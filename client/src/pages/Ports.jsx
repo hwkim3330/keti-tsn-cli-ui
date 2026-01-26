@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import axios from 'axios'
 
 function Ports({ config }) {
@@ -6,57 +6,99 @@ function Ports({ config }) {
   const [error, setError] = useState(null)
   const [ports, setPorts] = useState([])
   const [selectedPort, setSelectedPort] = useState(null)
+  const [portDetail, setPortDetail] = useState(null)
   const [portStats, setPortStats] = useState(null)
-  const [statsLoading, setStatsLoading] = useState(false)
+  const [detailLoading, setDetailLoading] = useState(false)
 
-  const portCount = 8 // LAN9662 has 8 ports
+  const portCount = 8
 
-  // Fetch all ports status
-  const fetchAllPorts = async () => {
-    setLoading(true)
-    setError(null)
+  // Fetch single port basic status with timeout
+  const fetchPortStatus = async (portNum) => {
+    const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
     try {
-      const portData = []
+      const response = await axios.post('/api/fetch', {
+        paths: [`${basePath}/oper-status`],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 5000 })
 
-      for (let i = 1; i <= portCount; i++) {
-        const basePath = `/ietf-interfaces:interfaces/interface[name='${i}']`
-
-        const response = await axios.post('/api/fetch', {
-          paths: [
-            `${basePath}/enabled`,
-            `${basePath}/oper-status`,
-            `${basePath}/phys-address`,
-            `${basePath}/mchp-velocitysp-port:eth-port/config`,
-            `${basePath}/ieee802-ethernet-interface:ethernet/speed`,
-            `${basePath}/ieee802-ethernet-interface:ethernet/duplex`
-          ],
-          transport: config.transport,
-          device: config.device,
-          host: config.host,
-          port: config.port
-        })
-
-        const parsed = parsePortResponse(response.data.result, i)
-        portData.push(parsed)
-      }
-
-      setPorts(portData)
+      const result = response.data.result || ''
+      const operStatus = result.includes('up') ? 'up' : 'down'
+      return { number: portNum, operStatus, error: null }
     } catch (err) {
-      setError(err.response?.data?.error || err.message)
-    } finally {
-      setLoading(false)
+      return { number: portNum, operStatus: 'unknown', error: err.message }
     }
   }
 
-  // Parse YAML response for a port
-  const parsePortResponse = (result, portNum) => {
+  // Fetch all ports status (one by one to avoid overwhelming the device)
+  const fetchAllPorts = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    const portData = []
+
+    for (let i = 1; i <= portCount; i++) {
+      const status = await fetchPortStatus(i)
+      portData.push(status)
+      // Update state incrementally so user sees progress
+      setPorts([...portData])
+    }
+
+    setLoading(false)
+  }, [config])
+
+  // Fetch detailed info for selected port
+  const fetchPortDetail = async (portNum) => {
+    setDetailLoading(true)
+    const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
+
+    try {
+      // Fetch config and status
+      const response = await axios.post('/api/fetch', {
+        paths: [
+          `${basePath}/enabled`,
+          `${basePath}/oper-status`,
+          `${basePath}/phys-address`,
+          `${basePath}/mchp-velocitysp-port:eth-port/config`
+        ],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 10000 })
+
+      const detail = parseDetailResponse(response.data.result, portNum)
+      setPortDetail(detail)
+
+      // Fetch statistics separately
+      const statsResponse = await axios.post('/api/fetch', {
+        paths: [`${basePath}/statistics`],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 10000 })
+
+      const stats = parseStatsResponse(statsResponse.data.result)
+      setPortStats(stats)
+
+    } catch (err) {
+      setError(`Port ${portNum}: ${err.message}`)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  // Parse detail response
+  const parseDetailResponse = (result, portNum) => {
     const data = {
       number: portNum,
       enabled: true,
       operStatus: 'unknown',
-      macAddress: '',
-      speed: '',
-      duplex: '',
+      macAddress: '-',
+      speed: '-',
+      duplex: '-',
       maxFrameLength: 0
     }
 
@@ -64,48 +106,23 @@ function Ports({ config }) {
 
     const lines = result.split('\n')
     for (const line of lines) {
-      if (line.includes('enabled:')) {
-        data.enabled = line.includes('true')
-      } else if (line.includes('oper-status:')) {
-        data.operStatus = line.split(':')[1]?.trim() || 'unknown'
-      } else if (line.includes('phys-address:')) {
-        data.macAddress = line.split(':').slice(1).join(':').trim()
-      } else if (line.includes('speed:')) {
-        const speedVal = line.split(':')[1]?.trim().replace(/'/g, '')
-        data.speed = speedVal || ''
-      } else if (line.includes('duplex:')) {
-        data.duplex = line.split(':')[1]?.trim() || ''
-      } else if (line.includes('max-frame-length:')) {
-        data.maxFrameLength = parseInt(line.split(':')[1]?.trim()) || 0
+      const trimmed = line.trim()
+      if (trimmed.startsWith('enabled:')) {
+        data.enabled = trimmed.includes('true')
+      } else if (trimmed.startsWith('oper-status:')) {
+        data.operStatus = trimmed.split(':')[1]?.trim() || 'unknown'
+      } else if (trimmed.startsWith('phys-address:')) {
+        data.macAddress = trimmed.split(':').slice(1).join(':').trim() || '-'
+      } else if (trimmed.startsWith('speed:')) {
+        data.speed = trimmed.split(':')[1]?.trim().replace(/'/g, '') || '-'
+      } else if (trimmed.startsWith('duplex:')) {
+        data.duplex = trimmed.split(':')[1]?.trim() || '-'
+      } else if (trimmed.startsWith('max-frame-length:')) {
+        data.maxFrameLength = parseInt(trimmed.split(':')[1]?.trim()) || 0
       }
     }
 
     return data
-  }
-
-  // Fetch port statistics
-  const fetchPortStats = async (portNum) => {
-    setStatsLoading(true)
-    try {
-      const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
-
-      const response = await axios.post('/api/fetch', {
-        paths: [
-          `${basePath}/statistics`,
-          `${basePath}/mchp-velocitysp-port:eth-port/statistics`
-        ],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      })
-
-      setPortStats(parseStatsResponse(response.data.result))
-    } catch (err) {
-      setError(err.response?.data?.error || err.message)
-    } finally {
-      setStatsLoading(false)
-    }
   }
 
   // Parse statistics response
@@ -122,50 +139,36 @@ function Ports({ config }) {
       inDiscards: 0,
       outDiscards: 0,
       inErrors: 0,
-      outErrors: 0,
-      trafficClass: []
+      outErrors: 0
     }
 
     if (!result) return stats
 
     const lines = result.split('\n')
-    let inTrafficClass = false
-    let currentTC = null
-
     for (const line of lines) {
       const trimmed = line.trim()
+      const getValue = (str) => parseInt(str.split(':')[1]?.replace(/'/g, '').trim()) || 0
 
-      if (trimmed.startsWith('in-octets:')) stats.inOctets = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('out-octets:')) stats.outOctets = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('in-unicast-pkts:')) stats.inUnicast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('out-unicast-pkts:')) stats.outUnicast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('in-broadcast-pkts:')) stats.inBroadcast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('out-broadcast-pkts:')) stats.outBroadcast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('in-multicast-pkts:')) stats.inMulticast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('out-multicast-pkts:')) stats.outMulticast = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      else if (trimmed.startsWith('in-discards:')) stats.inDiscards = parseInt(trimmed.split(':')[1]?.trim()) || 0
-      else if (trimmed.startsWith('out-discards:')) stats.outDiscards = parseInt(trimmed.split(':')[1]?.trim()) || 0
-      else if (trimmed.startsWith('in-errors:')) stats.inErrors = parseInt(trimmed.split(':')[1]?.trim()) || 0
-      else if (trimmed.startsWith('out-errors:')) stats.outErrors = parseInt(trimmed.split(':')[1]?.trim()) || 0
-      else if (trimmed === 'traffic-class:') {
-        inTrafficClass = true
-      } else if (inTrafficClass && trimmed.startsWith('- traffic-class:')) {
-        if (currentTC) stats.trafficClass.push(currentTC)
-        currentTC = { tc: parseInt(trimmed.split(':')[1]?.trim()) || 0, rxPackets: 0, txPackets: 0 }
-      } else if (currentTC && trimmed.startsWith('rx-packets:')) {
-        currentTC.rxPackets = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      } else if (currentTC && trimmed.startsWith('tx-packets:')) {
-        currentTC.txPackets = parseInt(trimmed.split(':')[1]?.replace(/'/g, '').trim()) || 0
-      }
+      if (trimmed.startsWith('in-octets:')) stats.inOctets = getValue(trimmed)
+      else if (trimmed.startsWith('out-octets:')) stats.outOctets = getValue(trimmed)
+      else if (trimmed.startsWith('in-unicast-pkts:')) stats.inUnicast = getValue(trimmed)
+      else if (trimmed.startsWith('out-unicast-pkts:')) stats.outUnicast = getValue(trimmed)
+      else if (trimmed.startsWith('in-broadcast-pkts:')) stats.inBroadcast = getValue(trimmed)
+      else if (trimmed.startsWith('out-broadcast-pkts:')) stats.outBroadcast = getValue(trimmed)
+      else if (trimmed.startsWith('in-multicast-pkts:')) stats.inMulticast = getValue(trimmed)
+      else if (trimmed.startsWith('out-multicast-pkts:')) stats.outMulticast = getValue(trimmed)
+      else if (trimmed.startsWith('in-discards:')) stats.inDiscards = getValue(trimmed)
+      else if (trimmed.startsWith('out-discards:')) stats.outDiscards = getValue(trimmed)
+      else if (trimmed.startsWith('in-errors:')) stats.inErrors = getValue(trimmed)
+      else if (trimmed.startsWith('out-errors:')) stats.outErrors = getValue(trimmed)
     }
-    if (currentTC) stats.trafficClass.push(currentTC)
 
     return stats
   }
 
   // Toggle port enabled state
   const togglePort = async (portNum, currentEnabled) => {
-    setLoading(true)
+    setDetailLoading(true)
     try {
       await axios.post('/api/patch', {
         patches: [{
@@ -176,18 +179,24 @@ function Ports({ config }) {
         device: config.device,
         host: config.host,
         port: config.port
-      })
-      await fetchAllPorts()
+      }, { timeout: 10000 })
+
+      // Refresh detail
+      await fetchPortDetail(portNum)
+      // Update overview
+      setPorts(ports.map(p =>
+        p.number === portNum ? { ...p, operStatus: !currentEnabled ? 'down' : p.operStatus } : p
+      ))
     } catch (err) {
       setError(err.response?.data?.error || err.message)
     } finally {
-      setLoading(false)
+      setDetailLoading(false)
     }
   }
 
   // Clear port counters
   const clearCounters = async (portNum) => {
-    setStatsLoading(true)
+    setDetailLoading(true)
     try {
       await axios.post('/api/patch', {
         patches: [{
@@ -198,30 +207,36 @@ function Ports({ config }) {
         device: config.device,
         host: config.host,
         port: config.port
-      })
-      await fetchPortStats(portNum)
+      }, { timeout: 10000 })
+
+      await fetchPortDetail(portNum)
     } catch (err) {
       setError(err.response?.data?.error || err.message)
     } finally {
-      setStatsLoading(false)
+      setDetailLoading(false)
     }
   }
 
+  // Initial fetch
   useEffect(() => {
     fetchAllPorts()
   }, [config.host])
 
+  // Fetch detail when port selected
   useEffect(() => {
     if (selectedPort) {
-      fetchPortStats(selectedPort)
+      setPortDetail(null)
+      setPortStats(null)
+      fetchPortDetail(selectedPort)
     }
   }, [selectedPort])
 
   const formatSpeed = (speed) => {
-    if (!speed) return '-'
+    if (!speed || speed === '-') return '-'
     const num = parseFloat(speed)
+    if (isNaN(num)) return speed
     if (num >= 1) return `${num} Gbps`
-    return `${num * 1000} Mbps`
+    return `${Math.round(num * 1000)} Mbps`
   }
 
   const formatBytes = (bytes) => {
@@ -229,26 +244,31 @@ function Ports({ config }) {
     const k = 1024
     const sizes = ['B', 'KB', 'MB', 'GB']
     const i = Math.floor(Math.log(bytes) / Math.log(k))
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
   }
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Port Status</h1>
-        <p className="page-description">Switch port configuration and statistics</p>
+        <p className="page-description">Switch port monitoring and configuration</p>
       </div>
 
       {/* Connection Info */}
       <div className="card">
         <div className="card-header">
           <h2 className="card-title">Connection</h2>
-          <button className="btn btn-secondary" onClick={fetchAllPorts} disabled={loading} style={{ fontSize: '0.8rem', padding: '6px 12px' }}>
-            {loading ? 'Loading...' : 'Refresh All'}
+          <button
+            className="btn btn-secondary"
+            onClick={fetchAllPorts}
+            disabled={loading}
+            style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+          >
+            {loading ? `Loading... (${ports.length}/${portCount})` : 'Refresh All'}
           </button>
         </div>
         <div style={{ padding: '10px', background: '#f8fafc', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.85rem' }}>
-          {config.transport === 'wifi' ? `WiFi: ${config.host}:${config.port}` : `Serial: ${config.device}`}
+          {config.transport === 'wifi' ? `${config.host}:${config.port}` : config.device}
         </div>
       </div>
 
@@ -258,66 +278,48 @@ function Ports({ config }) {
           <h2 className="card-title">Port Overview</h2>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '12px' }}>
-          {ports.map((port) => (
-            <div
-              key={port.number}
-              onClick={() => setSelectedPort(port.number)}
-              style={{
-                padding: '16px',
-                borderRadius: '8px',
-                border: selectedPort === port.number ? '2px solid #3b82f6' : '1px solid #e2e8f0',
-                background: selectedPort === port.number ? '#eff6ff' : '#fff',
-                cursor: 'pointer',
-                transition: 'all 0.2s'
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                <span style={{ fontSize: '1.1rem', fontWeight: '600' }}>Port {port.number}</span>
-                <span
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: '8px' }}>
+          {Array.from({ length: portCount }, (_, i) => i + 1).map((portNum) => {
+            const port = ports.find(p => p.number === portNum)
+            const isSelected = selectedPort === portNum
+            const status = port?.operStatus || 'loading'
+
+            return (
+              <div
+                key={portNum}
+                onClick={() => setSelectedPort(portNum)}
+                style={{
+                  padding: '12px',
+                  borderRadius: '8px',
+                  border: isSelected ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                  background: isSelected ? '#eff6ff' : '#fff',
+                  cursor: 'pointer',
+                  textAlign: 'center',
+                  transition: 'all 0.15s'
+                }}
+              >
+                <div style={{ fontSize: '1rem', fontWeight: '600', marginBottom: '6px' }}>
+                  Port {portNum}
+                </div>
+                <div
                   style={{
-                    width: '12px',
-                    height: '12px',
-                    borderRadius: '50%',
-                    background: port.operStatus === 'up' ? '#22c55e' : port.enabled ? '#eab308' : '#ef4444'
+                    display: 'inline-block',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.7rem',
+                    fontWeight: '500',
+                    background: status === 'up' ? '#dcfce7' : status === 'down' ? '#fee2e2' : '#f1f5f9',
+                    color: status === 'up' ? '#166534' : status === 'down' ? '#991b1b' : '#64748b'
                   }}
-                  title={port.operStatus === 'up' ? 'Link Up' : port.enabled ? 'No Link' : 'Disabled'}
-                />
+                >
+                  {status === 'up' ? 'UP' : status === 'down' ? 'DOWN' : status === 'loading' ? '...' : 'ERR'}
+                </div>
+                {port?.error && (
+                  <div style={{ fontSize: '0.65rem', color: '#ef4444', marginTop: '4px' }}>timeout</div>
+                )}
               </div>
-
-              <div style={{ fontSize: '0.8rem', color: '#64748b' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                  <span>Status:</span>
-                  <span style={{
-                    color: port.operStatus === 'up' ? '#22c55e' : '#64748b',
-                    fontWeight: '500'
-                  }}>
-                    {port.operStatus === 'up' ? 'Up' : port.enabled ? 'Down' : 'Disabled'}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                  <span>Speed:</span>
-                  <span>{formatSpeed(port.speed)}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span>Duplex:</span>
-                  <span style={{ textTransform: 'capitalize' }}>{port.duplex || '-'}</span>
-                </div>
-              </div>
-            </div>
-          ))}
-
-          {ports.length === 0 && !loading && (
-            <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '40px', color: '#64748b' }}>
-              Click "Refresh All" to load port status
-            </div>
-          )}
-
-          {loading && ports.length === 0 && (
-            <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '40px', color: '#64748b' }}>
-              Loading port status...
-            </div>
-          )}
+            )
+          })}
         </div>
       </div>
 
@@ -329,67 +331,74 @@ function Ports({ config }) {
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
                 className="btn btn-secondary"
-                onClick={() => fetchPortStats(selectedPort)}
-                disabled={statsLoading}
+                onClick={() => fetchPortDetail(selectedPort)}
+                disabled={detailLoading}
                 style={{ fontSize: '0.8rem', padding: '6px 12px' }}
               >
-                {statsLoading ? 'Loading...' : 'Refresh'}
+                {detailLoading ? 'Loading...' : 'Refresh'}
               </button>
-              <button
-                className="btn btn-secondary"
-                onClick={() => clearCounters(selectedPort)}
-                disabled={statsLoading}
-                style={{ fontSize: '0.8rem', padding: '6px 12px' }}
-              >
-                Clear Counters
-              </button>
+              {portStats && (
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => clearCounters(selectedPort)}
+                  disabled={detailLoading}
+                  style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+                >
+                  Clear Counters
+                </button>
+              )}
             </div>
           </div>
 
+          {detailLoading && !portDetail && (
+            <div style={{ padding: '40px', textAlign: 'center', color: '#64748b' }}>
+              Loading port details...
+            </div>
+          )}
+
           {/* Port Config */}
-          {ports.find(p => p.number === selectedPort) && (
+          {portDetail && (
             <div style={{ marginBottom: '20px' }}>
-              <h3 style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '12px', color: '#334155' }}>Configuration</h3>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px' }}>
-                {(() => {
-                  const port = ports.find(p => p.number === selectedPort)
-                  return (
-                    <>
-                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Admin State</div>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                          <span style={{ fontWeight: '500' }}>{port.enabled ? 'Enabled' : 'Disabled'}</span>
-                          <button
-                            className={`btn ${port.enabled ? 'btn-danger' : 'btn-primary'}`}
-                            onClick={() => togglePort(port.number, port.enabled)}
-                            disabled={loading}
-                            style={{ fontSize: '0.7rem', padding: '4px 8px' }}
-                          >
-                            {port.enabled ? 'Disable' : 'Enable'}
-                          </button>
-                        </div>
-                      </div>
-                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Oper Status</div>
-                        <div style={{ fontWeight: '500', color: port.operStatus === 'up' ? '#22c55e' : '#64748b' }}>
-                          {port.operStatus === 'up' ? 'Link Up' : 'Link Down'}
-                        </div>
-                      </div>
-                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Speed / Duplex</div>
-                        <div style={{ fontWeight: '500' }}>{formatSpeed(port.speed)} / {port.duplex || '-'}</div>
-                      </div>
-                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>MAC Address</div>
-                        <div style={{ fontWeight: '500', fontFamily: 'monospace', fontSize: '0.85rem' }}>{port.macAddress || '-'}</div>
-                      </div>
-                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Max Frame Length</div>
-                        <div style={{ fontWeight: '500' }}>{port.maxFrameLength || '-'} bytes</div>
-                      </div>
-                    </>
-                  )
-                })()}
+              <h3 style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '12px', color: '#334155' }}>
+                Configuration
+              </h3>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '10px' }}>
+                <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Admin State</div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span style={{ fontWeight: '500' }}>{portDetail.enabled ? 'Enabled' : 'Disabled'}</span>
+                    <button
+                      className={`btn ${portDetail.enabled ? 'btn-danger' : 'btn-primary'}`}
+                      onClick={() => togglePort(portDetail.number, portDetail.enabled)}
+                      disabled={detailLoading}
+                      style={{ fontSize: '0.7rem', padding: '3px 8px' }}
+                    >
+                      {portDetail.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                  </div>
+                </div>
+                <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Link Status</div>
+                  <div style={{ fontWeight: '500', color: portDetail.operStatus === 'up' ? '#16a34a' : '#64748b' }}>
+                    {portDetail.operStatus === 'up' ? 'Link Up' : 'Link Down'}
+                  </div>
+                </div>
+                <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Speed / Duplex</div>
+                  <div style={{ fontWeight: '500' }}>
+                    {formatSpeed(portDetail.speed)} / {portDetail.duplex}
+                  </div>
+                </div>
+                <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>MAC Address</div>
+                  <div style={{ fontWeight: '500', fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                    {portDetail.macAddress}
+                  </div>
+                </div>
+                <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Max Frame</div>
+                  <div style={{ fontWeight: '500' }}>{portDetail.maxFrameLength} bytes</div>
+                </div>
               </div>
             </div>
           )}
@@ -397,10 +406,12 @@ function Ports({ config }) {
           {/* Port Statistics */}
           {portStats && (
             <div>
-              <h3 style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '12px', color: '#334155' }}>Statistics</h3>
+              <h3 style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '12px', color: '#334155' }}>
+                Statistics
+              </h3>
 
-              {/* Summary Stats */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '8px', marginBottom: '16px' }}>
+              {/* Summary */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '8px', marginBottom: '16px' }}>
                 <div style={{ padding: '12px', background: '#f0fdf4', borderRadius: '6px', borderLeft: '3px solid #22c55e' }}>
                   <div style={{ fontSize: '0.7rem', color: '#64748b' }}>RX Bytes</div>
                   <div style={{ fontWeight: '600', fontSize: '1rem' }}>{formatBytes(portStats.inOctets)}</div>
@@ -411,23 +422,19 @@ function Ports({ config }) {
                 </div>
                 <div style={{ padding: '12px', background: '#f0fdf4', borderRadius: '6px', borderLeft: '3px solid #22c55e' }}>
                   <div style={{ fontSize: '0.7rem', color: '#64748b' }}>RX Packets</div>
-                  <div style={{ fontWeight: '600', fontSize: '1rem' }}>{(portStats.inUnicast + portStats.inBroadcast + portStats.inMulticast).toLocaleString()}</div>
+                  <div style={{ fontWeight: '600', fontSize: '1rem' }}>
+                    {(portStats.inUnicast + portStats.inBroadcast + portStats.inMulticast).toLocaleString()}
+                  </div>
                 </div>
                 <div style={{ padding: '12px', background: '#eff6ff', borderRadius: '6px', borderLeft: '3px solid #3b82f6' }}>
                   <div style={{ fontSize: '0.7rem', color: '#64748b' }}>TX Packets</div>
-                  <div style={{ fontWeight: '600', fontSize: '1rem' }}>{(portStats.outUnicast + portStats.outBroadcast + portStats.outMulticast).toLocaleString()}</div>
-                </div>
-                {(portStats.inErrors > 0 || portStats.outErrors > 0) && (
-                  <div style={{ padding: '12px', background: '#fef2f2', borderRadius: '6px', borderLeft: '3px solid #ef4444' }}>
-                    <div style={{ fontSize: '0.7rem', color: '#64748b' }}>Errors</div>
-                    <div style={{ fontWeight: '600', fontSize: '1rem', color: '#ef4444' }}>
-                      {portStats.inErrors + portStats.outErrors}
-                    </div>
+                  <div style={{ fontWeight: '600', fontSize: '1rem' }}>
+                    {(portStats.outUnicast + portStats.outBroadcast + portStats.outMulticast).toLocaleString()}
                   </div>
-                )}
+                </div>
               </div>
 
-              {/* Detailed Stats Table */}
+              {/* Detailed Table */}
               <div style={{ overflowX: 'auto' }}>
                 <table className="table">
                   <thead>
@@ -439,17 +446,17 @@ function Ports({ config }) {
                   </thead>
                   <tbody>
                     <tr>
-                      <td>Unicast Packets</td>
+                      <td>Unicast</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.inUnicast.toLocaleString()}</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.outUnicast.toLocaleString()}</td>
                     </tr>
                     <tr>
-                      <td>Broadcast Packets</td>
+                      <td>Broadcast</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.inBroadcast.toLocaleString()}</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.outBroadcast.toLocaleString()}</td>
                     </tr>
                     <tr>
-                      <td>Multicast Packets</td>
+                      <td>Multicast</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.inMulticast.toLocaleString()}</td>
                       <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>{portStats.outMulticast.toLocaleString()}</td>
                     </tr>
@@ -460,36 +467,27 @@ function Ports({ config }) {
                     </tr>
                     <tr>
                       <td>Errors</td>
-                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: portStats.inErrors > 0 ? '#ef4444' : 'inherit' }}>{portStats.inErrors}</td>
-                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: portStats.outErrors > 0 ? '#ef4444' : 'inherit' }}>{portStats.outErrors}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: portStats.inErrors > 0 ? '#ef4444' : 'inherit' }}>
+                        {portStats.inErrors}
+                      </td>
+                      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: portStats.outErrors > 0 ? '#ef4444' : 'inherit' }}>
+                        {portStats.outErrors}
+                      </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
-
-              {/* Traffic Class Stats */}
-              {portStats.trafficClass.length > 0 && (
-                <div style={{ marginTop: '16px' }}>
-                  <h4 style={{ fontSize: '0.85rem', fontWeight: '600', marginBottom: '8px', color: '#334155' }}>Traffic Class Counters</h4>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: '4px' }}>
-                    {portStats.trafficClass.map((tc) => (
-                      <div key={tc.tc} style={{ padding: '8px', background: '#f8fafc', borderRadius: '4px', textAlign: 'center' }}>
-                        <div style={{ fontSize: '0.7rem', color: '#64748b', marginBottom: '4px' }}>TC{tc.tc}</div>
-                        <div style={{ fontSize: '0.75rem' }}>
-                          <div style={{ color: '#22c55e' }}>↓{tc.rxPackets}</div>
-                          <div style={{ color: '#3b82f6' }}>↑{tc.txPackets}</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </div>
       )}
 
-      {error && <div className="alert alert-error">{error}</div>}
+      {error && (
+        <div className="alert alert-error" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>{error}</span>
+          <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2rem' }}>×</button>
+        </div>
+      )}
     </div>
   )
 }

@@ -18,11 +18,12 @@ function Settings({ config, setConfig }) {
     if (savedDevices) {
       setDevices(JSON.parse(savedDevices))
     } else {
-      // Default devices
+      // Default devices (PC hotspot: 10.42.0.1, ESP32s: 10.42.0.11~)
       const defaultDevices = [
         { id: 1, name: 'ESP32 #1', host: '10.42.0.11', port: 5683, transport: 'wifi' },
         { id: 2, name: 'ESP32 #2', host: '10.42.0.12', port: 5683, transport: 'wifi' },
-        { id: 3, name: 'Default AP', host: '192.168.4.1', port: 5683, transport: 'wifi' }
+        { id: 3, name: 'ESP32 #3', host: '10.42.0.13', port: 5683, transport: 'wifi' },
+        { id: 4, name: 'ESP32 #4', host: '10.42.0.14', port: 5683, transport: 'wifi' }
       ]
       setDevices(defaultDevices)
       localStorage.setItem('tsn-devices', JSON.stringify(defaultDevices))
