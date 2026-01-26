@@ -43,14 +43,17 @@ function Dashboard({ config }) {
     setBoardLoading(true)
     setBoardError(null)
     try {
-      // Fetch hardware info including temperature
+      // Fetch specific components only (faster than full hardware tree)
       const response = await axios.post('/api/fetch', {
-        paths: ['/ietf-hardware:hardware', '/ietf-system:system-state'],
+        paths: [
+          "/ietf-hardware:hardware/component[name='Board']",
+          "/ietf-hardware:hardware/component[name='SwTmp']"
+        ],
         transport: config.transport,
         device: config.device,
         host: config.host,
         port: config.port
-      }, { timeout: 10000 })
+      }, { timeout: 8000 })
 
       const info = parseBoardInfo(response.data.result)
       setBoardInfo(info)
@@ -73,31 +76,19 @@ function Dashboard({ config }) {
     }
 
     const lines = result.split('\n')
-    let inComponent = false
-    let currentClass = ''
-
     for (const line of lines) {
       const trimmed = line.trim()
 
-      if (trimmed.startsWith('- class:')) {
-        inComponent = true
-        currentClass = trimmed.split(':')[1]?.trim()
-      } else if (trimmed.startsWith('model-name:') && inComponent) {
-        if (currentClass === 'chassis') {
-          info.model = trimmed.split(':').slice(1).join(':').trim()
-        }
+      if (trimmed.startsWith('model-name:')) {
+        info.model = trimmed.split(':').slice(1).join(':').trim()
       } else if (trimmed.startsWith('firmware-rev:')) {
         info.firmware = trimmed.split(':')[1]?.trim()
       } else if (trimmed.startsWith('mfg-name:')) {
         info.manufacturer = trimmed.split(':')[1]?.trim()
       } else if (trimmed.startsWith('serial-num:')) {
         info.serial = trimmed.split(':')[1]?.trim().replace(/'/g, '')
-      } else if (trimmed.startsWith('value:') && currentClass === 'sensor') {
+      } else if (trimmed.startsWith('value:')) {
         info.temperature = parseInt(trimmed.split(':')[1]?.trim())
-      } else if (trimmed.startsWith('os-version:')) {
-        info.firmware = trimmed.split(':')[1]?.trim()
-      } else if (trimmed.startsWith('machine:')) {
-        info.model = trimmed.split(':').slice(1).join(':').trim()
       }
     }
 
