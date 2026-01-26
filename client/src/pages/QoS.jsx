@@ -10,12 +10,9 @@ function QoS({ config }) {
   // Default Priority
   const [defaultPriority, setDefaultPriority] = useState(0)
 
-  // Traffic Class Shaper
+  // Traffic Class Shaper (CBS)
   const [shaperTC, setShaperTC] = useState(3)
-  const [shaperType, setShaperType] = useState('credit-based')
   const [idleSlope, setIdleSlope] = useState(100000) // kbps
-  const [cir, setCir] = useState(50000) // kbps
-  const [cbsShaper, setCbsShaper] = useState(2000) // bytes
 
   // WRR Bandwidth
   const [wrrBandwidth, setWrrBandwidth] = useState([10, 40, 50])
@@ -27,26 +24,9 @@ function QoS({ config }) {
   const [policerRate, setPolicerRate] = useState(1000)
   const [policerBurst, setPolicerBurst] = useState(2000)
 
-  // Queue Max SDU (CBS)
-  const [queueTC, setQueueTC] = useState(7)
-  const [maxSduSize, setMaxSduSize] = useState(1522)
-
-  // Stream Filter (PSFP)
-  const [streamFilterId, setStreamFilterId] = useState(0)
-  const [streamHandle, setStreamHandle] = useState(0)
-  const [streamMaxSdu, setStreamMaxSdu] = useState(1522)
-  const [streamGateRef, setStreamGateRef] = useState(0)
-
-  // Flow Meter
-  const [flowMeterCir, setFlowMeterCir] = useState(100000000) // bits per second
-  const [flowMeterCbs, setFlowMeterCbs] = useState(4096) // bytes
-  const [flowMeterEir, setFlowMeterEir] = useState(0)
-  const [flowMeterEbs, setFlowMeterEbs] = useState(0)
-
   const basePath = `/ietf-interfaces:interfaces/interface[name='${portNumber}']`
   const bridgePortPath = `${basePath}/ieee802-dot1q-bridge:bridge-port`
   const qosPath = `${basePath}/mchp-velocitysp-port:eth-qos/config`
-  const bridgePath = `/ieee802-dot1q-bridge:bridges/bridge[name='switch']`
 
   const handleFetch = async (paths, label) => {
     setLoading(true)
@@ -86,30 +66,27 @@ function QoS({ config }) {
     }
   }
 
-  // Default Priority Actions
+  // Default Priority
   const fetchDefaultPriority = () => handleFetch([`${bridgePortPath}/default-priority`], 'Default Priority')
   const applyDefaultPriority = () => handlePatch([{ path: `${bridgePortPath}/default-priority`, value: defaultPriority }], 'Default Priority')
 
-  // Traffic Class Shaper Actions
+  // Traffic Class Shaper (CBS)
   const fetchShapers = () => handleFetch([`${qosPath}/traffic-class-shapers`], 'Traffic Class Shapers')
   const applyCreditBasedShaper = () => {
     handlePatch([{
       path: `${qosPath}/traffic-class-shapers`,
-      value: { 'traffic-class': shaperTC, 'credit-based': { 'idle-slope': idleSlope } }
+      value: {
+        'traffic-class': shaperTC,
+        'credit-based': { 'idle-slope': idleSlope }
+      }
     }], 'Credit Based Shaper')
   }
-  const applySingleLeakyShaper = () => {
-    handlePatch([{
-      path: `${qosPath}/traffic-class-shapers`,
-      value: { 'traffic-class': shaperTC, 'single-leaky-bucket': { 'committed-information-rate': cir, 'committed-burst-size': cbsShaper } }
-    }], 'Single Leaky Bucket Shaper')
-  }
 
-  // WRR Actions
+  // WRR
   const fetchWRR = () => handleFetch([`${qosPath}/traffic-class-schedulers-bandwidth`], 'WRR Bandwidth')
   const applyWRR = () => handlePatch([{ path: `${qosPath}/traffic-class-schedulers-bandwidth`, value: wrrBandwidth }], 'WRR Bandwidth')
 
-  // Port Policer Actions
+  // Port Policer
   const fetchPolicers = () => handleFetch([`${qosPath}/port-policers`], 'Port Policers')
   const applyPolicer = () => {
     const policerValue = {
@@ -127,42 +104,6 @@ function QoS({ config }) {
     handlePatch([{ path: `${qosPath}/port-policers[index='${policerIndex}']`, value: null }], 'Delete Policer')
   }
 
-  // Queue Max SDU Actions (CBS)
-  const fetchQueueMaxSdu = () => handleFetch([`${bridgePortPath}/ieee802-dot1q-sched-bridge:queue-max-sdu-table`], 'Queue Max SDU')
-  const applyQueueMaxSdu = () => {
-    handlePatch([{
-      path: `${bridgePortPath}/ieee802-dot1q-sched-bridge:queue-max-sdu-table/queue-max-sdu-entry[traffic-class='${queueTC}']/queue-max-sdu`,
-      value: maxSduSize
-    }], 'Queue Max SDU')
-  }
-
-  // Stream Filter Actions (PSFP)
-  const fetchStreamFilters = () => handleFetch([
-    `${bridgePath}/component[name='switch']/ieee802-dot1q-psfp-bridge:stream-filters`
-  ], 'Stream Filters')
-  const applyStreamFilter = () => {
-    const filterPath = `${bridgePath}/component[name='switch']/ieee802-dot1q-psfp-bridge:stream-filters/stream-filter-instance-table/stream-filter-instance-entry[stream-filter-instance-id='${streamFilterId}']`
-    handlePatch([
-      { path: `${filterPath}/stream-handle`, value: streamHandle },
-      { path: `${filterPath}/max-sdu-size`, value: streamMaxSdu },
-      { path: `${filterPath}/stream-gate-ref`, value: streamGateRef }
-    ], 'Stream Filter')
-  }
-
-  // Flow Meter Actions
-  const fetchFlowMeters = () => handleFetch([
-    `${bridgePath}/component[name='switch']/ieee802-dot1q-psfp-bridge:flow-meters`
-  ], 'Flow Meters')
-  const applyFlowMeter = () => {
-    const meterPath = `${bridgePath}/component[name='switch']/ieee802-dot1q-psfp-bridge:flow-meters/flow-meter-instance-table/flow-meter-instance-entry[flow-meter-instance-id='0']`
-    handlePatch([
-      { path: `${meterPath}/committed-information-rate`, value: flowMeterCir },
-      { path: `${meterPath}/committed-burst-size`, value: flowMeterCbs },
-      { path: `${meterPath}/excess-information-rate`, value: flowMeterEir },
-      { path: `${meterPath}/excess-burst-size`, value: flowMeterEbs }
-    ], 'Flow Meter')
-  }
-
   const updateWrrBandwidth = (index, value) => {
     const updated = [...wrrBandwidth]
     updated[index] = parseInt(value) || 0
@@ -176,7 +117,7 @@ function QoS({ config }) {
     <div>
       <div className="page-header">
         <h1 className="page-title">QoS Configuration</h1>
-        <p className="page-description">Quality of Service - Priority, Shaping, Scheduling, Policing, CBS, PSFP</p>
+        <p className="page-description">Quality of Service - CBS (Credit-Based Shaper), WRR, Policing</p>
       </div>
 
       <div className="card">
@@ -193,7 +134,7 @@ function QoS({ config }) {
           <div className="form-group">
             <label className="form-label">Connection</label>
             <div style={{ padding: '10px', background: '#f8fafc', borderRadius: '6px' }}>
-              {config.transport === 'wifi' ? `${config.host}:${config.port}` : config.device}
+              {config.transport === 'wifi' ? `WiFi: ${config.host}:${config.port}` : `Serial: ${config.device}`}
             </div>
           </div>
         </div>
@@ -208,7 +149,7 @@ function QoS({ config }) {
           </button>
         </div>
         <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          UN-TAGGED 프레임에 할당되는 기본 우선순위
+          Default priority assigned to untagged frames
         </p>
         <div className="form-row">
           <div className="form-group">
@@ -221,16 +162,16 @@ function QoS({ config }) {
         <button className="btn btn-primary" onClick={applyDefaultPriority} disabled={loading}>Apply</button>
       </div>
 
-      {/* Traffic Class Shaper */}
+      {/* CBS - Credit Based Shaper */}
       <div className="card">
         <div className="card-header">
-          <h2 className="card-title">Traffic Class Shaper</h2>
+          <h2 className="card-title">Credit Based Shaper (802.1Qav)</h2>
           <button className="btn btn-secondary" onClick={fetchShapers} disabled={loading} style={{fontSize:'0.8rem',padding:'6px 12px'}}>
             Fetch
           </button>
         </div>
         <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          트래픽 클래스별 Shaping: Credit Based (Qav) 또는 Single Leaky Bucket
+          Enable CBS on a traffic class with specified idle-slope rate
         </p>
         <div className="form-row">
           <div className="form-group">
@@ -240,35 +181,13 @@ function QoS({ config }) {
             </select>
           </div>
           <div className="form-group">
-            <label className="form-label">Shaper Type</label>
-            <select className="form-select" value={shaperType} onChange={(e) => setShaperType(e.target.value)}>
-              <option value="credit-based">Credit Based (Qav)</option>
-              <option value="single-leaky">Single Leaky Bucket</option>
-            </select>
-          </div>
-        </div>
-
-        {shaperType === 'credit-based' ? (
-          <div className="form-group">
             <label className="form-label">Idle Slope (kbps)</label>
             <input type="number" className="form-input" value={idleSlope} onChange={(e) => setIdleSlope(parseInt(e.target.value))} />
-            <small style={{color:'#64748b',fontSize:'0.75rem'}}>예: 100000 = 100 Mbps</small>
+            <small style={{color:'#64748b',fontSize:'0.75rem'}}>e.g., 100000 = 100 Mbps</small>
           </div>
-        ) : (
-          <div className="form-row">
-            <div className="form-group">
-              <label className="form-label">CIR (kbps)</label>
-              <input type="number" className="form-input" value={cir} onChange={(e) => setCir(parseInt(e.target.value))} />
-            </div>
-            <div className="form-group">
-              <label className="form-label">CBS (bytes)</label>
-              <input type="number" className="form-input" value={cbsShaper} onChange={(e) => setCbsShaper(parseInt(e.target.value))} />
-            </div>
-          </div>
-        )}
-
-        <button className="btn btn-primary" onClick={shaperType === 'credit-based' ? applyCreditBasedShaper : applySingleLeakyShaper} disabled={loading}>
-          Apply Shaper
+        </div>
+        <button className="btn btn-primary" onClick={applyCreditBasedShaper} disabled={loading}>
+          Apply CBS
         </button>
       </div>
 
@@ -281,7 +200,7 @@ function QoS({ config }) {
           </button>
         </div>
         <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          TC0부터 순서대로 WRR 대역폭 비율 (%). 리스트에 없는 TC는 Strict Priority.
+          WRR bandwidth percentage per TC (starting from TC0). TCs not in the list use Strict Priority.
         </p>
 
         <div style={{display:'flex',gap:'8px',flexWrap:'wrap',marginBottom:'12px'}}>
@@ -303,12 +222,12 @@ function QoS({ config }) {
         </div>
 
         <div style={{display:'flex',gap:'8px',marginBottom:'12px'}}>
-          <button className="btn btn-secondary" onClick={addWrrTC} style={{fontSize:'0.8rem',padding:'6px 12px'}}>+ TC 추가</button>
-          <button className="btn btn-secondary" onClick={removeWrrTC} disabled={wrrBandwidth.length <= 1} style={{fontSize:'0.8rem',padding:'6px 12px'}}>- TC 제거</button>
+          <button className="btn btn-secondary" onClick={addWrrTC} style={{fontSize:'0.8rem',padding:'6px 12px'}}>+ Add TC</button>
+          <button className="btn btn-secondary" onClick={removeWrrTC} disabled={wrrBandwidth.length <= 1} style={{fontSize:'0.8rem',padding:'6px 12px'}}>- Remove TC</button>
         </div>
 
         <div style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'12px'}}>
-          합계: {wrrBandwidth.reduce((a,b) => a+b, 0)}% (100%가 되어야 함)
+          Total: {wrrBandwidth.reduce((a,b) => a+b, 0)}% (should be 100%)
         </div>
 
         <button className="btn btn-primary" onClick={applyWRR} disabled={loading}>Apply WRR</button>
@@ -323,7 +242,7 @@ function QoS({ config }) {
           </button>
         </div>
         <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          포트 인그레스에서 프레임 유형별 Rate Limiting
+          Ingress rate limiting per frame type
         </p>
 
         <div className="form-row">
@@ -367,112 +286,6 @@ function QoS({ config }) {
           <button className="btn btn-primary" onClick={applyPolicer} disabled={loading}>Apply Policer</button>
           <button className="btn btn-danger" onClick={deletePolicer} disabled={loading}>Delete Policer</button>
         </div>
-      </div>
-
-      {/* Queue Max SDU (CBS) */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Queue Max SDU (802.1Qav)</h2>
-          <button className="btn btn-secondary" onClick={fetchQueueMaxSdu} disabled={loading} style={{fontSize:'0.8rem',padding:'6px 12px'}}>
-            Fetch
-          </button>
-        </div>
-        <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          각 Traffic Class 큐의 최대 SDU 크기 설정
-        </p>
-
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">Traffic Class</label>
-            <select className="form-select" value={queueTC} onChange={(e) => setQueueTC(parseInt(e.target.value))}>
-              {[0,1,2,3,4,5,6,7].map(tc => <option key={tc} value={tc}>TC {tc}</option>)}
-            </select>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Max SDU Size (bytes)</label>
-            <input type="number" className="form-input" value={maxSduSize} onChange={(e) => setMaxSduSize(parseInt(e.target.value))} />
-          </div>
-        </div>
-
-        <button className="btn btn-primary" onClick={applyQueueMaxSdu} disabled={loading}>Apply Queue Config</button>
-      </div>
-
-      {/* Stream Filter (PSFP) */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Stream Filter (802.1Qci PSFP)</h2>
-          <button className="btn btn-secondary" onClick={fetchStreamFilters} disabled={loading} style={{fontSize:'0.8rem',padding:'6px 12px'}}>
-            Fetch
-          </button>
-        </div>
-        <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          Per-Stream Filtering and Policing - 스트림별 필터링 설정
-        </p>
-
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">Filter Instance ID</label>
-            <input type="number" className="form-input" value={streamFilterId} onChange={(e) => setStreamFilterId(parseInt(e.target.value))} min="0" />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Stream Handle</label>
-            <input type="number" className="form-input" value={streamHandle} onChange={(e) => setStreamHandle(parseInt(e.target.value))} min="0" />
-          </div>
-        </div>
-
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">Max SDU Size (bytes)</label>
-            <input type="number" className="form-input" value={streamMaxSdu} onChange={(e) => setStreamMaxSdu(parseInt(e.target.value))} />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Stream Gate Reference</label>
-            <input type="number" className="form-input" value={streamGateRef} onChange={(e) => setStreamGateRef(parseInt(e.target.value))} min="0" />
-          </div>
-        </div>
-
-        <button className="btn btn-primary" onClick={applyStreamFilter} disabled={loading}>Apply Stream Filter</button>
-      </div>
-
-      {/* Flow Meter */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Flow Meter (Rate Limiter)</h2>
-          <button className="btn btn-secondary" onClick={fetchFlowMeters} disabled={loading} style={{fontSize:'0.8rem',padding:'6px 12px'}}>
-            Fetch
-          </button>
-        </div>
-        <p style={{fontSize:'0.85rem',color:'#64748b',marginBottom:'12px'}}>
-          PSFP Flow Meter - CIR/CBS/EIR/EBS 기반 Rate Limiting
-        </p>
-
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">CIR (bits/sec)</label>
-            <input type="number" className="form-input" value={flowMeterCir} onChange={(e) => setFlowMeterCir(parseInt(e.target.value))} />
-            <small style={{color:'#64748b',fontSize:'0.75rem'}}>Committed Information Rate</small>
-          </div>
-          <div className="form-group">
-            <label className="form-label">CBS (bytes)</label>
-            <input type="number" className="form-input" value={flowMeterCbs} onChange={(e) => setFlowMeterCbs(parseInt(e.target.value))} />
-            <small style={{color:'#64748b',fontSize:'0.75rem'}}>Committed Burst Size</small>
-          </div>
-        </div>
-
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">EIR (bits/sec)</label>
-            <input type="number" className="form-input" value={flowMeterEir} onChange={(e) => setFlowMeterEir(parseInt(e.target.value))} />
-            <small style={{color:'#64748b',fontSize:'0.75rem'}}>Excess Information Rate</small>
-          </div>
-          <div className="form-group">
-            <label className="form-label">EBS (bytes)</label>
-            <input type="number" className="form-input" value={flowMeterEbs} onChange={(e) => setFlowMeterEbs(parseInt(e.target.value))} />
-            <small style={{color:'#64748b',fontSize:'0.75rem'}}>Excess Burst Size</small>
-          </div>
-        </div>
-
-        <button className="btn btn-primary" onClick={applyFlowMeter} disabled={loading}>Apply Flow Meter</button>
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
