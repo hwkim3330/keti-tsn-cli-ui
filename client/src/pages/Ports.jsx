@@ -10,7 +10,7 @@ function Ports({ config }) {
   const [portStats, setPortStats] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
 
-  const portCount = 8
+  const portCount = 12 // LAN9692: 7 PHY + 4 SFP + 1 internal
 
   // Fetch single port basic status with timeout
   const fetchPortStatus = async (portNum) => {
