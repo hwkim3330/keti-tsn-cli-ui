@@ -165,7 +165,7 @@ function Dashboard({ config }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <div style={{
               width: '40px', height: '40px', borderRadius: '10px',
-              background: boardInfo?.temperature ? (boardInfo.temperature < 60 ? '#dcfce7' : boardInfo.temperature < 80 ? '#fef3c7' : '#fee2e2') : '#f1f5f9',
+              background: boardInfo && boardInfo.temperature != null ? (boardInfo.temperature < 60 ? '#dcfce7' : boardInfo.temperature < 80 ? '#fef3c7' : '#fee2e2') : '#f1f5f9',
               display: 'flex', alignItems: 'center', justifyContent: 'center'
             }}>
               <svg width="20" height="20" fill="none" stroke={getTempColor(boardInfo?.temperature)} viewBox="0 0 24 24">
@@ -175,7 +175,7 @@ function Dashboard({ config }) {
             <div>
               <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Temperature</div>
               <div style={{ fontSize: '1.25rem', fontWeight: '600', color: getTempColor(boardInfo?.temperature) }}>
-                {boardLoading ? '...' : boardInfo?.temperature !== null ? `${boardInfo.temperature}°C` : '-'}
+                {boardLoading ? '...' : boardInfo && boardInfo.temperature != null ? `${boardInfo.temperature}°C` : '-'}
               </div>
             </div>
           </div>
