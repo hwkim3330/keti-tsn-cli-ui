@@ -44,10 +44,13 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // Download catalog
-    await yangCatalog.downloadCatalog(transportInstance, checksum);
-
     await transportInstance.disconnect();
+
+    // Download catalog from remote server (Microchip)
+    const tarPath = await yangCatalog.downloadCatalog(checksum);
+
+    // Extract catalog
+    await yangCatalog.extractCatalog(tarPath);
 
     // Get catalog info after download
     catalogInfo = yangCatalog.getCatalogInfo(checksum);
