@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { BrowserRouter as Router, Routes, Route, NavLink } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Checksum from './pages/Checksum'
@@ -13,6 +13,7 @@ import Settings from './pages/Settings'
 import PTP from './pages/PTP'
 import TAS from './pages/TAS'
 import QoS from './pages/QoS'
+import CBS from './pages/CBS'
 
 function App() {
   const [transportConfig, setTransportConfig] = useState({
@@ -22,6 +23,44 @@ function App() {
     port: 5683
   })
 
+  const [devices, setDevices] = useState([])
+  const [showDeviceDropdown, setShowDeviceDropdown] = useState(false)
+
+  // Load saved devices from localStorage
+  useEffect(() => {
+    const savedDevices = localStorage.getItem('tsn-devices')
+    if (savedDevices) {
+      setDevices(JSON.parse(savedDevices))
+    } else {
+      const defaultDevices = [
+        { id: 1, name: 'ESP32 #1', host: '10.42.0.11', port: 5683, transport: 'wifi' },
+        { id: 2, name: 'ESP32 #2', host: '10.42.0.12', port: 5683, transport: 'wifi' },
+        { id: 3, name: 'Default AP', host: '192.168.4.1', port: 5683, transport: 'wifi' }
+      ]
+      setDevices(defaultDevices)
+    }
+  }, [])
+
+  const selectDevice = (device) => {
+    setTransportConfig({
+      transport: device.transport || 'wifi',
+      host: device.host,
+      port: device.port,
+      device: device.device || '/dev/ttyACM0'
+    })
+    setShowDeviceDropdown(false)
+  }
+
+  const getCurrentDeviceName = () => {
+    const found = devices.find(d => {
+      if (d.transport === 'wifi' || !d.transport) {
+        return transportConfig.transport === 'wifi' && transportConfig.host === d.host && transportConfig.port === d.port
+      }
+      return transportConfig.transport === 'serial' && transportConfig.device === d.device
+    })
+    return found ? found.name : (transportConfig.transport === 'wifi' ? transportConfig.host : transportConfig.device)
+  }
+
   return (
     <Router>
       <div className="app-container">
@@ -29,6 +68,78 @@ function App() {
           <div className="sidebar-header">
             <h1>KETI TSN CLI</h1>
             <p>Switch Configuration UI</p>
+          </div>
+
+          {/* Device Selector */}
+          <div style={{ padding: '0 16px 12px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+            <div
+              onClick={() => setShowDeviceDropdown(!showDeviceDropdown)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '10px 12px',
+                background: 'rgba(255,255,255,0.1)',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                transition: 'background 0.2s'
+              }}
+            >
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)' }}>Connected Device</div>
+                <div style={{ fontSize: '0.9rem', fontWeight: '500' }}>{getCurrentDeviceName()}</div>
+                <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.5)', fontFamily: 'monospace' }}>
+                  {transportConfig.transport === 'wifi' ? `${transportConfig.host}:${transportConfig.port}` : transportConfig.device}
+                </div>
+              </div>
+              <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style={{ opacity: 0.6 }}>
+                <path d="M3.5 6.5L8 11l4.5-4.5" stroke="currentColor" strokeWidth="1.5" fill="none" />
+              </svg>
+            </div>
+
+            {showDeviceDropdown && (
+              <div style={{
+                marginTop: '4px',
+                background: '#1e293b',
+                borderRadius: '8px',
+                overflow: 'hidden',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
+              }}>
+                {devices.map((device) => (
+                  <div
+                    key={device.id}
+                    onClick={() => selectDevice(device)}
+                    style={{
+                      padding: '10px 12px',
+                      cursor: 'pointer',
+                      borderBottom: '1px solid rgba(255,255,255,0.05)',
+                      background: (transportConfig.host === device.host && transportConfig.port === device.port) ? 'rgba(59,130,246,0.3)' : 'transparent',
+                      transition: 'background 0.2s'
+                    }}
+                    onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
+                    onMouseOut={(e) => e.currentTarget.style.background = (transportConfig.host === device.host && transportConfig.port === device.port) ? 'rgba(59,130,246,0.3)' : 'transparent'}
+                  >
+                    <div style={{ fontWeight: '500', fontSize: '0.85rem' }}>{device.name}</div>
+                    <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.5)', fontFamily: 'monospace' }}>
+                      {device.transport === 'serial' ? device.device : `${device.host}:${device.port}`}
+                    </div>
+                  </div>
+                ))}
+                <NavLink
+                  to="/settings"
+                  onClick={() => setShowDeviceDropdown(false)}
+                  style={{
+                    display: 'block',
+                    padding: '10px 12px',
+                    fontSize: '0.8rem',
+                    color: '#60a5fa',
+                    textDecoration: 'none'
+                  }}
+                >
+                  + Manage Devices
+                </NavLink>
+              </div>
+            )}
           </div>
 
           <nav>
@@ -94,7 +205,7 @@ function App() {
                 </svg>
                 <span>TAS (Qbv)</span>
               </NavLink>
-              <NavLink to="/qos" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+              <NavLink to="/cbs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
                 <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                 </svg>
@@ -150,7 +261,7 @@ function App() {
             <Route path="/patch" element={<Patch config={transportConfig} />} />
             <Route path="/ptp" element={<PTP config={transportConfig} />} />
             <Route path="/tas" element={<TAS config={transportConfig} />} />
-            <Route path="/qos" element={<QoS config={transportConfig} />} />
+            <Route path="/cbs" element={<CBS config={transportConfig} />} />
             <Route path="/settings" element={<Settings config={transportConfig} setConfig={setTransportConfig} />} />
           </Routes>
         </main>
