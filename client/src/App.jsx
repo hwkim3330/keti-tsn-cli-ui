@@ -14,6 +14,7 @@ import PTP from './pages/PTP'
 import TAS from './pages/TAS'
 import QoS from './pages/QoS'
 import CBS from './pages/CBS'
+import Ports from './pages/Ports'
 
 function App() {
   const [transportConfig, setTransportConfig] = useState({
@@ -151,6 +152,12 @@ function App() {
                 </svg>
                 <span>Dashboard</span>
               </NavLink>
+              <NavLink to="/ports" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+                <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+                </svg>
+                <span>Port Status</span>
+              </NavLink>
             </div>
 
             <div className="nav-section">
@@ -251,6 +258,7 @@ function App() {
         <main className="main-content">
           <Routes>
             <Route path="/" element={<Dashboard config={transportConfig} />} />
+            <Route path="/ports" element={<Ports config={transportConfig} />} />
             <Route path="/checksum" element={<Checksum config={transportConfig} />} />
             <Route path="/download" element={<Download config={transportConfig} />} />
             <Route path="/list" element={<CatalogList />} />
