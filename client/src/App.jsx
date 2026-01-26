@@ -12,7 +12,6 @@ import GetConfig from './pages/GetConfig'
 import Settings from './pages/Settings'
 import PTP from './pages/PTP'
 import TAS from './pages/TAS'
-import CBS from './pages/CBS'
 import QoS from './pages/QoS'
 
 function App() {
@@ -95,17 +94,11 @@ function App() {
                 </svg>
                 <span>TAS (Qbv)</span>
               </NavLink>
-              <NavLink to="/cbs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+              <NavLink to="/qos" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
                 <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                 </svg>
-                <span>CBS / PSFP</span>
-              </NavLink>
-              <NavLink to="/qos" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-                <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                </svg>
-                <span>QoS</span>
+                <span>QoS / CBS / PSFP</span>
               </NavLink>
             </div>
 
@@ -157,7 +150,6 @@ function App() {
             <Route path="/patch" element={<Patch config={transportConfig} />} />
             <Route path="/ptp" element={<PTP config={transportConfig} />} />
             <Route path="/tas" element={<TAS config={transportConfig} />} />
-            <Route path="/cbs" element={<CBS config={transportConfig} />} />
             <Route path="/qos" element={<QoS config={transportConfig} />} />
             <Route path="/settings" element={<Settings config={transportConfig} setConfig={setTransportConfig} />} />
           </Routes>
