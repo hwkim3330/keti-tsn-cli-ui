@@ -351,19 +351,21 @@ function buildiPatchRequest(patch, options = {}) {
 
 /**
  * Build POST request (RPC/action invocation)
- * @param {Object|Map} payload - CBOR-encodable payload
+ * @param {Object|Map|Buffer} payload - CBOR-encodable payload or Buffer
  * @param {Object} options - Additional options
+ * @param {string} options.uriPath - Custom URI path (default: 'c')
  * @returns {Buffer} CoAP message
  */
 function buildPostRequest(payload, options = {}) {
-  const encodedPayload = cborEncode(payload);
+  const encodedPayload = Buffer.isBuffer(payload) ? payload : cborEncode(payload);
+  const uriPath = options.uriPath || 'c';
 
   return buildMessage({
     type: MessageType.CON,
     code: MethodCode.POST,
     token: options.token || Buffer.alloc(0),
     options: [
-      { number: OptionNumber.URI_PATH, value: 'c' },
+      { number: OptionNumber.URI_PATH, value: uriPath },
       { number: OptionNumber.CONTENT_FORMAT, value: ContentFormat.YANG_INSTANCES_CBOR },
       { number: OptionNumber.ACCEPT, value: ContentFormat.YANG_DATA_CBOR_SID }
     ],

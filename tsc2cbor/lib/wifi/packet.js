@@ -6,7 +6,7 @@
  * any additional wrapping.
  *
  * Architecture:
- *   Host (Station) --[UDP/MUP1]--> ESP32 (AP) --[Serial/MUP1]--> LAN9662
+ *   Host (Station) --[UDP/MUP1]--> ESP32 (AP) --[Serial/MUP1]--> LAN9692
  *
  * Protocol Flow:
  *   1. Host connects to ESP32's WiFi AP (e.g., SSID: "TSN-Debug")

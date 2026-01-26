@@ -1,5 +1,7 @@
 import express from 'express';
 import { SerialPort } from 'serialport';
+import { execSync } from 'child_process';
+import os from 'os';
 
 const router = express.Router();
 
@@ -29,6 +31,88 @@ router.get('/defaults', (req, res) => {
     host: '192.168.4.1',
     port: 5683
   });
+});
+
+// Check if running as hotspot and get connected devices
+router.get('/hotspot', async (req, res) => {
+  try {
+    // Check if we have 10.42.0.1 (GNOME hotspot default)
+    const interfaces = os.networkInterfaces();
+    let hotspotInterface = null;
+    let hotspotIP = null;
+
+    for (const [name, addrs] of Object.entries(interfaces)) {
+      for (const addr of addrs) {
+        if (addr.family === 'IPv4' && addr.address.startsWith('10.42.0.')) {
+          hotspotInterface = name;
+          hotspotIP = addr.address;
+          break;
+        }
+      }
+    }
+
+    if (!hotspotInterface) {
+      return res.json({ active: false, devices: [] });
+    }
+
+    // Get ARP table for connected devices
+    const devices = [];
+    try {
+      const arpOutput = execSync('ip neigh show', { encoding: 'utf-8' });
+      const lines = arpOutput.split('\n');
+
+      for (const line of lines) {
+        // Format: 10.42.0.11 dev ap0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+        const match = line.match(/^(10\.42\.0\.\d+)\s+dev\s+(\S+)\s+lladdr\s+([0-9a-f:]+)\s+(\S+)/i);
+        if (match) {
+          const [, ip, dev, mac, state] = match;
+          if (ip !== hotspotIP) { // Exclude self
+            devices.push({
+              ip,
+              mac,
+              interface: dev,
+              state: state.toLowerCase(),
+              reachable: ['reachable', 'stale', 'delay'].includes(state.toLowerCase())
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // ip neigh failed, try arp -a
+      try {
+        const arpOutput = execSync('arp -a', { encoding: 'utf-8' });
+        const lines = arpOutput.split('\n');
+
+        for (const line of lines) {
+          const match = line.match(/\(?(10\.42\.0\.\d+)\)?\s+.*?([0-9a-f:]{17})/i);
+          if (match) {
+            const [, ip, mac] = match;
+            if (ip !== hotspotIP) {
+              devices.push({ ip, mac, reachable: true });
+            }
+          }
+        }
+      } catch (e2) {
+        // Both failed
+      }
+    }
+
+    // Sort by IP
+    devices.sort((a, b) => {
+      const aNum = parseInt(a.ip.split('.')[3]);
+      const bNum = parseInt(b.ip.split('.')[3]);
+      return aNum - bNum;
+    });
+
+    res.json({
+      active: true,
+      interface: hotspotInterface,
+      hostIP: hotspotIP,
+      devices
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

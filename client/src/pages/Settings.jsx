@@ -12,26 +12,37 @@ function Settings({ config, setConfig }) {
   const [editingDevice, setEditingDevice] = useState(null)
   const [newDevice, setNewDevice] = useState({ name: '', host: '', port: 5683, transport: 'wifi', device: '/dev/ttyACM0' })
 
+  // Hotspot connected devices
+  const [hotspot, setHotspot] = useState({ active: false, devices: [] })
+  const [scanningHotspot, setScanningHotspot] = useState(false)
+
   // Load saved devices from localStorage
   useEffect(() => {
+    const DEVICES_VERSION = 2 // Increment to reset defaults
+    const savedVersion = localStorage.getItem('tsn-devices-version')
     const savedDevices = localStorage.getItem('tsn-devices')
-    if (savedDevices) {
+
+    // Default devices (PC hotspot: 10.42.0.1, ESP32s: 10.42.0.11~)
+    const defaultDevices = [
+      { id: 1, name: 'ESP32 #1', host: '10.42.0.11', port: 5683, transport: 'wifi' },
+      { id: 2, name: 'ESP32 #2', host: '10.42.0.12', port: 5683, transport: 'wifi' },
+      { id: 3, name: 'ESP32 #3', host: '10.42.0.13', port: 5683, transport: 'wifi' },
+      { id: 4, name: 'ESP32 #4', host: '10.42.0.14', port: 5683, transport: 'wifi' }
+    ]
+
+    if (savedDevices && savedVersion === String(DEVICES_VERSION)) {
       setDevices(JSON.parse(savedDevices))
     } else {
-      // Default devices (PC hotspot: 10.42.0.1, ESP32s: 10.42.0.11~)
-      const defaultDevices = [
-        { id: 1, name: 'ESP32 #1', host: '10.42.0.11', port: 5683, transport: 'wifi' },
-        { id: 2, name: 'ESP32 #2', host: '10.42.0.12', port: 5683, transport: 'wifi' },
-        { id: 3, name: 'ESP32 #3', host: '10.42.0.13', port: 5683, transport: 'wifi' },
-        { id: 4, name: 'ESP32 #4', host: '10.42.0.14', port: 5683, transport: 'wifi' }
-      ]
+      // Reset to defaults on version change
       setDevices(defaultDevices)
       localStorage.setItem('tsn-devices', JSON.stringify(defaultDevices))
+      localStorage.setItem('tsn-devices-version', String(DEVICES_VERSION))
     }
   }, [])
 
   useEffect(() => {
     fetchPorts()
+    scanHotspot()
   }, [])
 
   // Save devices to localStorage whenever they change
@@ -51,6 +62,35 @@ function Settings({ config, setConfig }) {
     } finally {
       setLoading(false)
     }
+  }
+
+  const scanHotspot = async () => {
+    setScanningHotspot(true)
+    try {
+      const response = await axios.get('/api/config/hotspot')
+      setHotspot(response.data)
+    } catch (error) {
+      console.error('Error scanning hotspot:', error)
+    } finally {
+      setScanningHotspot(false)
+    }
+  }
+
+  const addHotspotDevice = (ip) => {
+    // Check if device already exists
+    const exists = devices.some(d => d.host === ip)
+    if (exists) return
+
+    const newId = Date.now()
+    const deviceNum = devices.filter(d => d.name.startsWith('ESP32')).length + 1
+    const device = {
+      id: newId,
+      name: `ESP32 #${deviceNum}`,
+      host: ip,
+      port: 5683,
+      transport: 'wifi'
+    }
+    setDevices([...devices, device])
   }
 
   const handleTransportChange = (transport) => {
@@ -125,6 +165,77 @@ function Settings({ config, setConfig }) {
         <h1 className="page-title">Settings</h1>
         <p className="page-description">Configure transport and device connections</p>
       </div>
+
+      {/* Hotspot Connected Devices */}
+      {hotspot.active && (
+        <div className="card" style={{ marginBottom: '16px', background: '#f0fdf4', border: '1px solid #bbf7d0' }}>
+          <div className="card-header">
+            <h2 className="card-title" style={{ color: '#166534' }}>
+              Hotspot Connected Devices
+            </h2>
+            <button
+              className="btn btn-secondary"
+              onClick={scanHotspot}
+              disabled={scanningHotspot}
+              style={{ fontSize: '0.75rem', padding: '4px 12px' }}
+            >
+              {scanningHotspot ? 'Scanning...' : 'Refresh'}
+            </button>
+          </div>
+          <p style={{ fontSize: '0.8rem', color: '#166534', marginBottom: '12px' }}>
+            Host IP: <strong>{hotspot.hostIP}</strong> ({hotspot.interface})
+          </p>
+
+          {hotspot.devices.length === 0 ? (
+            <p style={{ fontSize: '0.85rem', color: '#64748b' }}>No devices connected to hotspot</p>
+          ) : (
+            <div style={{ display: 'grid', gap: '8px' }}>
+              {hotspot.devices.map((dev) => {
+                const alreadySaved = devices.some(d => d.host === dev.ip)
+                return (
+                  <div
+                    key={dev.ip}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '10px 14px',
+                      background: '#fff',
+                      border: '1px solid #d1fae5',
+                      borderRadius: '6px'
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontWeight: '500', fontFamily: 'monospace' }}>{dev.ip}</div>
+                      <div style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                        MAC: {dev.mac} {dev.state && `(${dev.state})`}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        className="btn btn-primary"
+                        style={{ fontSize: '0.75rem', padding: '4px 12px' }}
+                        onClick={() => setConfig({ ...config, transport: 'wifi', host: dev.ip, port: 5683 })}
+                      >
+                        Connect
+                      </button>
+                      {!alreadySaved && (
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.75rem', padding: '4px 12px' }}
+                          onClick={() => addHotspotDevice(dev.ip)}
+                        >
+                          + Save
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Device List */}
       <div className="card">
@@ -429,14 +540,14 @@ function Settings({ config, setConfig }) {
           <pre style={{ margin: 0 }}>{`
 ${config.transport === 'wifi' ? `
 ┌─────────────┐      WiFi (UDP)      ┌─────────────┐      Serial      ┌─────────────┐
-│  Host (PC)  │ ◀─────────────────▶  │   ESP32     │ ◀─────────────▶  │  LAN9662    │
+│  Host (PC)  │ ◀─────────────────▶  │   ESP32     │ ◀─────────────▶  │  LAN9692    │
 │  (Station)  │     MUP1 frames      │   (Bridge)  │     MUP1         │  (Target)   │
 └─────────────┘      Port ${config.port}       └─────────────┘                  └─────────────┘
        │               ${config.host}              │
        └──────── WiFi Connection ──────────────────┘
 ` : `
 ┌─────────────┐      USB/UART       ┌─────────────┐
-│  Host (PC)  │ ◀─────────────────▶ │  LAN9662    │
+│  Host (PC)  │ ◀─────────────────▶ │  LAN9692    │
 │             │     MUP1 frames     │  (Target)   │
 └─────────────┘    ${config.device}    └─────────────┘
 `}

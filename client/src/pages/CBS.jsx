@@ -134,7 +134,7 @@ function CBS({ config }) {
           <div className="form-group">
             <label className="form-label">Port</label>
             <select className="form-select" value={portNumber} onChange={(e) => setPortNumber(e.target.value)}>
-              {[1,2,3,4,5,6,7,8].map(p => <option key={p} value={p}>Port {p}</option>)}
+              {Array.from({length: 12}, (_, i) => i + 1).map(p => <option key={p} value={p}>Port {p}</option>)}
             </select>
           </div>
           <div className="form-group">

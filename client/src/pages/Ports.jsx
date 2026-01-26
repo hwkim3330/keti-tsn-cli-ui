@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 
 function Ports({ config }) {
   const [loading, setLoading] = useState(false)
@@ -9,8 +10,41 @@ function Ports({ config }) {
   const [portDetail, setPortDetail] = useState(null)
   const [portStats, setPortStats] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [lastFetched, setLastFetched] = useState(null)
+
+  // Real-time monitoring
+  const [monitoring, setMonitoring] = useState(false)
+  const [statsHistory, setStatsHistory] = useState([])
+  const [prevStats, setPrevStats] = useState(null)
+  const monitoringRef = useRef(false)
+  const pollIntervalRef = useRef(null)
 
   const portCount = 12 // LAN9692: 7 PHY + 4 SFP + 1 internal
+  const cacheKey = `ports_${config.host}`
+
+  // Load cached data on mount
+  useEffect(() => {
+    const cached = localStorage.getItem(cacheKey)
+    if (cached) {
+      try {
+        const data = JSON.parse(cached)
+        setPorts(data.ports || [])
+        setLastFetched(data.timestamp ? new Date(data.timestamp) : null)
+      } catch (e) {
+        console.error('Failed to load cached ports:', e)
+      }
+    }
+  }, [cacheKey])
+
+  // Save to cache when ports change
+  const saveCache = (portData) => {
+    const data = { ports: portData, timestamp: new Date().toISOString() }
+    localStorage.setItem(cacheKey, JSON.stringify(data))
+    setLastFetched(new Date())
+  }
+
+  // Small delay helper
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
   // Fetch single port basic status with timeout
   const fetchPortStatus = async (portNum) => {
@@ -22,7 +56,7 @@ function Ports({ config }) {
         device: config.device,
         host: config.host,
         port: config.port
-      }, { timeout: 5000 })
+      }, { timeout: 8000 })
 
       const result = response.data.result || ''
       const operStatus = result.includes('up') ? 'up' : 'down'
@@ -39,14 +73,18 @@ function Ports({ config }) {
     const portData = []
 
     for (let i = 1; i <= portCount; i++) {
+      // Add small delay between requests to let device recover
+      if (i > 1) await delay(200)
       const status = await fetchPortStatus(i)
       portData.push(status)
       // Update state incrementally so user sees progress
       setPorts([...portData])
     }
 
+    // Save successful fetch to cache
+    saveCache(portData)
     setLoading(false)
-  }, [config])
+  }, [config, cacheKey])
 
   // Fetch detailed info for selected port
   const fetchPortDetail = async (portNum) => {
@@ -166,6 +204,104 @@ function Ports({ config }) {
     return stats
   }
 
+  // Fetch stats for monitoring (lightweight, no state updates except stats)
+  const fetchStatsOnly = async (portNum) => {
+    const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
+    try {
+      const response = await axios.post('/api/fetch', {
+        paths: [`${basePath}/statistics`],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 5000 })
+      return parseStatsResponse(response.data.result)
+    } catch {
+      return null
+    }
+  }
+
+  // Start/stop monitoring
+  const toggleMonitoring = () => {
+    if (monitoring) {
+      // Stop monitoring
+      monitoringRef.current = false
+      setMonitoring(false)
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+    } else {
+      // Start monitoring
+      monitoringRef.current = true
+      setMonitoring(true)
+      setStatsHistory([])
+      setPrevStats(null)
+
+      // Poll every 2 seconds
+      const poll = async () => {
+        if (!monitoringRef.current || !selectedPort) return
+
+        const stats = await fetchStatsOnly(selectedPort)
+        if (!stats || !monitoringRef.current) return
+
+        setStatsHistory(prev => {
+          const now = new Date()
+          const timeLabel = now.toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+          // Calculate rate (bytes/sec)
+          let rxRate = 0, txRate = 0
+          if (prevStats) {
+            rxRate = Math.max(0, stats.inOctets - prevStats.inOctets) / 2  // 2 second interval
+            txRate = Math.max(0, stats.outOctets - prevStats.outOctets) / 2
+          }
+          setPrevStats(stats)
+
+          const newEntry = {
+            time: timeLabel,
+            rx: Math.round(rxRate),
+            tx: Math.round(txRate),
+            rxTotal: stats.inOctets,
+            txTotal: stats.outOctets
+          }
+
+          // Keep last 30 data points (1 minute of data)
+          const updated = [...prev, newEntry]
+          if (updated.length > 30) updated.shift()
+          return updated
+        })
+      }
+
+      // Initial poll
+      poll()
+      pollIntervalRef.current = setInterval(poll, 2000)
+    }
+  }
+
+  // Cleanup monitoring on port change or unmount
+  useEffect(() => {
+    return () => {
+      monitoringRef.current = false
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+      }
+    }
+  }, [])
+
+  // Stop monitoring when port changes
+  useEffect(() => {
+    if (monitoring) {
+      monitoringRef.current = false
+      setMonitoring(false)
+      setStatsHistory([])
+      setPrevStats(null)
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+    }
+  }, [selectedPort])
+
   // Toggle port enabled state
   const togglePort = async (portNum, currentEnabled) => {
     setDetailLoading(true)
@@ -217,9 +353,12 @@ function Ports({ config }) {
     }
   }
 
-  // Initial fetch
+  // Initial fetch only if no cache
   useEffect(() => {
-    fetchAllPorts()
+    const cached = localStorage.getItem(cacheKey)
+    if (!cached) {
+      fetchAllPorts()
+    }
   }, [config.host])
 
   // Fetch detail when port selected
@@ -267,8 +406,15 @@ function Ports({ config }) {
             {loading ? `Loading... (${ports.length}/${portCount})` : 'Refresh All'}
           </button>
         </div>
-        <div style={{ padding: '10px', background: '#f8fafc', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.85rem' }}>
-          {config.transport === 'wifi' ? `${config.host}:${config.port}` : config.device}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px', background: '#f8fafc', borderRadius: '6px' }}>
+          <span style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+            {config.transport === 'wifi' ? `${config.host}:${config.port}` : config.device}
+          </span>
+          {lastFetched && (
+            <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+              Last updated: {lastFetched.toLocaleTimeString()}
+            </span>
+          )}
         </div>
       </div>
 
@@ -406,9 +552,85 @@ function Ports({ config }) {
           {/* Port Statistics */}
           {portStats && (
             <div>
-              <h3 style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '12px', color: '#334155' }}>
-                Statistics
-              </h3>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <h3 style={{ fontSize: '0.9rem', fontWeight: '600', color: '#334155', margin: 0 }}>
+                  Statistics
+                </h3>
+                <button
+                  className={`btn ${monitoring ? 'btn-danger' : 'btn-primary'}`}
+                  onClick={toggleMonitoring}
+                  style={{ fontSize: '0.75rem', padding: '4px 10px' }}
+                >
+                  {monitoring ? 'Stop Monitoring' : 'Start Monitoring'}
+                </button>
+              </div>
+
+              {/* Real-time Graph */}
+              {monitoring && statsHistory.length > 0 && (
+                <div style={{ marginBottom: '20px', padding: '16px', background: '#f8fafc', borderRadius: '8px' }}>
+                  <h4 style={{ fontSize: '0.85rem', fontWeight: '600', marginBottom: '12px', color: '#475569' }}>
+                    Traffic Rate (Bytes/sec)
+                  </h4>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <LineChart data={statsHistory} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={{ fontSize: 10 }}
+                        tickLine={false}
+                        interval="preserveStartEnd"
+                      />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        tickFormatter={(val) => {
+                          if (val >= 1000000) return `${(val / 1000000).toFixed(1)}M`
+                          if (val >= 1000) return `${(val / 1000).toFixed(0)}K`
+                          return val
+                        }}
+                      />
+                      <Tooltip
+                        formatter={(value, name) => {
+                          const label = name === 'rx' ? 'RX' : 'TX'
+                          if (value >= 1000000) return [`${(value / 1000000).toFixed(2)} MB/s`, label]
+                          if (value >= 1000) return [`${(value / 1000).toFixed(2)} KB/s`, label]
+                          return [`${value} B/s`, label]
+                        }}
+                        labelStyle={{ fontSize: 11 }}
+                        contentStyle={{ fontSize: 11 }}
+                      />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Line
+                        type="monotone"
+                        dataKey="rx"
+                        stroke="#22c55e"
+                        strokeWidth={2}
+                        dot={false}
+                        name="RX"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="tx"
+                        stroke="#3b82f6"
+                        strokeWidth={2}
+                        dot={false}
+                        name="TX"
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                  <div style={{ display: 'flex', justifyContent: 'center', gap: '24px', marginTop: '8px', fontSize: '0.75rem', color: '#64748b' }}>
+                    <span>Polling: 2s interval</span>
+                    <span>History: {statsHistory.length} samples</span>
+                  </div>
+                </div>
+              )}
+
+              {monitoring && statsHistory.length === 0 && (
+                <div style={{ marginBottom: '20px', padding: '24px', background: '#f8fafc', borderRadius: '8px', textAlign: 'center', color: '#64748b' }}>
+                  Collecting data...
+                </div>
+              )}
 
               {/* Summary */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '8px', marginBottom: '16px' }}>

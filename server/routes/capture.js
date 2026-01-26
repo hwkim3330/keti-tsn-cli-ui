@@ -1,0 +1,460 @@
+import express from 'express';
+import Cap from 'cap';
+
+const router = express.Router();
+const { Cap: CapLib, decoders } = Cap;
+
+// Multiple captures (one per interface)
+let captures = new Map(); // interface name -> { cap, packetCount }
+let wsClients = new Set();
+let globalPacketCount = 0;
+
+// CoAP message types
+const COAP_TYPES = { 0: 'CON', 1: 'NON', 2: 'ACK', 3: 'RST' };
+
+// CoAP method codes
+const COAP_METHODS = {
+  0: 'EMPTY', 1: 'GET', 2: 'POST', 3: 'PUT', 4: 'DELETE',
+  5: 'FETCH', 6: 'PATCH', 7: 'iPATCH'
+};
+
+// CoAP response codes
+const COAP_RESPONSES = {
+  65: '2.01 Created', 66: '2.02 Deleted', 67: '2.03 Valid',
+  68: '2.04 Changed', 69: '2.05 Content',
+  128: '4.00 Bad Request', 129: '4.01 Unauthorized',
+  132: '4.04 Not Found', 133: '4.05 Method Not Allowed',
+  160: '5.00 Internal Server Error'
+};
+
+// PTP message types (IEEE 1588)
+const PTP_MSG_TYPES = {
+  0x0: 'Sync',
+  0x1: 'Delay_Req',
+  0x2: 'Pdelay_Req',
+  0x3: 'Pdelay_Resp',
+  0x8: 'Follow_Up',
+  0x9: 'Delay_Resp',
+  0xA: 'Pdelay_Resp_Follow_Up',
+  0xB: 'Announce',
+  0xC: 'Signaling',
+  0xD: 'Management'
+};
+
+// Parse PTP packet (IEEE 1588-2008)
+function parsePTP(buffer) {
+  if (buffer.length < 34) return null;
+
+  const msgType = buffer[0] & 0x0F;
+  const version = buffer[1] & 0x0F;
+
+  if (version !== 2) return null; // PTPv2 only
+
+  const msgLength = buffer.readUInt16BE(2);
+  const domainNumber = buffer[4];
+  const flags = buffer.readUInt16BE(6);
+  const correctionNs = buffer.readBigInt64BE(8);
+
+  // Source port identity (8 bytes clock ID + 2 bytes port)
+  const clockId = buffer.slice(20, 28).toString('hex').match(/.{2}/g).join(':');
+  const sourcePort = buffer.readUInt16BE(28);
+
+  const sequenceId = buffer.readUInt16BE(30);
+  const controlField = buffer[32];
+
+  // Timestamp (seconds + nanoseconds) - only in some message types
+  let timestamp = null;
+  if ([0x0, 0x1, 0x2, 0x3, 0x8, 0x9, 0xA].includes(msgType) && buffer.length >= 44) {
+    const seconds = buffer.readUIntBE(34, 6);
+    const nanoseconds = buffer.readUInt32BE(40);
+    timestamp = { seconds, nanoseconds };
+  }
+
+  return {
+    msgType: PTP_MSG_TYPES[msgType] || `Unknown(${msgType})`,
+    msgTypeRaw: msgType,
+    version,
+    length: msgLength,
+    domain: domainNumber,
+    flags,
+    correction: Number(correctionNs) / 65536, // Convert to nanoseconds
+    clockId,
+    sourcePort,
+    sequenceId,
+    timestamp
+  };
+}
+
+// Parse CoAP packet
+function parseCoAP(buffer, offset = 0) {
+  if (buffer.length < offset + 4) return null;
+
+  const firstByte = buffer[offset];
+  const version = (firstByte >> 6) & 0x03;
+  const type = (firstByte >> 4) & 0x03;
+  const tokenLen = firstByte & 0x0f;
+
+  if (version !== 1) return null;
+
+  const code = buffer[offset + 1];
+  const codeClass = (code >> 5) & 0x07;
+  const codeDetail = code & 0x1f;
+  const messageId = buffer.readUInt16BE(offset + 2);
+
+  let codeStr;
+  if (codeClass === 0) {
+    codeStr = COAP_METHODS[codeDetail] || `0.${codeDetail.toString().padStart(2, '0')}`;
+  } else {
+    codeStr = COAP_RESPONSES[code] || `${codeClass}.${codeDetail.toString().padStart(2, '0')}`;
+  }
+
+  const token = buffer.slice(offset + 4, offset + 4 + tokenLen);
+
+  // Skip options to find payload
+  let optionOffset = offset + 4 + tokenLen;
+  while (optionOffset < buffer.length && buffer[optionOffset] !== 0xFF) {
+    const optByte = buffer[optionOffset++];
+    let delta = (optByte >> 4) & 0x0f;
+    let length = optByte & 0x0f;
+    if (delta === 13) { delta = buffer[optionOffset++] + 13; }
+    else if (delta === 14) { delta = buffer.readUInt16BE(optionOffset) + 269; optionOffset += 2; }
+    if (length === 13) { length = buffer[optionOffset++] + 13; }
+    else if (length === 14) { length = buffer.readUInt16BE(optionOffset) + 269; optionOffset += 2; }
+    optionOffset += length;
+  }
+  if (optionOffset < buffer.length && buffer[optionOffset] === 0xFF) optionOffset++;
+
+  const payload = optionOffset < buffer.length ? buffer.slice(optionOffset) : Buffer.alloc(0);
+
+  return {
+    type: COAP_TYPES[type],
+    code: codeStr,
+    messageId,
+    token: token.toString('hex'),
+    payloadLen: payload.length,
+    payload
+  };
+}
+
+// Set WebSocket clients
+export function setWsClients(clients) {
+  wsClients = clients;
+}
+
+// Get current capture state for sync
+export function getCaptureState() {
+  const active = [];
+  for (const [name, info] of captures) {
+    active.push({ interface: name, packetCount: info.packetCount });
+  }
+  return {
+    running: captures.size > 0,
+    activeCaptures: active,
+    totalInterfaces: captures.size,
+    globalPacketCount
+  };
+}
+
+function broadcast(data) {
+  const message = JSON.stringify(data);
+  wsClients.forEach(client => {
+    try {
+      if (client.readyState === 1) client.send(message);
+    } catch (e) {
+      // Ignore send errors
+    }
+  });
+}
+
+function toHex(buffer) {
+  return Array.from(buffer).map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+function toAscii(buffer) {
+  return Array.from(buffer).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('');
+}
+
+// Get available interfaces
+router.get('/interfaces', (req, res) => {
+  try {
+    const devices = CapLib.deviceList();
+    res.json(devices.map(d => ({
+      name: d.name,
+      description: d.description || d.name,
+      addresses: d.addresses?.map(a => a.addr).filter(Boolean) || []
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start capture on one or more interfaces
+router.post('/start', (req, res) => {
+  const { interfaces: ifaces = [], port: portParam = 5683, host = '', captureMode = 'coap', ptpMode } = req.body;
+  const port = parseInt(portParam, 10) || 5683; // Ensure port is always a number
+
+  // Support legacy ptpMode parameter
+  const mode = ptpMode ? 'ptp' : (captureMode || 'coap');
+
+  // Support single interface (string) or multiple (array)
+  const interfaceList = Array.isArray(ifaces) ? ifaces : (ifaces ? [ifaces] : []);
+
+  if (interfaceList.length === 0) {
+    // Auto-detect
+    const device = CapLib.findDevice();
+    if (device) interfaceList.push(device);
+  }
+
+  if (interfaceList.length === 0) {
+    return res.status(400).json({ error: 'No network interface specified or found' });
+  }
+
+  // Check for already running captures
+  const alreadyRunning = interfaceList.filter(i => captures.has(i));
+  if (alreadyRunning.length > 0) {
+    return res.status(400).json({ error: `Capture already running on: ${alreadyRunning.join(', ')}` });
+  }
+
+  const started = [];
+  const failed = [];
+
+  for (const ifaceName of interfaceList) {
+    try {
+      const cap = new CapLib();
+      const buffer = Buffer.alloc(65535);
+
+      // Build filter based on capture mode
+      let filter;
+      if (mode === 'all') {
+        // Capture all IP packets (no filter)
+        filter = 'ip';
+      } else if (mode === 'ptp') {
+        // PTP uses UDP ports 319 (event) and 320 (general)
+        filter = 'udp port 319 or udp port 320';
+      } else {
+        // CoAP mode
+        filter = `udp port ${port}`;
+        if (host) filter += ` and host ${host}`;
+      }
+
+      const bufSize = 10 * 1024 * 1024;
+      const linkType = cap.open(ifaceName, filter, bufSize, buffer);
+      cap.setMinBytes && cap.setMinBytes(0);
+
+      const captureInfo = { cap, packetCount: 0, linkType, ifaceName };
+      captures.set(ifaceName, captureInfo);
+
+      cap.on('packet', (nbytes, trunc) => {
+        if (nbytes <= 0) return;
+
+        const rawPacket = buffer.slice(0, nbytes);
+        const captureTime = process.hrtime.bigint(); // High-resolution timestamp
+
+        try {
+          // Decode layers
+          let ethInfo, ipInfo, udpInfo, tcpInfo;
+          let ipOffset = 0;
+
+          if (linkType === 'ETHERNET') {
+            ethInfo = decoders.Ethernet(rawPacket);
+            if (ethInfo.info?.type !== 0x0800) return; // IPv4 only for now
+            ipOffset = ethInfo.offset;
+          }
+
+          ipInfo = decoders.IPV4(rawPacket, ipOffset);
+          const ipProtocol = ipInfo.info?.protocol;
+
+          // Determine protocol and ports
+          let protocol = 'IP';
+          let srcPort = 0;
+          let dstPort = 0;
+          let coap = null;
+          let ptp = null;
+          let tcp = null;
+          let info = '';
+          let udpPayload = null;
+
+          if (ipProtocol === 17) {
+            // UDP
+            udpInfo = decoders.UDP(rawPacket, ipInfo.offset);
+            srcPort = udpInfo.info.srcport;
+            dstPort = udpInfo.info.dstport;
+            protocol = 'UDP';
+            info = `UDP ${srcPort} -> ${dstPort}`;
+
+            // UDP header is 8 bytes, payload starts after
+            const udpPayloadOffset = ipInfo.offset + 8;
+            udpPayload = rawPacket.slice(udpPayloadOffset);
+
+            // Check for PTP (ports 319, 320)
+            if (srcPort === 319 || srcPort === 320 || dstPort === 319 || dstPort === 320) {
+              ptp = parsePTP(udpPayload);
+              if (ptp) {
+                protocol = 'PTP';
+                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domain}`;
+                if (ptp.timestamp) {
+                  info += ` T=${ptp.timestamp.seconds}.${ptp.timestamp.nanoseconds.toString().padStart(9, '0')}`;
+                }
+                if (ptp.correction !== 0) {
+                  info += ` Corr=${ptp.correction.toFixed(0)}ns`;
+                }
+              }
+            }
+            // Check for CoAP (port 5683 or custom)
+            else if (srcPort === port || dstPort === port) {
+              coap = parseCoAP(udpPayload);
+              if (coap) {
+                protocol = 'CoAP';
+                info = `${coap.type} ${coap.code} MID=${coap.messageId}`;
+                if (coap.payloadLen > 0) info += ` [${coap.payloadLen} bytes]`;
+              }
+            }
+          } else if (ipProtocol === 6) {
+            // TCP
+            tcpInfo = decoders.TCP(rawPacket, ipInfo.offset);
+            srcPort = tcpInfo.info.srcport;
+            dstPort = tcpInfo.info.dstport;
+            protocol = 'TCP';
+
+            const flags = [];
+            if (tcpInfo.info.flags?.syn) flags.push('SYN');
+            if (tcpInfo.info.flags?.ack) flags.push('ACK');
+            if (tcpInfo.info.flags?.fin) flags.push('FIN');
+            if (tcpInfo.info.flags?.rst) flags.push('RST');
+            if (tcpInfo.info.flags?.psh) flags.push('PSH');
+
+            info = `TCP ${srcPort} -> ${dstPort}`;
+            if (flags.length > 0) info += ` [${flags.join(',')}]`;
+            tcp = { srcPort, dstPort, flags: tcpInfo.info.flags, seq: tcpInfo.info.seqno, ack: tcpInfo.info.ackno };
+          } else if (ipProtocol === 1) {
+            // ICMP
+            protocol = 'ICMP';
+            const icmpType = rawPacket[ipInfo.offset];
+            const icmpCode = rawPacket[ipInfo.offset + 1];
+            const icmpTypes = { 0: 'Echo Reply', 8: 'Echo Request', 3: 'Dest Unreachable', 11: 'Time Exceeded' };
+            info = `ICMP ${icmpTypes[icmpType] || `Type ${icmpType}`} Code ${icmpCode}`;
+          } else {
+            // Other protocols
+            const protoNames = { 2: 'IGMP', 47: 'GRE', 50: 'ESP', 51: 'AH', 89: 'OSPF' };
+            protocol = protoNames[ipProtocol] || `IP(${ipProtocol})`;
+            info = `${protocol} packet`;
+          }
+
+          captureInfo.packetCount++;
+          globalPacketCount++;
+
+          const packet = {
+            id: globalPacketCount,
+            time: new Date().toISOString(),
+            captureNs: captureTime.toString(),
+            interface: ifaceName,
+            source: ipInfo.info.srcaddr,
+            srcPort,
+            destination: ipInfo.info.dstaddr,
+            dstPort,
+            protocol,
+            length: nbytes,
+            coap: coap ? {
+              type: coap.type,
+              code: coap.code,
+              messageId: coap.messageId,
+              token: coap.token,
+              payloadLen: coap.payloadLen
+            } : null,
+            ptp: ptp ? {
+              msgType: ptp.msgType,
+              sequenceId: ptp.sequenceId,
+              domain: ptp.domain,
+              clockId: ptp.clockId,
+              sourcePort: ptp.sourcePort,
+              timestamp: ptp.timestamp,
+              correction: ptp.correction
+            } : null,
+            tcp: tcp,
+            info,
+            hex: toHex(rawPacket),
+            ascii: toAscii(rawPacket),
+            payloadHex: udpPayload ? toHex(udpPayload) : null,
+            payloadAscii: udpPayload ? toAscii(udpPayload) : null
+          };
+
+          broadcast({ type: 'packet', data: packet });
+        } catch (err) {
+          // Log decode errors for debugging
+          if (!captureInfo.errorCount) captureInfo.errorCount = 0;
+          captureInfo.errorCount++;
+          if (captureInfo.errorCount <= 5) {
+            console.error(`Packet decode error on ${ifaceName}:`, err.message);
+          }
+        }
+      });
+
+      started.push({ interface: ifaceName, filter });
+    } catch (err) {
+      failed.push({ interface: ifaceName, error: err.message });
+    }
+  }
+
+  if (started.length === 0) {
+    return res.status(500).json({ error: 'Failed to start any capture', failed });
+  }
+
+  globalPacketCount = 0;
+  res.json({
+    success: true,
+    message: `Capture started on ${started.length} interface(s)`,
+    started,
+    failed: failed.length > 0 ? failed : undefined
+  });
+});
+
+// Stop capture (all or specific interfaces)
+router.post('/stop', (req, res) => {
+  const { interfaces: ifaces } = req.body;
+
+  let toStop;
+  if (ifaces && Array.isArray(ifaces)) {
+    toStop = ifaces;
+  } else if (ifaces) {
+    toStop = [ifaces];
+  } else {
+    toStop = Array.from(captures.keys());
+  }
+
+  const stopped = [];
+  for (const ifaceName of toStop) {
+    const captureInfo = captures.get(ifaceName);
+    if (captureInfo) {
+      try {
+        captureInfo.cap.close();
+      } catch (e) {}
+      captures.delete(ifaceName);
+      stopped.push(ifaceName);
+    }
+  }
+
+  broadcast({ type: 'stopped', interfaces: stopped });
+  res.json({ success: true, stopped });
+});
+
+// Get status
+router.get('/status', (req, res) => {
+  const active = [];
+  for (const [name, info] of captures) {
+    active.push({
+      interface: name,
+      packetCount: info.packetCount,
+      errorCount: info.errorCount || 0
+    });
+  }
+
+  res.json({
+    running: captures.size > 0,
+    activeCaptures: active,
+    totalInterfaces: captures.size,
+    clients: wsClients.size,
+    globalPacketCount
+  });
+});
+
+export default router;

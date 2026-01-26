@@ -15,6 +15,42 @@ function Dashboard({ config }) {
   const [checksumStatus, setChecksumStatus] = useState(null)
   const [checksumLoading, setChecksumLoading] = useState(false)
 
+  // Save config
+  const [saveLoading, setSaveLoading] = useState(false)
+  const [saveResult, setSaveResult] = useState(null)
+
+  // PTP status
+  const [ptpStatus, setPtpStatus] = useState(null)
+  const [ptpLoading, setPtpLoading] = useState(false)
+
+  const cacheKey = `dashboard_${config.host}`
+
+  // Load cached data on mount
+  useEffect(() => {
+    const cached = localStorage.getItem(cacheKey)
+    if (cached) {
+      try {
+        const data = JSON.parse(cached)
+        if (data.boardInfo) setBoardInfo(data.boardInfo)
+        if (data.checksumStatus) setChecksumStatus(data.checksumStatus)
+        if (data.ptpStatus) setPtpStatus(data.ptpStatus)
+      } catch (e) {
+        console.error('Failed to load cached dashboard:', e)
+      }
+    }
+  }, [cacheKey])
+
+  // Save to cache
+  const saveCache = (board, checksum, ptp) => {
+    const data = {
+      boardInfo: board,
+      checksumStatus: checksum,
+      ptpStatus: ptp,
+      timestamp: new Date().toISOString()
+    }
+    localStorage.setItem(cacheKey, JSON.stringify(data))
+  }
+
   useEffect(() => {
     const fetchData = async () => {
       try {
@@ -33,32 +69,48 @@ function Dashboard({ config }) {
     fetchData()
   }, [])
 
-  // Fetch board info when config changes
+  // Fetch board info when config changes (only if no cache)
   useEffect(() => {
-    fetchBoardInfo()
-    fetchChecksumStatus()
+    const cached = localStorage.getItem(cacheKey)
+    if (!cached) {
+      const fetchAll = async () => {
+        const board = await fetchBoardInfo()
+        const checksum = await fetchChecksumStatus()
+        const ptp = await fetchPtpStatus()
+        saveCache(board, checksum, ptp)
+      }
+      fetchAll()
+    }
   }, [config.host])
 
   const fetchBoardInfo = async () => {
     setBoardLoading(true)
     setBoardError(null)
     try {
-      // Fetch specific components only (faster than full hardware tree)
-      const response = await axios.post('/api/fetch', {
-        paths: [
-          "/ietf-hardware:hardware/component[name='Board']",
-          "/ietf-hardware:hardware/component[name='SwTmp']"
-        ],
+      // Fetch components sequentially (device can't handle concurrent requests)
+      const boardRes = await axios.post('/api/fetch', {
+        paths: ["/ietf-hardware:hardware/component[name='Board']"],
         transport: config.transport,
         device: config.device,
         host: config.host,
         port: config.port
-      }, { timeout: 8000 })
+      }, { timeout: 10000 })
 
-      const info = parseBoardInfo(response.data.result)
+      const tempRes = await axios.post('/api/fetch', {
+        paths: ["/ietf-hardware:hardware/component[name='SwTmp']"],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 10000 })
+
+      const combinedResult = (boardRes.data.result || '') + '\n' + (tempRes.data.result || '')
+      const info = parseBoardInfo(combinedResult)
       setBoardInfo(info)
+      return info
     } catch (err) {
       setBoardError(err.message)
+      return null
     } finally {
       setBoardLoading(false)
     }
@@ -72,7 +124,7 @@ function Dashboard({ config }) {
       firmware: '-',
       temperature: null,
       manufacturer: '-',
-      serial: '-'
+      chip: '-'
     }
 
     const lines = result.split('\n')
@@ -80,13 +132,15 @@ function Dashboard({ config }) {
       const trimmed = line.trim()
 
       if (trimmed.startsWith('model-name:')) {
-        info.model = trimmed.split(':').slice(1).join(':').trim()
+        const modelFull = trimmed.split(':').slice(1).join(':').trim()
+        info.model = modelFull
+        // Extract chip name (e.g., LAN9692 from "LAN9692VAO - ...")
+        const chipMatch = modelFull.match(/^(LAN\d+)/)
+        if (chipMatch) info.chip = chipMatch[1]
       } else if (trimmed.startsWith('firmware-rev:')) {
         info.firmware = trimmed.split(':')[1]?.trim()
       } else if (trimmed.startsWith('mfg-name:')) {
         info.manufacturer = trimmed.split(':')[1]?.trim()
-      } else if (trimmed.startsWith('serial-num:')) {
-        info.serial = trimmed.split(':')[1]?.trim().replace(/'/g, '')
       } else if (trimmed.startsWith('value:')) {
         info.temperature = parseInt(trimmed.split(':')[1]?.trim())
       }
@@ -105,10 +159,91 @@ function Dashboard({ config }) {
         port: config.port
       }, { timeout: 15000 })
       setChecksumStatus(response.data)
+      return response.data
     } catch (err) {
-      setChecksumStatus({ match: false, error: err.message })
+      const errorStatus = { match: false, error: err.message }
+      setChecksumStatus(errorStatus)
+      return errorStatus
     } finally {
       setChecksumLoading(false)
+    }
+  }
+
+  const fetchPtpStatus = async () => {
+    setPtpLoading(true)
+    try {
+      const response = await axios.post('/api/fetch', {
+        paths: ["/ieee1588-ptp:ptp/instances"],
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 10000 })
+      const status = parsePtpStatus(response.data.result)
+      setPtpStatus(status)
+      return status
+    } catch (err) {
+      const errorStatus = { error: err.message }
+      setPtpStatus(errorStatus)
+      return errorStatus
+    } finally {
+      setPtpLoading(false)
+    }
+  }
+
+  const parsePtpStatus = (result) => {
+    if (!result) return null
+
+    const status = {
+      clockIdentity: null,
+      grandmasterIdentity: null,
+      isGrandmaster: false,
+      offset: null,
+      portState: null,
+      instanceIndex: null
+    }
+
+    const lines = result.split('\n')
+    for (const line of lines) {
+      const trimmed = line.trim()
+
+      if (trimmed.startsWith('instance-index:')) {
+        status.instanceIndex = parseInt(trimmed.split(':')[1]?.trim())
+      } else if (trimmed.startsWith('clock-identity:')) {
+        status.clockIdentity = trimmed.split(':').slice(1).join(':').trim()
+      } else if (trimmed.startsWith('grandmaster-identity:')) {
+        status.grandmasterIdentity = trimmed.split(':').slice(1).join(':').trim()
+      } else if (trimmed.startsWith('current-utc-offset:')) {
+        status.offset = parseInt(trimmed.split(':')[1]?.trim())
+      } else if (trimmed.startsWith('port-state:')) {
+        status.portState = trimmed.split(':')[1]?.trim()
+      }
+    }
+
+    // Determine if this device is the grandmaster
+    if (status.clockIdentity && status.grandmasterIdentity) {
+      status.isGrandmaster = status.clockIdentity === status.grandmasterIdentity
+    }
+
+    return status
+  }
+
+  const saveConfig = async () => {
+    setSaveLoading(true)
+    setSaveResult(null)
+    try {
+      const response = await axios.post('/api/rpc/save-config', {
+        transport: config.transport,
+        device: config.device,
+        host: config.host,
+        port: config.port
+      }, { timeout: 15000 })
+      setSaveResult({ success: true, message: 'Configuration saved!' })
+    } catch (err) {
+      const errorMsg = err.response?.data?.error || err.message
+      setSaveResult({ success: false, message: errorMsg })
+    } finally {
+      setSaveLoading(false)
     }
   }
 
@@ -177,17 +312,38 @@ function Dashboard({ config }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <div style={{
               width: '40px', height: '40px', borderRadius: '10px',
-              background: checksumStatus?.match ? '#dcfce7' : checksumStatus?.error ? '#fee2e2' : '#f1f5f9',
+              background: checksumStatus?.cached ? '#dcfce7' : checksumStatus?.error ? '#fee2e2' : '#fef3c7',
               display: 'flex', alignItems: 'center', justifyContent: 'center'
             }}>
-              <svg width="20" height="20" fill="none" stroke={checksumStatus?.match ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#64748b'} viewBox="0 0 24 24">
+              <svg width="20" height="20" fill="none" stroke={checksumStatus?.cached ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#d97706'} viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
             </div>
             <div>
               <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Catalog Sync</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: checksumStatus?.match ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#64748b' }}>
-                {checksumLoading ? '...' : checksumStatus?.match ? 'OK' : checksumStatus?.error ? 'Error' : 'Mismatch'}
+              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: checksumStatus?.cached ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#d97706' }}>
+                {checksumLoading ? '...' : checksumStatus?.cached ? 'OK' : checksumStatus?.error ? 'Error' : 'Need Sync'}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* PTP Status */}
+        <div className="card" style={{ padding: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{
+              width: '40px', height: '40px', borderRadius: '10px',
+              background: ptpStatus?.isGrandmaster ? '#fef3c7' : ptpStatus?.error ? '#fee2e2' : ptpStatus ? '#dbeafe' : '#f1f5f9',
+              display: 'flex', alignItems: 'center', justifyContent: 'center'
+            }}>
+              <svg width="20" height="20" fill="none" stroke={ptpStatus?.isGrandmaster ? '#d97706' : ptpStatus?.error ? '#ef4444' : ptpStatus ? '#2563eb' : '#64748b'} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>PTP Role</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: ptpStatus?.isGrandmaster ? '#d97706' : ptpStatus?.error ? '#ef4444' : ptpStatus ? '#2563eb' : '#64748b' }}>
+                {ptpLoading ? '...' : ptpStatus?.isGrandmaster ? 'GM' : ptpStatus?.error ? 'Error' : ptpStatus ? 'Slave' : '-'}
               </div>
             </div>
           </div>
@@ -215,11 +371,16 @@ function Dashboard({ config }) {
           <h2 className="card-title">Board Information</h2>
           <button
             className="btn btn-secondary"
-            onClick={fetchBoardInfo}
-            disabled={boardLoading}
+            onClick={async () => {
+              const board = await fetchBoardInfo()
+              const checksum = await fetchChecksumStatus()
+              const ptp = await fetchPtpStatus()
+              saveCache(board, checksum, ptp)
+            }}
+            disabled={boardLoading || checksumLoading || ptpLoading}
             style={{ fontSize: '0.8rem', padding: '6px 12px' }}
           >
-            {boardLoading ? 'Loading...' : 'Refresh'}
+            {boardLoading || checksumLoading || ptpLoading ? 'Loading...' : 'Refresh'}
           </button>
         </div>
 
@@ -240,8 +401,8 @@ function Dashboard({ config }) {
               <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{boardInfo.manufacturer}</div>
             </div>
             <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Serial Number</div>
-              <div style={{ fontWeight: '500', fontSize: '0.9rem', fontFamily: 'monospace' }}>{boardInfo.serial}</div>
+              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Chip</div>
+              <div style={{ fontWeight: '500', fontSize: '0.9rem', fontFamily: 'monospace' }}>{boardInfo.chip}</div>
             </div>
           </div>
         ) : boardLoading ? (
@@ -250,6 +411,51 @@ function Dashboard({ config }) {
           <div style={{ padding: '20px', textAlign: 'center', color: '#64748b' }}>Click Refresh to load board info</div>
         )}
       </div>
+
+      {/* PTP Info */}
+      {ptpStatus && !ptpStatus.error && (
+        <div className="card">
+          <div className="card-header">
+            <h2 className="card-title">PTP Status</h2>
+            <span style={{
+              padding: '4px 12px',
+              borderRadius: '12px',
+              fontSize: '0.75rem',
+              fontWeight: '600',
+              background: ptpStatus.isGrandmaster ? '#fef3c7' : '#dbeafe',
+              color: ptpStatus.isGrandmaster ? '#92400e' : '#1e40af'
+            }}>
+              {ptpStatus.isGrandmaster ? 'Grandmaster' : 'Slave'}
+            </span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px' }}>
+            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Clock Identity</div>
+              <div style={{ fontWeight: '500', fontSize: '0.8rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                {ptpStatus.clockIdentity || '-'}
+              </div>
+            </div>
+            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Grandmaster Identity</div>
+              <div style={{ fontWeight: '500', fontSize: '0.8rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                {ptpStatus.grandmasterIdentity || '-'}
+              </div>
+            </div>
+            {ptpStatus.portState && (
+              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Port State</div>
+                <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{ptpStatus.portState}</div>
+              </div>
+            )}
+            {ptpStatus.offset !== null && (
+              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>UTC Offset</div>
+                <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{ptpStatus.offset}s</div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Connection Info */}
       <div className="card">
@@ -279,6 +485,34 @@ function Dashboard({ config }) {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Save Configuration */}
+      <div className="card">
+        <div className="card-header">
+          <h2 className="card-title">Save Configuration</h2>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+          <button
+            className="btn btn-primary"
+            onClick={saveConfig}
+            disabled={saveLoading}
+            style={{ minWidth: '150px' }}
+          >
+            {saveLoading ? 'Saving...' : 'Save to Startup'}
+          </button>
+          {saveResult && (
+            <span style={{
+              color: saveResult.success ? '#16a34a' : '#ef4444',
+              fontSize: '0.9rem'
+            }}>
+              {saveResult.message}
+            </span>
+          )}
+        </div>
+        <p style={{ marginTop: '8px', fontSize: '0.8rem', color: '#64748b' }}>
+          Save current running configuration to startup. Applied on next reboot.
+        </p>
       </div>
 
       {/* Quick Actions */}

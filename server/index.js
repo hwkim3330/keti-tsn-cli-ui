@@ -3,6 +3,8 @@ import cors from 'cors';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
+import http from 'http';
+import { WebSocketServer } from 'ws';
 
 import checksumRoutes from './routes/checksum.js';
 import downloadRoutes from './routes/download.js';
@@ -13,12 +15,50 @@ import fetchRoutes from './routes/fetch.js';
 import patchRoutes from './routes/patch.js';
 import getRoutes from './routes/get.js';
 import configRoutes from './routes/config.js';
+import rpcRoutes from './routes/rpc.js';
+import captureRoutes, { setWsClients, getCaptureState } from './routes/capture.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Create HTTP server
+const server = http.createServer(app);
+
+// WebSocket server for packet capture
+const wss = new WebSocketServer({ server, path: '/ws/capture' });
+const wsClients = new Set();
+
+wss.on('connection', (ws) => {
+  console.log('WebSocket client connected');
+  wsClients.add(ws);
+  setWsClients(wsClients);
+
+  // Send current capture state to newly connected client
+  const state = getCaptureState();
+  try {
+    ws.send(JSON.stringify({
+      type: 'sync',
+      data: state
+    }));
+  } catch (e) {
+    // Ignore
+  }
+
+  ws.on('close', () => {
+    console.log('WebSocket client disconnected');
+    wsClients.delete(ws);
+    setWsClients(wsClients);
+  });
+
+  ws.on('error', (err) => {
+    console.error('WebSocket error:', err.message);
+    wsClients.delete(ws);
+    setWsClients(wsClients);
+  });
+});
 
 // Middleware
 app.use(cors());
@@ -35,8 +75,15 @@ app.use('/api/fetch', fetchRoutes);
 app.use('/api/patch', patchRoutes);
 app.use('/api/get', getRoutes);
 app.use('/api/config', configRoutes);
+app.use('/api/rpc', rpcRoutes);
+app.use('/api/capture', captureRoutes);
 
-// Serve static files in production
+// Health check (must be before static wildcard)
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Serve static files in production (must be last)
 const clientBuildPath = join(__dirname, '../client/dist');
 if (fs.existsSync(clientBuildPath)) {
   app.use(express.static(clientBuildPath));
@@ -45,11 +92,7 @@ if (fs.existsSync(clientBuildPath)) {
   });
 }
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.listen(PORT, () => {
-  console.log(`TSN CLI UI Server running on http://localhost:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`TSN UI Server running on http://localhost:${PORT}`);
+  console.log(`WebSocket available at ws://localhost:${PORT}/ws/capture`);
 });

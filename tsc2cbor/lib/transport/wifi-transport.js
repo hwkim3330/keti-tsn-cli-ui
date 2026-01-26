@@ -5,7 +5,7 @@
  * Uses transparent bridging - MUP1 frames are sent directly over UDP.
  *
  * Architecture:
- *   Host (PC/Station) --[WiFi/UDP]--> Proxy (ESP32/AP) --[Serial/MUP1]--> Target (LAN9662)
+ *   Host (PC/Station) --[WiFi/UDP]--> Proxy (ESP32/AP) --[Serial/MUP1]--> Target (LAN9692)
  *
  * The ESP32 operates in AP mode, creating an isolated debugging network.
  * CoAP naturally runs over UDP (RFC 7252), making this the ideal transport.

@@ -7,21 +7,36 @@ function Patch({ config }) {
   ])
   const [newPath, setNewPath] = useState('')
   const [newValue, setNewValue] = useState('')
+  const [valueType, setValueType] = useState('auto') // auto, string, number, boolean, null
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
 
   const addPatch = () => {
-    if (newPath.trim() && newValue.trim()) {
+    if (newPath.trim() && (newValue.trim() || valueType === 'null')) {
       let parsedValue = newValue.trim()
-      // Try to parse as number or boolean
-      if (parsedValue === 'true') parsedValue = true
-      else if (parsedValue === 'false') parsedValue = false
-      else if (!isNaN(parsedValue)) parsedValue = Number(parsedValue)
+
+      // Parse value based on selected type
+      if (valueType === 'null') {
+        parsedValue = null
+      } else if (valueType === 'boolean') {
+        parsedValue = parsedValue === 'true' || parsedValue === '1'
+      } else if (valueType === 'number') {
+        parsedValue = Number(parsedValue) || 0
+      } else if (valueType === 'string') {
+        // Keep as string
+      } else {
+        // Auto-detect type
+        if (parsedValue === 'true') parsedValue = true
+        else if (parsedValue === 'false') parsedValue = false
+        else if (parsedValue === 'null') parsedValue = null
+        else if (!isNaN(parsedValue) && parsedValue !== '') parsedValue = Number(parsedValue)
+      }
 
       setPatches([...patches, { path: newPath.trim(), value: parsedValue }])
       setNewPath('')
       setNewValue('')
+      setValueType('auto')
     }
   }
 
@@ -95,11 +110,14 @@ function Patch({ config }) {
                 <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '8px', marginBottom: '4px' }}>Value</div>
                 <div style={{ fontSize: '0.875rem', fontFamily: 'monospace' }}>
                   <span style={{
-                    background: typeof patch.value === 'boolean' ? '#dbeafe' : typeof patch.value === 'number' ? '#dcfce7' : '#fef3c7',
+                    background: patch.value === null ? '#f1f5f9' : typeof patch.value === 'boolean' ? '#dbeafe' : typeof patch.value === 'number' ? '#dcfce7' : '#fef3c7',
                     padding: '2px 8px',
                     borderRadius: '4px'
                   }}>
-                    {String(patch.value)}
+                    {patch.value === null ? 'null (delete)' : String(patch.value)}
+                  </span>
+                  <span style={{ marginLeft: '8px', fontSize: '0.7rem', color: '#64748b' }}>
+                    ({patch.value === null ? 'null' : typeof patch.value})
                   </span>
                 </div>
               </div>
@@ -121,7 +139,7 @@ function Patch({ config }) {
           ))}
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr auto', gap: '8px', marginBottom: '16px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr auto auto', gap: '8px', marginBottom: '16px' }}>
           <input
             type="text"
             className="form-input"
@@ -135,8 +153,21 @@ function Patch({ config }) {
             value={newValue}
             onChange={(e) => setNewValue(e.target.value)}
             placeholder="Value"
+            disabled={valueType === 'null'}
             onKeyPress={(e) => e.key === 'Enter' && addPatch()}
           />
+          <select
+            className="form-select"
+            value={valueType}
+            onChange={(e) => setValueType(e.target.value)}
+            style={{ width: '100px' }}
+          >
+            <option value="auto">Auto</option>
+            <option value="string">String</option>
+            <option value="number">Number</option>
+            <option value="boolean">Boolean</option>
+            <option value="null">Null</option>
+          </select>
           <button className="btn btn-secondary" onClick={addPatch}>
             Add
           </button>
