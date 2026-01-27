@@ -5,6 +5,27 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 
 const TAP_INTERFACE = 'enxc84d44231cc2'
 
+// Wrap 1초 경계 처리 (0~1e9-1 범위에서 최소 변화량 계산)
+function wrapDelta(dt) {
+  if (dt > 5e8) return dt - 1e9
+  if (dt < -5e8) return dt + 1e9
+  return dt
+}
+
+// 표준편차 계산
+function std(arr) {
+  if (arr.length < 2) return 0
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length
+  const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / arr.length
+  return Math.sqrt(variance)
+}
+
+// 평균 계산
+function mean(arr) {
+  if (arr.length === 0) return 0
+  return arr.reduce((a, b) => a + b, 0) / arr.length
+}
+
 function Dashboard() {
   const { devices } = useDevices()
   const [boardStatus, setBoardStatus] = useState({})
@@ -26,6 +47,21 @@ function Dashboard() {
   const ptpStateRef = useRef({ lastSync: null, lastPdelayReq: null, lastPdelayResp: null })
   const MAX_PACKETS = 50
   const MAX_SYNC_PAIRS = 30
+
+  // PTP Offset Estimation Model
+  const [ptpFeatures, setPtpFeatures] = useState({
+    t1_ns_history: [],      // Follow_Up t1 nanoseconds
+    delta_t1_history: [],   // Wrapped delta t1
+    pdelay_gap_history: [], // Pdelay timing gap
+    d_history: [],          // Link delay samples
+  })
+  const [offsetModel, setOffsetModel] = useState({
+    weights: { w_jitter: 0, w_d: 1, w_pdelay: 0, bias: 0 },
+    trained: false,
+    samples: 0
+  })
+  const [offsetEstimates, setOffsetEstimates] = useState([]) // offset_hat time series
+  const FEATURE_WINDOW = 32 // 최근 N개 샘플로 feature 계산
 
   // Fetch GM status (full data, cached on server)
   const fetchGmHealth = useCallback(async (device) => {
@@ -162,7 +198,7 @@ function Dashboard() {
     return () => { if (wsRef.current) wsRef.current.close() }
   }, [])
 
-  // Handle PTP packet from tap
+  // Handle PTP packet from tap + Feature Extraction
   const handlePtpPacket = useCallback((packet) => {
     setPtpPackets(prev => [...prev, packet].slice(-MAX_PACKETS))
 
@@ -183,6 +219,7 @@ function Dashboard() {
     } else if (ptp.msgType === 'Follow_Up' && state.lastSync?.sequenceId === ptp.sequenceId) {
       // Follow_Up contains preciseOriginTimestamp (t1)
       const t1 = ptp.timestamp // preciseOriginTimestamp
+      const t1_ns = t1?.nanoseconds || 0
       const syncCorr = state.lastSync.correction || 0
       const followUpCorr = ptp.correction || 0
       const totalCorr = syncCorr + followUpCorr
@@ -190,36 +227,131 @@ function Dashboard() {
       setSyncPairs(prev => [...prev, {
         sequenceId: ptp.sequenceId,
         t1_sec: t1?.seconds || 0,
-        t1_ns: t1?.nanoseconds || 0,
+        t1_ns,
         syncCorr,
         followUpCorr,
         totalCorr,
         time: timeStr
       }].slice(-MAX_SYNC_PAIRS))
 
+      // Feature extraction: t1_ns history and wrapped delta
+      setPtpFeatures(prev => {
+        const newT1History = [...prev.t1_ns_history, t1_ns].slice(-FEATURE_WINDOW)
+
+        // Calculate wrapped delta
+        let newDeltaHistory = prev.delta_t1_history
+        if (prev.t1_ns_history.length > 0) {
+          const lastT1 = prev.t1_ns_history[prev.t1_ns_history.length - 1]
+          const delta = wrapDelta(t1_ns - lastT1)
+          newDeltaHistory = [...prev.delta_t1_history, delta].slice(-FEATURE_WINDOW)
+        }
+
+        return {
+          ...prev,
+          t1_ns_history: newT1History,
+          delta_t1_history: newDeltaHistory
+        }
+      })
+
+      // Calculate offset_hat if model is trained
+      if (offsetModel.trained) {
+        const features = calculateFeatures()
+        if (features) {
+          const offset_hat =
+            offsetModel.weights.w_jitter * features.jitter_t1 +
+            offsetModel.weights.w_d * features.mean_d +
+            offsetModel.weights.w_pdelay * features.jitter_pdelay +
+            offsetModel.weights.bias
+
+          setOffsetEstimates(prev => [...prev, {
+            time: timeStr,
+            offset_hat: Math.round(offset_hat),
+            jitter_t1: features.jitter_t1
+          }].slice(-120))
+        }
+      }
+
       state.lastSync = null
     } else if (ptp.msgType === 'Pdelay_Req') {
-      state.lastPdelayReq = { sequenceId: ptp.sequenceId, time: now }
+      state.lastPdelayReq = { sequenceId: ptp.sequenceId, time: now, timestamp: ptp.timestamp }
     } else if (ptp.msgType === 'Pdelay_Resp' && state.lastPdelayReq?.sequenceId === ptp.sequenceId) {
       state.lastPdelayResp = {
         sequenceId: ptp.sequenceId,
         reqTime: state.lastPdelayReq.time,
         respTime: now,
-        correction: ptp.correction || 0,
-        timestamp: ptp.timestamp
+        reqTimestamp: state.lastPdelayReq.timestamp,
+        respTimestamp: ptp.timestamp,
+        correction: ptp.correction || 0
       }
     } else if (ptp.msgType === 'Pdelay_Resp_Follow_Up' && state.lastPdelayResp?.sequenceId === ptp.sequenceId) {
-      // Complete Pdelay exchange
+      // Complete Pdelay exchange - extract pdelay_gap feature
       const rtt = state.lastPdelayResp.respTime - state.lastPdelayResp.reqTime
+      const respNs = state.lastPdelayResp.respTimestamp?.nanoseconds || 0
+      const fuNs = ptp.timestamp?.nanoseconds || 0
+      const pdelayGap = wrapDelta(fuNs - respNs)
+
       setPdelayInfo(prev => ({
         lastRtt: rtt,
         count: prev.count + 1,
-        respTimestamp: ptp.timestamp
+        respTimestamp: ptp.timestamp,
+        pdelayGap
       }))
+
+      // Feature: pdelay gap history
+      setPtpFeatures(prev => ({
+        ...prev,
+        pdelay_gap_history: [...prev.pdelay_gap_history, pdelayGap].slice(-FEATURE_WINDOW)
+      }))
+
       state.lastPdelayReq = null
       state.lastPdelayResp = null
     }
-  }, [])
+  }, [offsetModel])
+
+  // Calculate features from history
+  const calculateFeatures = useCallback(() => {
+    const { delta_t1_history, pdelay_gap_history, d_history } = ptpFeatures
+    if (delta_t1_history.length < 4) return null
+
+    return {
+      jitter_t1: std(delta_t1_history),
+      mean_d: d_history.length > 0 ? mean(d_history) : 0,
+      jitter_pdelay: pdelay_gap_history.length > 2 ? std(pdelay_gap_history) : 0
+    }
+  }, [ptpFeatures])
+
+  // Update model when board offset arrives (every ~3-5 seconds)
+  useEffect(() => {
+    const currentOffset = boardStatus[devices.find(d => d.host === '10.42.0.12')?.id]?.ptp?.offset
+    const currentD = boardStatus[devices.find(d => d.host === '10.42.0.12')?.id]?.ptp?.meanLinkDelay
+
+    if (currentOffset !== undefined && currentOffset !== null && currentD) {
+      // Add link delay to feature history
+      const d_ns = currentD / 65536
+      setPtpFeatures(prev => ({
+        ...prev,
+        d_history: [...prev.d_history, d_ns].slice(-FEATURE_WINDOW)
+      }))
+
+      // Simple online model update (bias adjustment)
+      const features = calculateFeatures()
+      if (features && features.jitter_t1 > 0) {
+        // 간단한 bias 보정: offset ≈ -d + bias
+        const newBias = currentOffset + features.mean_d
+        setOffsetModel(prev => ({
+          weights: {
+            ...prev.weights,
+            w_d: -1,  // offset ≈ -d + bias
+            bias: prev.samples > 0
+              ? prev.weights.bias * 0.9 + newBias * 0.1  // Exponential moving average
+              : newBias
+          },
+          trained: true,
+          samples: prev.samples + 1
+        }))
+      }
+    }
+  }, [boardStatus, devices, calculateFeatures])
 
   // Start/Stop tap capture
   const startTapCapture = async () => {
@@ -232,6 +364,9 @@ function Dashboard() {
       setPtpPackets([])
       setSyncPairs([])
       setPdelayInfo({ lastRtt: null, count: 0 })
+      setPtpFeatures({ t1_ns_history: [], delta_t1_history: [], pdelay_gap_history: [], d_history: [] })
+      setOffsetEstimates([])
+      setOffsetModel({ weights: { w_jitter: 0, w_d: 1, w_pdelay: 0, bias: 0 }, trained: false, samples: 0 })
       ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
     } catch (e) {}
   }
@@ -599,6 +734,9 @@ function Dashboard() {
               setPtpPackets([])
               setSyncPairs([])
               setPdelayInfo({ lastRtt: null, count: 0 })
+              setPtpFeatures({ t1_ns_history: [], delta_t1_history: [], pdelay_gap_history: [], d_history: [] })
+              setOffsetEstimates([])
+              setOffsetModel({ weights: { w_jitter: 0, w_d: 1, w_pdelay: 0, bias: 0 }, trained: false, samples: 0 })
               ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
             }} style={{ fontSize: '0.75rem', padding: '4px 12px' }}>
               Clear
@@ -757,6 +895,84 @@ function Dashboard() {
               <b>t2:</b> Slave(Board2)가 Sync 수신 시각 (내부값, TAP 캡쳐 ✗) &nbsp;|&nbsp;
               <b>d:</b> Link Delay &nbsp;|&nbsp;
               <b>C:</b> Correction 합
+            </div>
+
+            {/* PTP Feature & Model Section */}
+            <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #e2e8f0' }}>
+              <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '12px' }}>
+                PTP Feature Extraction & Offset Estimation
+                <span style={{
+                  marginLeft: '8px', padding: '2px 8px', borderRadius: '4px', fontSize: '0.65rem',
+                  background: offsetModel.trained ? '#dcfce7' : '#fef3c7',
+                  color: offsetModel.trained ? '#166534' : '#92400e'
+                }}>
+                  {offsetModel.trained ? `Trained (${offsetModel.samples} samples)` : 'Learning...'}
+                </span>
+              </h3>
+
+              {/* Features */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '12px' }}>
+                <div style={{ padding: '8px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '0.6rem', color: '#64748b' }}>Δt1 Samples</div>
+                  <div style={{ fontSize: '0.9rem', fontWeight: '600', color: '#475569' }}>
+                    {ptpFeatures.delta_t1_history.length}
+                  </div>
+                </div>
+                <div style={{ padding: '8px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '0.6rem', color: '#64748b' }}>Jitter(Δt1) std</div>
+                  <div style={{ fontSize: '0.9rem', fontWeight: '600', color: '#7c3aed', fontFamily: 'monospace' }}>
+                    {ptpFeatures.delta_t1_history.length > 2
+                      ? std(ptpFeatures.delta_t1_history).toFixed(0)
+                      : '-'} ns
+                  </div>
+                </div>
+                <div style={{ padding: '8px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '0.6rem', color: '#64748b' }}>Pdelay Gap std</div>
+                  <div style={{ fontSize: '0.9rem', fontWeight: '600', color: '#059669', fontFamily: 'monospace' }}>
+                    {ptpFeatures.pdelay_gap_history.length > 2
+                      ? std(ptpFeatures.pdelay_gap_history).toFixed(0)
+                      : '-'} ns
+                  </div>
+                </div>
+                <div style={{ padding: '8px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '0.6rem', color: '#64748b' }}>Model Bias</div>
+                  <div style={{ fontSize: '0.9rem', fontWeight: '600', color: '#0891b2', fontFamily: 'monospace' }}>
+                    {offsetModel.trained ? offsetModel.weights.bias.toFixed(0) : '-'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Offset Estimation Graph */}
+              {offsetEstimates.length > 2 && (
+                <div style={{ marginTop: '12px' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '8px' }}>
+                    Offset: Board (실제) vs Estimated (추정)
+                  </h4>
+                  <div style={{ height: '160px' }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart
+                        data={offsetEstimates.slice(-60)}
+                        margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                        <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="#94a3b8" interval="preserveStartEnd" />
+                        <YAxis tick={{ fontSize: 9 }} stroke="#94a3b8" />
+                        <Tooltip contentStyle={{ fontSize: '0.7rem' }} />
+                        <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                        <Line
+                          type="monotone"
+                          dataKey="offset_hat"
+                          name="Estimated"
+                          stroke="#7c3aed"
+                          strokeWidth={2}
+                          dot={false}
+                          isAnimationActive={false}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
