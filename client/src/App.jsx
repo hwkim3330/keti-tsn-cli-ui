@@ -5,7 +5,9 @@ import Dashboard from './pages/Dashboard'
 import Settings from './pages/Settings'
 import PTP from './pages/PTP'
 import TAS from './pages/TAS'
+import TASDashboard from './pages/TASDashboard'
 import CBS from './pages/CBS'
+import CBSDashboard from './pages/CBSDashboard'
 import Ports from './pages/Ports'
 import Capture from './pages/Capture'
 import Tools from './pages/Tools'
@@ -21,35 +23,29 @@ function Sidebar() {
 
       <nav>
         <div className="nav-section">
-          <div className="nav-section-title">Overview</div>
+          <div className="nav-section-title">Dashboards</div>
           <NavLink to="/" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            <span>PTP Dashboard</span>
+            <span>PTP</span>
           </NavLink>
-          <NavLink to="/ports" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <NavLink to="/tas-dashboard" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
             </svg>
-            <span>Port Status</span>
+            <span>TAS</span>
           </NavLink>
-          <NavLink to="/capture" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <NavLink to="/cbs-dashboard" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
-            <span>Packet Capture</span>
-          </NavLink>
-          <NavLink to="/traffic" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-            <span>Traffic Generator</span>
+            <span>CBS</span>
           </NavLink>
         </div>
 
         <div className="nav-section">
-          <div className="nav-section-title">TSN Configuration</div>
+          <div className="nav-section-title">Configuration</div>
           <NavLink to="/ptp" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -58,7 +54,7 @@ function Sidebar() {
           </NavLink>
           <NavLink to="/tas" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
             </svg>
             <span>TAS (802.1Qbv)</span>
           </NavLink>
@@ -67,6 +63,28 @@ function Sidebar() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
             <span>CBS (802.1Qav)</span>
+          </NavLink>
+        </div>
+
+        <div className="nav-section">
+          <div className="nav-section-title">Tools</div>
+          <NavLink to="/ports" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+            </svg>
+            <span>Port Status</span>
+          </NavLink>
+          <NavLink to="/capture" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+            </svg>
+            <span>Packet Capture</span>
+          </NavLink>
+          <NavLink to="/traffic" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+            <span>Traffic Generator</span>
           </NavLink>
         </div>
 
@@ -100,7 +118,9 @@ function App() {
             <Route path="/traffic" element={<Traffic />} />
             <Route path="/ptp" element={<PTP />} />
             <Route path="/tas" element={<TAS />} />
+            <Route path="/tas-dashboard" element={<TASDashboard />} />
             <Route path="/cbs" element={<CBS />} />
+            <Route path="/cbs-dashboard" element={<CBSDashboard />} />
             <Route path="/tools" element={<Tools />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
