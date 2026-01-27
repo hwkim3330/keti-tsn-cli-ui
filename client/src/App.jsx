@@ -16,9 +16,9 @@ import Traffic from './pages/Traffic'
 function Sidebar() {
   return (
     <aside className="sidebar">
-      <div className="sidebar-header" style={{ padding: '20px 16px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-        <img src="/keti.png" alt="KETI" style={{ height: '32px', marginBottom: '8px', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
-        <div style={{ fontSize: '0.75rem', fontWeight: '500', color: 'rgba(255,255,255,0.5)' }}>TSN Switch Manager</div>
+      <div className="sidebar-header" style={{ padding: '24px 20px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+        <img src="/keti.png" alt="KETI" style={{ height: '44px', marginBottom: '12px', filter: 'brightness(0) invert(1)', opacity: 0.95 }} />
+        <div style={{ fontSize: '0.9rem', fontWeight: '600', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.02em' }}>TSN Switch Manager</div>
       </div>
 
       <nav>
