@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from 'recharts'
+
+const TAP_INTERFACE = 'enxc84d44231cc2'
 
 function Dashboard() {
   const { devices } = useDevices()
@@ -12,7 +14,18 @@ function Dashboard() {
   const intervalRef = useRef(null)
   const [offsetHistory, setOffsetHistory] = useState([])
   const [connectionStats, setConnectionStats] = useState({})
-  const MAX_HISTORY = 120 // 4 minutes at 2s interval
+  const MAX_HISTORY = 120
+
+  // PTP Tap monitoring state
+  const [tapCapturing, setTapCapturing] = useState(false)
+  const [tapConnected, setTapConnected] = useState(false)
+  const [ptpPackets, setPtpPackets] = useState([])
+  const [syncPairs, setSyncPairs] = useState([])
+  const [tapOffsetHistory, setTapOffsetHistory] = useState([])
+  const wsRef = useRef(null)
+  const ptpStateRef = useRef({ lastSync: null })
+  const MAX_PACKETS = 50
+  const MAX_SYNC_PAIRS = 30
 
   // Fetch GM status (full data, cached on server)
   const fetchGmHealth = useCallback(async (device) => {
@@ -113,6 +126,93 @@ function Dashboard() {
       if (intervalRef.current) clearInterval(intervalRef.current)
     }
   }, [autoRefresh, devices, refreshInterval, fetchAll])
+
+  // WebSocket for PTP tap capture
+  useEffect(() => {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/capture`
+
+    const connect = () => {
+      const ws = new WebSocket(wsUrl)
+
+      ws.onopen = () => setTapConnected(true)
+      ws.onclose = () => {
+        setTapConnected(false)
+        setTimeout(connect, 3000)
+      }
+      ws.onerror = () => {}
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'sync') {
+            setTapCapturing(msg.data.running && msg.data.activeCaptures.some(c => c.interface === TAP_INTERFACE))
+          } else if (msg.type === 'packet' && msg.data.protocol === 'PTP') {
+            handlePtpPacket(msg.data)
+          } else if (msg.type === 'stopped') {
+            setTapCapturing(false)
+          }
+        } catch (e) {}
+      }
+
+      wsRef.current = ws
+    }
+
+    connect()
+    return () => { if (wsRef.current) wsRef.current.close() }
+  }, [])
+
+  // Handle PTP packet from tap
+  const handlePtpPacket = useCallback((packet) => {
+    setPtpPackets(prev => [...prev, packet].slice(-MAX_PACKETS))
+
+    const ptp = packet.ptp
+    if (!ptp) return
+
+    const state = ptpStateRef.current
+    const now = Date.now()
+
+    if (ptp.msgType === 'Sync') {
+      state.lastSync = { sequenceId: ptp.sequenceId, time: now }
+    } else if (ptp.msgType === 'Follow_Up' && state.lastSync?.sequenceId === ptp.sequenceId) {
+      const correction = ptp.correction || 0
+      const timeStr = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+      setSyncPairs(prev => [...prev, {
+        sequenceId: ptp.sequenceId,
+        correction,
+        time: timeStr
+      }].slice(-MAX_SYNC_PAIRS))
+
+      setTapOffsetHistory(prev => [...prev, {
+        time: timeStr,
+        tapCorrection: correction
+      }].slice(-MAX_HISTORY))
+
+      state.lastSync = null
+    }
+  }, [])
+
+  // Start/Stop tap capture
+  const startTapCapture = async () => {
+    try {
+      await axios.post('/api/capture/start', {
+        interfaces: [TAP_INTERFACE],
+        captureMode: 'ptp'
+      })
+      setTapCapturing(true)
+      setPtpPackets([])
+      setSyncPairs([])
+      setTapOffsetHistory([])
+    } catch (e) {}
+  }
+
+  const stopTapCapture = async () => {
+    try {
+      await axios.post('/api/capture/stop', { interfaces: [TAP_INTERFACE] })
+      setTapCapturing(false)
+    } catch (e) {}
+  }
 
   const servoStateText = (state) => {
     const states = { 0: 'Init', 1: 'Tracking', 2: 'Locked', 3: 'Holdover' }
@@ -433,6 +533,187 @@ function Dashboard() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* PTP Tap Monitoring Section */}
+      <div className="card" style={{ marginTop: '16px' }}>
+        <div className="card-header">
+          <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            PTP Tap Monitor
+            <span style={{
+              fontSize: '0.65rem', padding: '2px 6px', borderRadius: '4px',
+              background: '#f1f5f9', color: '#64748b'
+            }}>
+              {TAP_INTERFACE}
+            </span>
+          </h2>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <span style={{
+              padding: '3px 8px', borderRadius: '12px', fontSize: '0.7rem',
+              background: tapConnected ? '#ecfdf5' : '#fef2f2',
+              color: tapConnected ? '#059669' : '#dc2626'
+            }}>
+              {tapConnected ? 'WS Connected' : 'WS Disconnected'}
+            </span>
+            {!tapCapturing ? (
+              <button className="btn btn-primary" onClick={startTapCapture} disabled={!tapConnected}
+                style={{ fontSize: '0.75rem', padding: '4px 12px' }}>
+                Start Capture
+              </button>
+            ) : (
+              <button className="btn btn-danger" onClick={stopTapCapture}
+                style={{ fontSize: '0.75rem', padding: '4px 12px' }}>
+                Stop
+              </button>
+            )}
+            <button className="btn btn-secondary" onClick={() => {
+              setPtpPackets([])
+              setSyncPairs([])
+              setTapOffsetHistory([])
+            }} style={{ fontSize: '0.75rem', padding: '4px 12px' }}>
+              Clear
+            </button>
+          </div>
+        </div>
+
+        {tapCapturing && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* PTP Messages */}
+            <div>
+              <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
+                Recent PTP Messages ({ptpPackets.length})
+              </h3>
+              <div style={{
+                height: '180px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace',
+                background: '#f8fafc', borderRadius: '6px', padding: '8px'
+              }}>
+                {ptpPackets.length === 0 ? (
+                  <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>
+                    Waiting for PTP packets...
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>Type</th>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>Seq</th>
+                        <th style={{ textAlign: 'right', padding: '4px' }}>Correction</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ptpPackets.slice(-20).reverse().map((pkt, i) => (
+                        <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                          <td style={{
+                            padding: '3px 4px',
+                            color: pkt.ptp?.msgType === 'Sync' ? '#2563eb' :
+                                   pkt.ptp?.msgType === 'Follow_Up' ? '#7c3aed' : '#64748b'
+                          }}>
+                            {pkt.ptp?.msgType}
+                          </td>
+                          <td style={{ padding: '3px 4px' }}>{pkt.ptp?.sequenceId}</td>
+                          <td style={{ padding: '3px 4px', textAlign: 'right', color: '#6366f1' }}>
+                            {pkt.ptp?.correction ? `${pkt.ptp.correction.toFixed(0)} ns` : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+
+            {/* Sync/Follow_Up Pairs */}
+            <div>
+              <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
+                Sync/Follow_Up Pairs ({syncPairs.length})
+              </h3>
+              <div style={{
+                height: '180px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace',
+                background: '#f8fafc', borderRadius: '6px', padding: '8px'
+              }}>
+                {syncPairs.length === 0 ? (
+                  <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>
+                    Waiting for Sync/Follow_Up pairs...
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>Time</th>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>SeqID</th>
+                        <th style={{ textAlign: 'right', padding: '4px' }}>Correction (ns)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {syncPairs.slice(-15).reverse().map((pair, i) => (
+                        <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                          <td style={{ padding: '3px 4px', color: '#64748b' }}>{pair.time}</td>
+                          <td style={{ padding: '3px 4px' }}>{pair.sequenceId}</td>
+                          <td style={{ padding: '3px 4px', textAlign: 'right', fontWeight: '600', color: '#7c3aed' }}>
+                            {pair.correction.toFixed(0)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Comparison Graph - ESP Offset vs Tap Correction */}
+        {tapCapturing && tapOffsetHistory.length > 1 && (
+          <div style={{ marginTop: '16px' }}>
+            <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
+              Offset Comparison: ESP vs Tap
+            </h3>
+            <div style={{ height: '200px' }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={tapOffsetHistory.map((tap, i) => ({
+                    time: tap.time,
+                    tapCorrection: tap.tapCorrection,
+                    espOffset: offsetHistory[offsetHistory.length - tapOffsetHistory.length + i]?.[board2?.name]
+                  }))}
+                  margin={{ top: 10, right: 20, left: 0, bottom: 5 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="#94a3b8" interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 9 }} stroke="#94a3b8" />
+                  <Tooltip contentStyle={{ fontSize: '0.7rem' }} />
+                  <Legend wrapperStyle={{ fontSize: '0.7rem' }} />
+                  <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                  <Line
+                    type="monotone"
+                    dataKey="tapCorrection"
+                    name="Tap Correction"
+                    stroke="#7c3aed"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="espOffset"
+                    name="ESP Offset"
+                    stroke="#0891b2"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
+
+        {!tapCapturing && (
+          <div style={{ padding: '40px', textAlign: 'center', color: '#94a3b8' }}>
+            Click "Start Capture" to monitor PTP packets from tap device
+          </div>
+        )}
       </div>
     </div>
   )
