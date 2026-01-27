@@ -4,11 +4,11 @@ const DeviceContext = createContext()
 
 const STORAGE_KEY = 'tsn-devices'
 const STORAGE_VERSION_KEY = 'tsn-devices-version'
-const DEVICES_VERSION = 4
+const DEVICES_VERSION = 6
 
 const defaultDevices = [
-  { id: 'esp1', name: 'ESP 1', transport: 'wifi', host: '10.42.0.11', port: 5683 },
-  { id: 'esp2', name: 'ESP 2', transport: 'wifi', host: '10.42.0.12', port: 5683 },
+  { id: 'board1', name: 'LAN9692 #1', transport: 'wifi', host: '10.42.0.11', port: 5683 },
+  { id: 'board2', name: 'LAN9692 #2', transport: 'wifi', host: '10.42.0.12', port: 5683 },
 ]
 
 export function DeviceProvider({ children }) {

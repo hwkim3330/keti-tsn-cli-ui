@@ -6,6 +6,15 @@ import fs from 'fs';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 
+// Prevent server crash on unhandled errors
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT]', err.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason?.message || reason);
+});
+
 import checksumRoutes from './routes/checksum.js';
 import downloadRoutes from './routes/download.js';
 import listRoutes from './routes/list.js';

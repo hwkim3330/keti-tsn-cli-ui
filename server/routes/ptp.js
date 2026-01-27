@@ -11,6 +11,45 @@ const router = express.Router();
 // Board connection state
 const boardState = new Map();
 
+// Request queue to prevent overloading ESP32
+const pendingRequests = new Map();
+
+// GM (ESP1) can be cached longer since it doesn't change
+const GM_CACHE_DURATION = 30000; // 30 seconds
+const SLAVE_CACHE_DURATION = 2000; // 2 seconds for debounce only
+
+// Check if we can use cached data
+function getCachedIfValid(ip) {
+  const cached = boardState.get(ip);
+  if (!cached || !cached.online) return null;
+
+  const age = Date.now() - cached.lastCheck;
+  const isGM = cached.ptp?.isGM;
+  const maxAge = isGM ? GM_CACHE_DURATION : SLAVE_CACHE_DURATION;
+
+  if (age < maxAge) {
+    return { ...cached, cached: true, cacheAge: age };
+  }
+  return null;
+}
+
+// Simple request debouncing
+function canMakeRequest(ip) {
+  const pending = pendingRequests.get(ip);
+  if (pending && Date.now() - pending < 2000) {
+    return false;
+  }
+  return true;
+}
+
+function markRequestStart(ip) {
+  pendingRequests.set(ip, Date.now());
+}
+
+function markRequestEnd(ip) {
+  pendingRequests.delete(ip);
+}
+
 // PTP profile configurations
 const PTP_PROFILES = {
   gm: {
@@ -46,18 +85,64 @@ async function findYangCache() {
   return catalogs[0].path;
 }
 
-async function createTransportConnection(host, port = 5683) {
+async function createTransportConnection(host, port = 5683, timeout = 20000) {
   const { createTransport } = await import(`${TSC2CBOR_LIB}/transport/index.js`);
   const transport = createTransport('wifi', { verbose: false });
-  await transport.connect({ host, port });
-  await transport.waitForReady(5000);
-  return transport;
+
+  // Add timeout wrapper
+  const connectWithTimeout = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('Connection timeout'));
+    }, timeout);
+
+    transport.connect({ host, port })
+      .then(() => transport.waitForReady(5000))
+      .then(() => {
+        clearTimeout(timer);
+        resolve(transport);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+
+  return connectWithTimeout;
 }
 
 // Health check for a single board
 router.get('/health/:ip', async (req, res) => {
   const { ip } = req.params;
   const startTime = Date.now();
+  let transport = null;
+
+  // Check if we have valid cached data (especially for GM)
+  const cached = getCachedIfValid(ip);
+  if (cached) {
+    return res.json({
+      online: cached.online,
+      latency: cached.latency,
+      ptp: cached.ptp,
+      cached: true,
+      cacheAge: cached.cacheAge
+    });
+  }
+
+  // Check if request is already in progress
+  if (!canMakeRequest(ip)) {
+    const state = boardState.get(ip);
+    if (state) {
+      return res.json({
+        online: state.online,
+        latency: state.latency,
+        ptp: state.ptp,
+        cached: true
+      });
+    }
+    return res.json({ online: false, error: 'Request in progress', cached: true });
+  }
+
+  markRequestStart(ip);
 
   try {
     const yangCacheDir = await findYangCache();
@@ -66,7 +151,7 @@ router.get('/health/:ip', async (req, res) => {
     const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
 
     const { sidInfo } = await loadYangInputs(yangCacheDir, false);
-    const transport = await createTransportConnection(ip);
+    transport = await createTransportConnection(ip);
 
     // Quick fetch of PTP servo status
     const queries = extractSidsFromInstanceIdentifier(
@@ -76,7 +161,7 @@ router.get('/health/:ip', async (req, res) => {
     );
 
     const response = await transport.sendiFetchRequest(queries);
-    await transport.disconnect();
+    try { await transport.disconnect(); } catch (e) {}
 
     if (!response.isSuccess()) {
       throw new Error(`CoAP code ${response.code}`);
@@ -97,18 +182,88 @@ router.get('/health/:ip', async (req, res) => {
       ptp: ptpData
     });
 
+    markRequestEnd(ip);
     res.json({
       online: true,
       latency,
       ptp: ptpData
     });
   } catch (error) {
+    markRequestEnd(ip);
+
+    // Cleanup transport on error
+    if (transport) {
+      try { await transport.disconnect(); } catch (e) {}
+    }
+
     boardState.set(ip, {
       online: false,
       lastCheck: Date.now(),
       error: error.message
     });
 
+    res.json({
+      online: false,
+      error: error.message,
+      latency: Date.now() - startTime
+    });
+  }
+});
+
+// Quick offset check - uses full path but only parses offset
+router.get('/offset/:ip', async (req, res) => {
+  const { ip } = req.params;
+  const startTime = Date.now();
+  let transport = null;
+
+  try {
+    const yangCacheDir = await findYangCache();
+    const { loadYangInputs } = await import(`${TSC2CBOR_LIB}/common/input-loader.js`);
+    const { extractSidsFromInstanceIdentifier } = await import(`${TSC2CBOR_LIB}/encoder/transformer-instance-id.js`);
+    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
+
+    const { sidInfo } = await loadYangInputs(yangCacheDir, false);
+    transport = await createTransportConnection(ip, 5683, 15000);
+
+    const queries = extractSidsFromInstanceIdentifier(
+      [{ "/ieee1588-ptp:ptp": null }],
+      sidInfo,
+      { verbose: false }
+    );
+
+    const response = await transport.sendiFetchRequest(queries);
+    try { await transport.disconnect(); } catch (e) {}
+
+    if (!response.isSuccess()) {
+      throw new Error(`CoAP code ${response.code}`);
+    }
+
+    const decoder = new Cbor2TscConverter(yangCacheDir);
+    const result = await decoder.convertBuffer(response.payload, { verbose: false, outputFormat: 'rfc7951' });
+
+    // Parse PTP data
+    const yaml = result.yaml || '';
+    const offsetMatch = yaml.match(/offset:\s*(-?\d+)/);
+    const stateMatch = yaml.match(/state:\s*(\d+)/);
+    const portStateMatch = yaml.match(/port-state:\s*(\w+)/);
+    const profileMatch = yaml.match(/profile:\s*(\w+)/);
+    const asCapable = yaml.includes('as-capable: true');
+    const delayMatch = yaml.match(/mean-link-delay:\s*(\d+)/);
+
+    res.json({
+      online: true,
+      latency: Date.now() - startTime,
+      offset: offsetMatch ? parseInt(offsetMatch[1]) : null,
+      servoState: stateMatch ? parseInt(stateMatch[1]) : null,
+      portState: portStateMatch ? portStateMatch[1] : null,
+      profile: profileMatch ? profileMatch[1] : null,
+      asCapable,
+      meanLinkDelay: delayMatch ? parseInt(delayMatch[1]) : null
+    });
+  } catch (error) {
+    if (transport) {
+      try { await transport.disconnect(); } catch (e) {}
+    }
     res.json({
       online: false,
       error: error.message,

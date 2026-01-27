@@ -60,82 +60,76 @@ function Capture() {
     })
   }, [])
 
-  // PTP packet analysis
+  // PTP packet analysis - wrapped in try-catch for safety
   const analyzePtpPacket = useCallback((packet) => {
-    if (packet.protocol !== 'PTP' || !packet.ptp) return
+    try {
+      if (!packet || packet.protocol !== 'PTP' || !packet.ptp) return
 
-    const ptp = packet.ptp
-    const state = ptpStateRef.current
-    const timestamp = new Date(packet.time).getTime()
+      const ptp = packet.ptp
+      const state = ptpStateRef.current
+      if (!state) return
 
-    switch (ptp.msgType) {
-      case 'Sync':
-        state.lastSync = {
-          sequenceId: ptp.sequenceId,
-          timestamp,
-          clockId: ptp.clockId
-        }
-        break
+      const timestamp = Date.now()
 
-      case 'Follow_Up':
-        if (state.lastSync && state.lastSync.sequenceId === ptp.sequenceId) {
-          // Calculate offset from correction field
-          const correctionNs = ptp.correctionField || 0
-          const preciseOriginTs = ptp.preciseOriginTimestamp || 0
+      switch (ptp.msgType) {
+        case 'Sync':
+          state.lastSync = {
+            sequenceId: ptp.sequenceId,
+            ts: timestamp,
+            clockId: ptp.clockId
+          }
+          break
 
-          setPtpAnalysis(prev => {
-            const newPair = {
-              sequenceId: ptp.sequenceId,
-              syncTime: state.lastSync.timestamp,
-              followUpTime: timestamp,
-              correctionField: correctionNs,
-              preciseOriginTs,
-              time: new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
-            }
+        case 'Follow_Up':
+          if (state.lastSync && state.lastSync.ts && state.lastSync.sequenceId === ptp.sequenceId) {
+            const correctionNs = ptp.correction || 0
+            const syncTs = state.lastSync.ts
 
-            const newSyncPairs = [...prev.syncPairs, newPair].slice(-100)
+            setPtpAnalysis(prev => {
+              const newPair = {
+                sequenceId: ptp.sequenceId,
+                syncTime: syncTs,
+                followUpTime: timestamp,
+                correctionField: correctionNs,
+                time: new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+              }
 
-            // Calculate offset history entry
-            const historyEntry = {
-              time: newPair.time,
-              correction: correctionNs
-            }
+              return {
+                ...prev,
+                syncPairs: [...prev.syncPairs, newPair].slice(-100),
+                offsetHistory: [...prev.offsetHistory, { time: newPair.time, correction: correctionNs }].slice(-60)
+              }
+            })
 
-            return {
+            state.lastSync = null
+          }
+          break
+
+        case 'Pdelay_Req':
+          state.lastPdelayReq = {
+            sequenceId: ptp.sequenceId,
+            ts: timestamp
+          }
+          break
+
+        case 'Pdelay_Resp':
+          if (state.lastPdelayReq && state.lastPdelayReq.ts && state.lastPdelayReq.sequenceId === ptp.sequenceId) {
+            const rtt = timestamp - state.lastPdelayReq.ts
+            setPtpAnalysis(prev => ({
               ...prev,
-              syncPairs: newSyncPairs,
-              offsetHistory: [...prev.offsetHistory, historyEntry].slice(-60)
-            }
-          })
+              pdelayPairs: [...prev.pdelayPairs, {
+                sequenceId: ptp.sequenceId,
+                rtt
+              }].slice(-50)
+            }))
+          }
+          break
 
-          state.lastSync = null
-        }
-        break
-
-      case 'Pdelay_Req':
-        state.lastPdelayReq = {
-          sequenceId: ptp.sequenceId,
-          timestamp
-        }
-        break
-
-      case 'Pdelay_Resp':
-        if (state.lastPdelayReq && state.lastPdelayReq.sequenceId === ptp.sequenceId) {
-          const rtt = timestamp - state.lastPdelayReq.timestamp
-          setPtpAnalysis(prev => ({
-            ...prev,
-            pdelayPairs: [...prev.pdelayPairs, {
-              sequenceId: ptp.sequenceId,
-              rtt,
-              timestamp
-            }].slice(-50)
-          }))
-        }
-        break
-
-      case 'Pdelay_Resp_Follow_Up':
-        // Could be used for more precise delay calculation
-        break
+        default:
+          break
+      }
+    } catch (e) {
+      // Silently ignore PTP analysis errors
     }
   }, [])
 

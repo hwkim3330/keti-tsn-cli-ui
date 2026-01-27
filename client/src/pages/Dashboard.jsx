@@ -8,52 +8,55 @@ function Dashboard() {
   const [boardStatus, setBoardStatus] = useState({})
   const [loading, setLoading] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true) // Default ON
-  const [refreshInterval, setRefreshInterval] = useState(2000)
+  const [refreshInterval, setRefreshInterval] = useState(5000) // 5s default
   const intervalRef = useRef(null)
   const [offsetHistory, setOffsetHistory] = useState([])
   const [connectionStats, setConnectionStats] = useState({})
   const MAX_HISTORY = 120 // 4 minutes at 2s interval
 
-  // Fetch single board status using new PTP API
-  const fetchBoardHealth = useCallback(async (device) => {
-    const startTime = Date.now()
+  // Fetch GM status (full data, cached on server)
+  const fetchGmHealth = useCallback(async (device) => {
     try {
-      const res = await axios.get(`/api/ptp/health/${device.host}`, { timeout: 15000 })
-      const latency = Date.now() - startTime
-
-      // Update connection stats
+      const res = await axios.get(`/api/ptp/health/${device.host}`, { timeout: 25000 })
       setConnectionStats(prev => ({
         ...prev,
-        [device.id]: {
-          ...prev[device.id],
-          successCount: (prev[device.id]?.successCount || 0) + 1,
-          lastSuccess: Date.now(),
-          latency
-        }
+        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency: res.data.latency }
       }))
-
       return {
         online: res.data.online,
         ptp: res.data.ptp,
         latency: res.data.latency,
-        lastUpdate: Date.now()
+        cached: res.data.cached
       }
     } catch (err) {
-      // Update connection stats
+      setConnectionStats(prev => ({ ...prev, [device.id]: { ...prev[device.id], failCount: (prev[device.id]?.failCount || 0) + 1 } }))
+      return { online: false, error: err.message }
+    }
+  }, [])
+
+  // Fetch Slave offset only (faster endpoint)
+  const fetchSlaveOffset = useCallback(async (device) => {
+    try {
+      const res = await axios.get(`/api/ptp/offset/${device.host}`, { timeout: 20000 })
       setConnectionStats(prev => ({
         ...prev,
-        [device.id]: {
-          ...prev[device.id],
-          failCount: (prev[device.id]?.failCount || 0) + 1,
-          lastError: err.message
-        }
+        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency: res.data.latency }
       }))
-
       return {
-        online: false,
-        error: err.message,
-        lastUpdate: Date.now()
+        online: res.data.online,
+        ptp: {
+          offset: res.data.offset,
+          servoState: res.data.servoState,
+          portState: res.data.portState,
+          profile: res.data.profile,
+          asCapable: res.data.asCapable,
+          meanLinkDelay: res.data.meanLinkDelay
+        },
+        latency: res.data.latency
       }
+    } catch (err) {
+      setConnectionStats(prev => ({ ...prev, [device.id]: { ...prev[device.id], failCount: (prev[device.id]?.failCount || 0) + 1 } }))
+      return { online: false, error: err.message }
     }
   }, [])
 
@@ -63,36 +66,37 @@ function Dashboard() {
     setLoading(true)
     const timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
     const historyEntry = { time: timestamp }
-    const newStatus = {}
+    const newStatus = { ...boardStatus }
 
-    // Fetch all boards in parallel
-    const results = await Promise.allSettled(
-      devices.map(device => fetchBoardHealth(device))
-    )
+    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
+    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
 
-    results.forEach((result, idx) => {
-      const device = devices[idx]
-      if (result.status === 'fulfilled') {
-        newStatus[device.id] = result.value
-
-        // Add offset to history
-        if (result.value.ptp?.offset !== null && result.value.ptp?.offset !== undefined) {
-          historyEntry[device.name] = result.value.ptp.offset
-        }
-      } else {
-        newStatus[device.id] = { online: false, error: result.reason?.message }
+    // Fetch Slave offset (faster endpoint)
+    if (slaveDevice) {
+      const result = await fetchSlaveOffset(slaveDevice)
+      newStatus[slaveDevice.id] = {
+        ...newStatus[slaveDevice.id],
+        ...result
       }
-    })
+      if (result.ptp?.offset !== null && result.ptp?.offset !== undefined) {
+        historyEntry[slaveDevice.name] = result.ptp.offset
+      }
+    }
+
+    // GM uses full health (cached on server for 30s)
+    if (gmDevice) {
+      const result = await fetchGmHealth(gmDevice)
+      newStatus[gmDevice.id] = result
+    }
 
     setBoardStatus(newStatus)
 
-    // Add to history if we have offset data
-    if (Object.keys(historyEntry).length > 1) {
+    if (historyEntry[slaveDevice?.name] !== undefined) {
       setOffsetHistory(prev => [...prev, historyEntry].slice(-MAX_HISTORY))
     }
 
     setLoading(false)
-  }, [devices, fetchBoardHealth])
+  }, [devices, fetchSlaveOffset, fetchGmHealth, boardStatus])
 
   // Initial fetch and auto-refresh
   useEffect(() => {
@@ -116,13 +120,13 @@ function Dashboard() {
   }
 
   const servoStateColor = (state) => {
-    const colors = { 0: '#94a3b8', 1: '#22c55e', 2: '#3b82f6', 3: '#f59e0b' }
+    const colors = { 0: '#94a3b8', 1: '#059669', 2: '#2563eb', 3: '#d97706' }
     return colors[state] ?? '#94a3b8'
   }
 
-  // Board identification
-  const board1 = devices.find(d => d.name.includes('1') || d.host?.includes('.11'))
-  const board2 = devices.find(d => d.name.includes('2') || d.host?.includes('.12'))
+  // Board identification - use host IP or #1/#2 suffix
+  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
+  const board2 = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
   const board1Status = board1 ? boardStatus[board1.id] : null
   const board2Status = board2 ? boardStatus[board2.id] : null
   const isSynced = board1Status?.online && board2Status?.online &&
@@ -156,9 +160,10 @@ function Dashboard() {
             onChange={(e) => setRefreshInterval(parseInt(e.target.value))}
             style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid #e2e8f0', fontSize: '0.8rem' }}
           >
-            <option value={1000}>1s</option>
-            <option value={2000}>2s</option>
+            <option value={3000}>3s</option>
             <option value={5000}>5s</option>
+            <option value={10000}>10s</option>
+            <option value={15000}>15s</option>
           </select>
           <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', cursor: 'pointer' }}>
             <input
@@ -180,26 +185,26 @@ function Dashboard() {
           {/* Board 1 */}
           <div style={{ textAlign: 'center' }}>
             <div style={{
-              width: '140px', height: '90px', border: '3px solid #292524', borderRadius: '8px',
+              width: '140px', height: '90px', border: '2px solid #64748b', borderRadius: '8px',
               display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              background: board1Status?.online ? '#fafaf9' : '#fef2f2',
+              background: board1Status?.online ? '#f8fafc' : '#fef2f2',
               position: 'relative'
             }}>
               {board1Status?.online && (
                 <div style={{
-                  position: 'absolute', top: '-8px', right: '-8px',
-                  width: '16px', height: '16px', borderRadius: '50%',
-                  background: '#22c55e', border: '2px solid #fff'
+                  position: 'absolute', top: '-6px', right: '-6px',
+                  width: '12px', height: '12px', borderRadius: '50%',
+                  background: '#059669', border: '2px solid #fff'
                 }} />
               )}
-              <div style={{ fontWeight: '700', fontSize: '1rem' }}>Board 1</div>
-              <div style={{ fontSize: '0.7rem', color: '#57534e' }}>LAN9692</div>
+              <div style={{ fontWeight: '600', fontSize: '0.95rem', color: '#334155' }}>Board 1</div>
+              <div style={{ fontSize: '0.7rem', color: '#64748b' }}>LAN9692</div>
               {board1Status?.ptp?.isGM && (
                 <div style={{
-                  fontSize: '0.7rem', background: '#292524', color: '#fff',
-                  padding: '2px 10px', borderRadius: '4px', marginTop: '4px', fontWeight: '600'
+                  fontSize: '0.65rem', background: '#475569', color: '#fff',
+                  padding: '2px 8px', borderRadius: '4px', marginTop: '4px', fontWeight: '500'
                 }}>
-                  GRANDMASTER
+                  GM
                 </div>
               )}
             </div>
@@ -215,23 +220,22 @@ function Dashboard() {
 
           {/* Connection Line */}
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-            <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: '600' }}>Port 8 ↔ Port 8</div>
+            <div style={{ fontSize: '0.7rem', color: '#64748b' }}>Port 8 ↔ Port 8</div>
             <div style={{
-              width: '100px', height: '6px',
-              background: isSynced ? 'linear-gradient(90deg, #22c55e, #16a34a)' : '#e5e7eb',
-              borderRadius: '3px',
-              boxShadow: isSynced ? '0 0 8px rgba(34, 197, 94, 0.5)' : 'none'
+              width: '80px', height: '3px',
+              background: isSynced ? '#059669' : '#cbd5e1',
+              borderRadius: '2px'
             }} />
             <div style={{
-              fontSize: '0.8rem',
-              color: isSynced ? '#16a34a' : '#94a3b8',
-              fontWeight: '600'
+              fontSize: '0.75rem',
+              color: isSynced ? '#059669' : '#94a3b8',
+              fontWeight: '500'
             }}>
-              {isSynced ? '● PTP SYNC' : '○ NO SYNC'}
+              {isSynced ? 'SYNCED' : 'NOT SYNCED'}
             </div>
             {isSynced && board2Status?.ptp?.offset !== null && (
-              <div style={{ fontSize: '0.7rem', color: '#64748b', fontFamily: 'monospace' }}>
-                Offset: {board2Status.ptp.offset} ns
+              <div style={{ fontSize: '0.65rem', color: '#64748b', fontFamily: 'monospace' }}>
+                {board2Status.ptp.offset} ns
               </div>
             )}
           </div>
@@ -239,24 +243,24 @@ function Dashboard() {
           {/* Board 2 */}
           <div style={{ textAlign: 'center' }}>
             <div style={{
-              width: '140px', height: '90px', border: '3px solid #0891b2', borderRadius: '8px',
+              width: '140px', height: '90px', border: '2px solid #64748b', borderRadius: '8px',
               display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              background: board2Status?.online ? '#f0fdfa' : '#fef2f2',
+              background: board2Status?.online ? '#f8fafc' : '#fef2f2',
               position: 'relative'
             }}>
               {board2Status?.online && (
                 <div style={{
-                  position: 'absolute', top: '-8px', right: '-8px',
-                  width: '16px', height: '16px', borderRadius: '50%',
-                  background: '#22c55e', border: '2px solid #fff'
+                  position: 'absolute', top: '-6px', right: '-6px',
+                  width: '12px', height: '12px', borderRadius: '50%',
+                  background: '#059669', border: '2px solid #fff'
                 }} />
               )}
-              <div style={{ fontWeight: '700', fontSize: '1rem' }}>Board 2</div>
-              <div style={{ fontSize: '0.7rem', color: '#0e7490' }}>LAN9692</div>
+              <div style={{ fontWeight: '600', fontSize: '0.95rem', color: '#334155' }}>Board 2</div>
+              <div style={{ fontSize: '0.7rem', color: '#64748b' }}>LAN9692</div>
               {board2Status?.ptp?.portState === 'slave' && (
                 <div style={{
-                  fontSize: '0.7rem', background: '#0891b2', color: '#fff',
-                  padding: '2px 10px', borderRadius: '4px', marginTop: '4px', fontWeight: '600'
+                  fontSize: '0.65rem', background: '#475569', color: '#fff',
+                  padding: '2px 8px', borderRadius: '4px', marginTop: '4px', fontWeight: '500'
                 }}>
                   SLAVE
                 </div>
@@ -292,9 +296,9 @@ function Dashboard() {
                   {device.name}
                   {status?.online && ptp && (
                     <span style={{
-                      fontSize: '0.65rem', padding: '2px 8px', borderRadius: '4px',
-                      background: isBoard1 ? '#292524' : '#0891b2',
-                      color: '#fff', fontWeight: '600'
+                      fontSize: '0.6rem', padding: '2px 6px', borderRadius: '3px',
+                      background: '#e2e8f0',
+                      color: '#475569', fontWeight: '500'
                     }}>
                       {ptp.isGM ? 'GM' : ptp.portState?.toUpperCase() || 'N/A'}
                     </span>
@@ -330,15 +334,15 @@ function Dashboard() {
                     </div>
                   </div>
                   <div style={{
-                    padding: '12px', background: isBoard1 ? '#f5f3ff' : '#fef3c7',
+                    padding: '12px', background: '#f1f5f9',
                     borderRadius: '6px', gridColumn: '1 / -1'
                   }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <div>
-                        <div style={{ fontSize: '0.65rem', color: '#94a3b8', marginBottom: '2px' }}>Offset</div>
+                        <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '2px' }}>Offset</div>
                         <div style={{
-                          fontWeight: '700', fontSize: '1.2rem', fontFamily: 'monospace',
-                          color: isBoard1 ? '#6366f1' : '#f59e0b'
+                          fontWeight: '600', fontSize: '1.1rem', fontFamily: 'monospace',
+                          color: '#334155'
                         }}>
                           {ptp.offset !== null ? `${ptp.offset} ns` : '-'}
                         </div>
@@ -411,8 +415,8 @@ function Dashboard() {
                     key={device.id}
                     type="monotone"
                     dataKey={device.name}
-                    stroke={idx === 0 ? '#6366f1' : '#f59e0b'}
-                    strokeWidth={2}
+                    stroke={idx === 0 ? '#64748b' : '#0891b2'}
+                    strokeWidth={1.5}
                     dot={false}
                     isAnimationActive={false}
                     connectNulls
