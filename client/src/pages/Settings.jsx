@@ -1,41 +1,15 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import axios from 'axios'
+import { useDevices } from '../contexts/DeviceContext'
 
-function Settings({ config, setConfig }) {
+function Settings() {
+  const { devices, setDevices, addDevice, updateDevice, deleteDevice, selectedDevice, selectDevice } = useDevices()
   const [serialPorts, setSerialPorts] = useState([])
-  const [devices, setDevices] = useState([])
   const [deviceStatus, setDeviceStatus] = useState({})
   const [checkingAll, setCheckingAll] = useState(false)
   const [editingDevice, setEditingDevice] = useState(null)
   const [hotspot, setHotspot] = useState({ active: false, devices: [] })
   const [scanningHotspot, setScanningHotspot] = useState(false)
-
-  // Load devices
-  useEffect(() => {
-    const DEVICES_VERSION = 3
-    const savedVersion = localStorage.getItem('tsn-devices-version')
-    const savedDevices = localStorage.getItem('tsn-devices')
-
-    const defaultDevices = [
-      { id: 'usb1', name: 'USB Board', transport: 'serial', device: '/dev/ttyACM0' },
-      { id: 'wifi1', name: 'ESP32 #1', transport: 'wifi', host: '10.42.0.11', port: 5683 },
-      { id: 'wifi2', name: 'ESP32 #2', transport: 'wifi', host: '10.42.0.12', port: 5683 },
-    ]
-
-    if (savedDevices && savedVersion === String(DEVICES_VERSION)) {
-      setDevices(JSON.parse(savedDevices))
-    } else {
-      setDevices(defaultDevices)
-      localStorage.setItem('tsn-devices', JSON.stringify(defaultDevices))
-      localStorage.setItem('tsn-devices-version', String(DEVICES_VERSION))
-    }
-  }, [])
-
-  useEffect(() => {
-    if (devices.length > 0) {
-      localStorage.setItem('tsn-devices', JSON.stringify(devices))
-    }
-  }, [devices])
 
   useEffect(() => {
     fetchSerialPorts()
@@ -99,37 +73,21 @@ function Settings({ config, setConfig }) {
     setCheckingAll(false)
   }
 
-  const selectDevice = (device) => {
-    setConfig({
-      transport: device.transport,
-      device: device.device || '/dev/ttyACM0',
-      host: device.host || '',
-      port: device.port || 5683
-    })
-  }
-
-  const addDevice = (type) => {
+  const handleAddDevice = (type) => {
     const newDevice = type === 'serial'
       ? { id: `usb${Date.now()}`, name: 'New USB Board', transport: 'serial', device: '/dev/ttyACM0' }
       : { id: `wifi${Date.now()}`, name: 'New ESP32', transport: 'wifi', host: '10.42.0.', port: 5683 }
-    setDevices([...devices, newDevice])
+    addDevice(newDevice)
     setEditingDevice(newDevice.id)
   }
 
-  const updateDevice = (id, updates) => {
-    setDevices(devices.map(d => d.id === id ? { ...d, ...updates } : d))
-  }
-
-  const deleteDevice = (id) => {
-    setDevices(devices.filter(d => d.id !== id))
+  const handleDeleteDevice = (id) => {
+    deleteDevice(id)
     setDeviceStatus(prev => { const n = {...prev}; delete n[id]; return n })
   }
 
   const isCurrentDevice = (device) => {
-    if (device.transport === 'serial') {
-      return config.transport === 'serial' && config.device === device.device
-    }
-    return config.transport === 'wifi' && config.host === device.host
+    return selectedDevice?.id === device.id
   }
 
   const usbDevices = devices.filter(d => d.transport === 'serial')
@@ -302,7 +260,7 @@ function Settings({ config, setConfig }) {
               </button>
               <button
                 className="btn btn-danger"
-                onClick={() => deleteDevice(device.id)}
+                onClick={() => handleDeleteDevice(device.id)}
                 style={{ padding: '6px 10px', fontSize: '0.8rem' }}
               >
                 Del
@@ -365,14 +323,13 @@ function Settings({ config, setConfig }) {
                         className="btn btn-primary"
                         style={{ padding: '2px 8px', fontSize: '0.7rem' }}
                         onClick={() => {
-                          const newDev = {
+                          addDevice({
                             id: `wifi${Date.now()}`,
                             name: `ESP32 (${dev.ip.split('.').pop()})`,
                             transport: 'wifi',
                             host: dev.ip,
                             port: 5683
-                          }
-                          setDevices([...devices, newDev])
+                          })
                         }}
                       >
                         + Add
@@ -394,7 +351,7 @@ function Settings({ config, setConfig }) {
           <h2 className="card-title">USB Devices</h2>
           <button
             className="btn btn-secondary"
-            onClick={() => addDevice('serial')}
+            onClick={() => handleAddDevice('serial')}
             style={{ fontSize: '0.8rem' }}
           >
             + Add USB
@@ -417,7 +374,7 @@ function Settings({ config, setConfig }) {
           <h2 className="card-title">WiFi Devices (ESP32)</h2>
           <button
             className="btn btn-secondary"
-            onClick={() => addDevice('wifi')}
+            onClick={() => handleAddDevice('wifi')}
             style={{ fontSize: '0.8rem' }}
           >
             + Add WiFi

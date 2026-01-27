@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
+import { useDevices } from '../contexts/DeviceContext'
 
-function Dashboard({ config }) {
+function Dashboard() {
+  const { devices } = useDevices()
   const [health, setHealth] = useState(null)
   const [catalogs, setCatalogs] = useState([])
   const [loading, setLoading] = useState(true)
 
   // Multi-device state
-  const [devices, setDevices] = useState([])
   const [deviceStatuses, setDeviceStatuses] = useState({})
   const [checkingDevice, setCheckingDevice] = useState(null)
 
@@ -15,18 +16,6 @@ function Dashboard({ config }) {
   const [configuringPtp, setConfiguringPtp] = useState(false)
   const [ptpResult, setPtpResult] = useState(null)
   const [ptpPort, setPtpPort] = useState(8) // Default PTP port
-
-  // Load devices from localStorage
-  useEffect(() => {
-    const savedDevices = localStorage.getItem('tsn-devices')
-    if (savedDevices) {
-      try {
-        setDevices(JSON.parse(savedDevices))
-      } catch (e) {
-        console.error('Failed to load devices:', e)
-      }
-    }
-  }, [])
 
   useEffect(() => {
     const fetchData = async () => {

@@ -1,177 +1,149 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
+import { useDevices } from '../contexts/DeviceContext'
 
-function TAS({ config }) {
-  const [portNumber, setPortNumber] = useState('1')
+function TAS() {
+  const { devices, selectedDevice, selectDevice } = useDevices()
+  const [deviceStatuses, setDeviceStatuses] = useState({})
+
+  const [portNumber, setPortNumber] = useState('8')
   const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  const [lastResult, setLastResult] = useState(null)
 
-  // Current device config (loaded from device)
-  const [currentConfig, setCurrentConfig] = useState(null)
+  // Auto refresh
+  const [autoRefresh, setAutoRefresh] = useState(false)
+  const intervalRef = useRef(null)
+  const fetchingRef = useRef(false)
 
   // Admin config (editable)
   const [gateEnabled, setGateEnabled] = useState(true)
   const [adminGateStates, setAdminGateStates] = useState(255)
-  const [cycleTimeUs, setCycleTimeUs] = useState(1000) // microseconds for easier input
+  const [cycleTimeUs, setCycleTimeUs] = useState(1000)
   const [cycleTimeExtensionUs, setCycleTimeExtensionUs] = useState(10)
   const [baseTimeSeconds, setBaseTimeSeconds] = useState(100)
 
-  // Gate Control List - visual format
+  // Gate Control List
   const [gateEntries, setGateEntries] = useState([
-    { timeUs: 125, gates: [true, false, false, false, false, false, false, false] }, // TC0 open
-    { timeUs: 125, gates: [false, true, false, false, false, false, false, false] }, // TC1 open
-    { timeUs: 125, gates: [false, false, true, false, false, false, false, false] }, // TC2 open
-    { timeUs: 125, gates: [false, false, false, true, false, false, false, false] }, // TC3 open
-    { timeUs: 125, gates: [false, false, false, false, true, false, false, false] }, // TC4 open
-    { timeUs: 125, gates: [false, false, false, false, false, true, false, false] }, // TC5 open
-    { timeUs: 125, gates: [false, false, false, false, false, false, true, false] }, // TC6 open
-    { timeUs: 125, gates: [false, false, false, false, false, false, false, true] }, // TC7 open
+    { timeUs: 125, gates: [true, false, false, false, false, false, false, false] },
+    { timeUs: 125, gates: [false, true, false, false, false, false, false, false] },
+    { timeUs: 125, gates: [false, false, true, false, false, false, false, false] },
+    { timeUs: 125, gates: [false, false, false, true, false, false, false, false] },
+    { timeUs: 125, gates: [false, false, false, false, true, false, false, false] },
+    { timeUs: 125, gates: [false, false, false, false, false, true, false, false] },
+    { timeUs: 125, gates: [false, false, false, false, false, false, true, false] },
+    { timeUs: 125, gates: [false, false, false, false, false, false, false, true] },
   ])
 
-  const basePath = `/ietf-interfaces:interfaces/interface[name='${portNumber}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-sched-bridge:gate-parameter-table`
 
-  // Load current config from device
-  const loadFromDevice = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const response = await axios.post('/api/fetch', {
-        paths: [basePath],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 15000 })
+  const getBasePath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-sched-bridge:gate-parameter-table`
 
-      const data = parseYamlResponse(response.data.result)
-      setCurrentConfig(data)
-
-      // Update form with loaded values
-      if (data) {
-        setGateEnabled(data.gateEnabled ?? true)
-        setAdminGateStates(data.adminGateStates ?? 255)
-        if (data.cycleTimeNs > 0) {
-          setCycleTimeUs(Math.round(data.cycleTimeNs / 1000))
-        }
-        if (data.cycleTimeExtensionNs > 0) {
-          setCycleTimeExtensionUs(Math.round(data.cycleTimeExtensionNs / 1000))
-        }
-        if (data.baseTimeSeconds > 0) {
-          setBaseTimeSeconds(data.baseTimeSeconds)
-        }
-        if (data.adminControlList && data.adminControlList.length > 0) {
-          setGateEntries(data.adminControlList.map(entry => ({
-            timeUs: Math.round(entry.timeInterval / 1000),
-            gates: Array.from({ length: 8 }, (_, i) => ((entry.gateStates >> i) & 1) === 1)
-          })))
-        }
-      }
-
-      setResult({ type: 'fetch', label: 'Load Config', data: response.data.result })
-    } catch (err) {
-      setError(err.response?.data?.error || err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // Parse YAML response to structured data
-  const parseYamlResponse = (yamlStr) => {
+  // Parse TAS status from YAML
+  const parseStatus = (yamlStr) => {
     if (!yamlStr) return null
-
-    const data = {
-      gateEnabled: true,
+    const status = {
+      gateEnabled: false,
       adminGateStates: 255,
       operGateStates: 255,
       cycleTimeNs: 0,
-      cycleTimeExtensionNs: 0,
-      baseTimeSeconds: 0,
-      baseTimeNs: 0,
-      currentTimeSeconds: 0,
-      currentTimeNs: 0,
       configPending: false,
       adminControlList: [],
       operControlList: []
     }
 
-    const lines = yamlStr.split('\n')
-    let section = ''
-    let currentEntry = null
+    try {
+      status.gateEnabled = yamlStr.includes('gate-enabled: true')
 
-    const pushEntry = () => {
-      if (currentEntry && currentEntry.timeInterval > 0) {
-        if (section === 'admin-control-list') {
-          data.adminControlList.push({ ...currentEntry })
-        } else if (section === 'oper-control-list') {
-          data.operControlList.push({ ...currentEntry })
+      const adminGatesMatch = yamlStr.match(/admin-gate-states:\s*(\d+)/)
+      if (adminGatesMatch) status.adminGateStates = parseInt(adminGatesMatch[1])
+
+      const operGatesMatch = yamlStr.match(/oper-gate-states:\s*(\d+)/)
+      if (operGatesMatch) status.operGateStates = parseInt(operGatesMatch[1])
+
+      const cycleMatch = yamlStr.match(/numerator:\s*(\d+)/)
+      if (cycleMatch) status.cycleTimeNs = parseInt(cycleMatch[1])
+
+      status.configPending = yamlStr.includes('config-pending: true')
+
+      // Parse admin control list
+      const adminSection = yamlStr.match(/admin-control-list:[\s\S]*?(?=oper-control-list:|$)/)?.[0]
+      if (adminSection) {
+        const entries = adminSection.match(/gate-states-value:\s*(\d+)[\s\S]*?time-interval-value:\s*(\d+)/g)
+        if (entries) {
+          status.adminControlList = entries.map(e => {
+            const gs = e.match(/gate-states-value:\s*(\d+)/)?.[1]
+            const ti = e.match(/time-interval-value:\s*(\d+)/)?.[1]
+            return { gateStates: parseInt(gs) || 0, timeInterval: parseInt(ti) || 0 }
+          })
         }
       }
-      currentEntry = null
+
+      return status
+    } catch {
+      return status
     }
-
-    for (const line of lines) {
-      const trimmed = line.trim()
-
-      if (trimmed.startsWith('gate-enabled:')) {
-        data.gateEnabled = trimmed.includes('true')
-      } else if (trimmed.startsWith('admin-gate-states:')) {
-        data.adminGateStates = parseInt(trimmed.split(':')[1]) || 255
-      } else if (trimmed.startsWith('oper-gate-states:')) {
-        data.operGateStates = parseInt(trimmed.split(':')[1]) || 255
-      } else if (trimmed.startsWith('config-pending:')) {
-        data.configPending = trimmed.includes('true')
-      } else if (trimmed.startsWith('admin-cycle-time-extension:')) {
-        data.cycleTimeExtensionNs = parseInt(trimmed.split(':')[1]) || 0
-      } else if (trimmed === 'admin-control-list:') {
-        pushEntry()
-        section = 'admin-control-list'
-      } else if (trimmed === 'oper-control-list:') {
-        pushEntry()
-        section = 'oper-control-list'
-      } else if (trimmed === 'admin-cycle-time:' || trimmed === 'admin-base-time:' ||
-                 trimmed === 'current-time:' || trimmed === 'oper-cycle-time:' ||
-                 trimmed === 'queue-max-sdu-table:' || trimmed === 'oper-base-time:') {
-        pushEntry()
-        section = ''
-      } else if (trimmed.startsWith('- gate-states-value:') || trimmed.startsWith('- index:')) {
-        // New entry starts
-        pushEntry()
-        currentEntry = { index: 0, gateStates: 255, timeInterval: 0 }
-        if (trimmed.startsWith('- gate-states-value:')) {
-          currentEntry.gateStates = parseInt(trimmed.split(':')[1]) || 255
-        } else if (trimmed.startsWith('- index:')) {
-          currentEntry.index = parseInt(trimmed.split(':')[1]) || 0
-        }
-      } else if (currentEntry && (section === 'admin-control-list' || section === 'oper-control-list')) {
-        if (trimmed.startsWith('gate-states-value:')) {
-          currentEntry.gateStates = parseInt(trimmed.split(':')[1]) || 255
-        } else if (trimmed.startsWith('time-interval-value:')) {
-          currentEntry.timeInterval = parseInt(trimmed.split(':')[1]) || 0
-        } else if (trimmed.startsWith('index:')) {
-          currentEntry.index = parseInt(trimmed.split(':')[1]) || 0
-        }
-      }
-
-      // Parse cycle time numerator
-      if (trimmed.startsWith('numerator:') && section === '') {
-        const val = parseInt(trimmed.split(':')[1]) || 0
-        if (val > 0) data.cycleTimeNs = val
-      }
-    }
-
-    // Push last entry
-    pushEntry()
-
-    return data
   }
 
-  // Convert gates array to integer (bitmask)
-  const gatesToInt = (gates) => {
-    return gates.reduce((acc, open, idx) => acc | (open ? (1 << idx) : 0), 0)
+  // Fetch status for a single device
+  const fetchDeviceStatus = async (device) => {
+    try {
+      const res = await axios.post('/api/fetch', {
+        paths: [getBasePath(portNumber)],
+        transport: device.transport,
+        device: device.device,
+        host: device.host,
+        port: device.port || 5683
+      }, { timeout: 10000 })
+
+      const parsed = parseStatus(res.data.result)
+      return { ...parsed, online: true, raw: res.data.result }
+    } catch (err) {
+      return { online: false, error: err.message }
+    }
   }
 
-  // Toggle a gate in an entry
+  // Fetch all device statuses
+  const fetchAllStatuses = async (silent = false) => {
+    if (fetchingRef.current) return
+    fetchingRef.current = true
+    if (!silent) setLoading(true)
+
+    try {
+      for (const device of devices) {
+        const status = await fetchDeviceStatus(device)
+        setDeviceStatuses(prev => ({ ...prev, [device.id]: status }))
+        await new Promise(r => setTimeout(r, 200))
+      }
+      if (!silent) setError(null)
+    } catch (err) {
+      if (!silent) setError(err.message)
+    } finally {
+      fetchingRef.current = false
+      if (!silent) setLoading(false)
+    }
+  }
+
+  // Initial fetch
+  useEffect(() => {
+    if (devices.length > 0) {
+      fetchAllStatuses(false)
+    }
+  }, [devices, portNumber])
+
+  // Auto refresh
+  useEffect(() => {
+    if (autoRefresh && devices.length > 0) {
+      intervalRef.current = setInterval(() => fetchAllStatuses(true), 3000)
+    } else {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+    }
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
+  }, [autoRefresh, devices, portNumber])
+
+  // Convert gates array to integer
+  const gatesToInt = (gates) => gates.reduce((acc, open, idx) => acc | (open ? (1 << idx) : 0), 0)
+
+  // Toggle a gate
   const toggleGate = (entryIdx, tcIdx) => {
     const updated = [...gateEntries]
     updated[entryIdx].gates[tcIdx] = !updated[entryIdx].gates[tcIdx]
@@ -185,73 +157,54 @@ function TAS({ config }) {
     setGateEntries(updated)
   }
 
-  // Add new entry
-  const addEntry = () => {
-    setGateEntries([...gateEntries, { timeUs: 125, gates: [true, true, true, true, true, true, true, true] }])
-  }
+  // Add/remove entry
+  const addEntry = () => setGateEntries([...gateEntries, { timeUs: 125, gates: [true, true, true, true, true, true, true, true] }])
+  const removeEntry = (idx) => gateEntries.length > 1 && setGateEntries(gateEntries.filter((_, i) => i !== idx))
 
-  // Remove entry
-  const removeEntry = (idx) => {
-    if (gateEntries.length > 1) {
-      setGateEntries(gateEntries.filter((_, i) => i !== idx))
-    }
-  }
-
-  // Calculate totals
   const totalTimeUs = gateEntries.reduce((sum, e) => sum + e.timeUs, 0)
 
-  // Apply full configuration
+  // Apply configuration
   const applyConfig = async () => {
-    // Validate cycle time >= total GCL time
+    if (!selectedDevice) return
     if (cycleTimeUs < totalTimeUs) {
-      setError(`Cycle time (${cycleTimeUs} µs) must be >= total GCL time (${totalTimeUs} µs)`)
+      setError(`Cycle time (${cycleTimeUs} us) must be >= total GCL time (${totalTimeUs} us)`)
       return
     }
 
     setLoading(true)
     setError(null)
+    setLastResult(null)
+
+    const basePath = getBasePath(portNumber)
+    const patches = [
+      { path: `${basePath}/gate-enabled`, value: gateEnabled },
+      { path: `${basePath}/admin-gate-states`, value: adminGateStates },
+      ...gateEntries.map((entry, idx) => ({
+        path: `${basePath}/admin-control-list/gate-control-entry`,
+        value: {
+          index: idx + 1,
+          'operation-name': 'ieee802-dot1q-sched:set-gate-states',
+          'time-interval-value': entry.timeUs * 1000,
+          'gate-states-value': gatesToInt(entry.gates)
+        }
+      })),
+      { path: `${basePath}/admin-cycle-time/numerator`, value: cycleTimeUs * 1000 },
+      { path: `${basePath}/admin-cycle-time/denominator`, value: 1 },
+      { path: `${basePath}/admin-cycle-time-extension`, value: cycleTimeExtensionUs * 1000 },
+      { path: `${basePath}/admin-base-time/seconds`, value: String(baseTimeSeconds) },
+      { path: `${basePath}/admin-base-time/nanoseconds`, value: 0 }
+    ]
+
     try {
-      const patches = []
-
-      // Gate enabled
-      patches.push({ path: `${basePath}/gate-enabled`, value: gateEnabled })
-
-      // Admin gate states
-      patches.push({ path: `${basePath}/admin-gate-states`, value: adminGateStates })
-
-      // Gate control list entries
-      gateEntries.forEach((entry, idx) => {
-        patches.push({
-          path: `${basePath}/admin-control-list/gate-control-entry`,
-          value: {
-            index: idx + 1,
-            'operation-name': 'ieee802-dot1q-sched:set-gate-states',
-            'time-interval-value': entry.timeUs * 1000, // convert to nanoseconds
-            'gate-states-value': gatesToInt(entry.gates)
-          }
-        })
-      })
-
-      // Cycle time (numerator in nanoseconds, denominator = 1)
-      patches.push({ path: `${basePath}/admin-cycle-time/numerator`, value: cycleTimeUs * 1000 })
-      patches.push({ path: `${basePath}/admin-cycle-time/denominator`, value: 1 })
-
-      // Cycle time extension
-      patches.push({ path: `${basePath}/admin-cycle-time-extension`, value: cycleTimeExtensionUs * 1000 })
-
-      // Base time
-      patches.push({ path: `${basePath}/admin-base-time/seconds`, value: String(baseTimeSeconds) })
-      patches.push({ path: `${basePath}/admin-base-time/nanoseconds`, value: 0 })
-
-      const response = await axios.post('/api/patch', {
+      const res = await axios.post('/api/patch', {
         patches,
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 30000 })
-
-      setResult({ type: 'patch', label: 'Apply Config', data: response.data })
+      setLastResult(res.data)
+      setTimeout(() => fetchAllStatuses(true), 500)
     } catch (err) {
       setError(err.response?.data?.error || err.message)
     } finally {
@@ -261,36 +214,20 @@ function TAS({ config }) {
 
   // Trigger config change
   const triggerConfigChange = async () => {
+    if (!selectedDevice) return
     setLoading(true)
     setError(null)
-    try {
-      const response = await axios.post('/api/patch', {
-        patches: [{ path: `${basePath}/config-change`, value: true }],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 10000 })
-      setResult({ type: 'patch', label: 'Config Change', data: response.data })
-    } catch (err) {
-      setError(err.response?.data?.error || err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
 
-  // Fetch current time from device
-  const fetchCurrentTime = async () => {
-    setLoading(true)
     try {
-      const response = await axios.post('/api/fetch', {
-        paths: [`${basePath}/current-time`],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+      const res = await axios.post('/api/patch', {
+        patches: [{ path: `${getBasePath(portNumber)}/config-change`, value: true }],
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 10000 })
-      setResult({ type: 'fetch', label: 'Current Time', data: response.data.result })
+      setLastResult(res.data)
+      setTimeout(() => fetchAllStatuses(true), 500)
     } catch (err) {
       setError(err.response?.data?.error || err.message)
     } finally {
@@ -301,250 +238,238 @@ function TAS({ config }) {
   return (
     <div>
       <div className="page-header">
-        <h1 className="page-title">TAS Configuration (IEEE 802.1Qbv)</h1>
-        <p className="page-description">Time-Aware Shaper - Gate Control List Configuration</p>
-      </div>
-
-      {/* Port Selection & Load */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Port Selection</h2>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button className="btn btn-secondary" onClick={loadFromDevice} disabled={loading}>
-              {loading ? 'Loading...' : 'Load from Device'}
-            </button>
-            <button className="btn btn-secondary" onClick={fetchCurrentTime} disabled={loading}>
-              Current Time
-            </button>
-          </div>
-        </div>
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">Port</label>
-            <select className="form-select" value={portNumber} onChange={(e) => setPortNumber(e.target.value)}>
-              {Array.from({ length: 12 }, (_, i) => i + 1).map(p => (
-                <option key={p} value={p}>Port {p}</option>
-              ))}
-            </select>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Gate Enabled</label>
-            <select className="form-select" value={gateEnabled} onChange={(e) => setGateEnabled(e.target.value === 'true')}>
-              <option value="true">Enabled</option>
-              <option value="false">Disabled</option>
-            </select>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Default Gate States</label>
-            <input
-              type="number"
-              className="form-input"
-              value={adminGateStates}
-              onChange={(e) => setAdminGateStates(parseInt(e.target.value) || 0)}
-              min="0"
-              max="255"
-            />
-            <small style={{ color: '#64748b', fontSize: '0.7rem' }}>255 = all gates open when GCL inactive</small>
-          </div>
-        </div>
-      </div>
-
-      {/* Gate Control List Table */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Gate Control List</h2>
-          <button className="btn btn-secondary" onClick={addEntry} style={{ fontSize: '0.8rem', padding: '6px 12px' }}>
-            + Add Entry
+        <h1 className="page-title">TAS (802.1Qbv)</h1>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <select
+            className="form-select"
+            value={portNumber}
+            onChange={(e) => setPortNumber(e.target.value)}
+            style={{ width: '100px' }}
+          >
+            {[1,2,3,4,5,6,7,8,9,10,11,12].map(p => <option key={p} value={p}>Port {p}</option>)}
+          </select>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', cursor: 'pointer' }}>
+            <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
+            Auto
+          </label>
+          <button className="btn btn-secondary" onClick={() => fetchAllStatuses(false)} disabled={loading}>
+            Refresh
           </button>
         </div>
+      </div>
 
-        <div style={{ overflowX: 'auto' }}>
-          <table className="table" style={{ minWidth: '700px' }}>
-            <thead>
-              <tr>
-                <th style={{ width: '50px' }}>#</th>
-                <th style={{ width: '100px' }}>Time (µs)</th>
-                <th style={{ textAlign: 'center' }}>TC7</th>
-                <th style={{ textAlign: 'center' }}>TC6</th>
-                <th style={{ textAlign: 'center' }}>TC5</th>
-                <th style={{ textAlign: 'center' }}>TC4</th>
-                <th style={{ textAlign: 'center' }}>TC3</th>
-                <th style={{ textAlign: 'center' }}>TC2</th>
-                <th style={{ textAlign: 'center' }}>TC1</th>
-                <th style={{ textAlign: 'center' }}>TC0</th>
-                <th style={{ width: '80px' }}>Value</th>
-                <th style={{ width: '50px' }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {gateEntries.map((entry, idx) => (
-                <tr key={idx}>
-                  <td style={{ fontWeight: '600', color: '#64748b' }}>{idx + 1}</td>
-                  <td>
-                    <input
-                      type="number"
-                      className="form-input"
-                      value={entry.timeUs}
-                      onChange={(e) => updateEntryTime(idx, e.target.value)}
-                      style={{ width: '90px' }}
-                      min="1"
-                    />
-                  </td>
-                  {[7, 6, 5, 4, 3, 2, 1, 0].map(tc => (
-                    <td key={tc} style={{ textAlign: 'center' }}>
-                      <button
-                        onClick={() => toggleGate(idx, tc)}
-                        style={{
-                          width: '36px',
-                          height: '36px',
-                          borderRadius: '6px',
-                          border: 'none',
-                          cursor: 'pointer',
-                          background: entry.gates[tc] ? '#22c55e' : '#ef4444',
-                          color: '#fff',
-                          fontWeight: '600',
-                          fontSize: '0.8rem',
-                          transition: 'all 0.15s'
-                        }}
-                      >
-                        {entry.gates[tc] ? 'O' : 'C'}
-                      </button>
-                    </td>
+      {/* Device Status Cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(devices.length, 3)}, 1fr)`, gap: '12px', marginBottom: '16px' }}>
+        {devices.map(device => {
+          const status = deviceStatuses[device.id] || {}
+          const isSelected = selectedDevice?.id === device.id
+
+          return (
+            <div
+              key={device.id}
+              onClick={() => selectDevice(device)}
+              style={{
+                padding: '16px',
+                background: isSelected ? '#f1f5f9' : '#fff',
+                border: isSelected ? '2px solid #475569' : status.online ? '1px solid #d1d5db' : '1px solid #fca5a5',
+                borderRadius: '12px',
+                cursor: 'pointer'
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+                <div>
+                  <div style={{ fontWeight: '600', fontSize: '0.95rem' }}>{device.name}</div>
+                  <div style={{ fontSize: '0.7rem', color: '#64748b', fontFamily: 'monospace' }}>
+                    {device.transport === 'serial' ? device.device : device.host}
+                  </div>
+                </div>
+                <div style={{
+                  padding: '4px 10px',
+                  borderRadius: '6px',
+                  fontSize: '0.75rem',
+                  fontWeight: '600',
+                  background: !status.online ? '#fef2f2' : status.gateEnabled ? '#ecfdf5' : '#f8fafc',
+                  color: !status.online ? '#b91c1c' : status.gateEnabled ? '#059669' : '#64748b'
+                }}>
+                  {!status.online ? 'OFFLINE' : status.gateEnabled ? 'ENABLED' : 'DISABLED'}
+                </div>
+              </div>
+
+              {status.online ? (
+                <div style={{ fontSize: '0.8rem' }}>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                    <span style={{ padding: '2px 8px', background: '#f1f5f9', borderRadius: '4px' }}>
+                      Cycle: {status.cycleTimeNs ? `${(status.cycleTimeNs / 1000).toFixed(0)} us` : '-'}
+                    </span>
+                    <span style={{ padding: '2px 8px', background: '#f1f5f9', borderRadius: '4px' }}>
+                      GCL: {status.adminControlList?.length || 0} entries
+                    </span>
+                    {status.configPending && (
+                      <span style={{ padding: '2px 8px', background: '#fef3c7', borderRadius: '4px', color: '#92400e' }}>
+                        Pending
+                      </span>
+                    )}
+                  </div>
+                  {status.adminControlList?.length > 0 && (
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                      {status.adminControlList.slice(0, 8).map((e, i) => (
+                        <span key={i} style={{
+                          padding: '2px 4px',
+                          background: '#f8fafc',
+                          borderRadius: '2px',
+                          fontSize: '0.65rem',
+                          fontFamily: 'monospace'
+                        }}>
+                          {e.gateStates}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ padding: '12px', textAlign: 'center', color: '#94a3b8', fontSize: '0.85rem' }}>
+                  {status.error || 'Offline'}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {devices.length === 0 && (
+        <div className="card" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+          No devices configured. Go to Settings to add devices.
+        </div>
+      )}
+
+      {/* Configuration */}
+      {selectedDevice && (
+        <>
+          {/* Gate Control List */}
+          <div className="card">
+            <div className="card-header">
+              <h2 className="card-title">Gate Control List</h2>
+              <button className="btn btn-secondary" onClick={addEntry} style={{ fontSize: '0.8rem', padding: '6px 12px' }}>
+                + Add
+              </button>
+            </div>
+
+            <div style={{ overflowX: 'auto' }}>
+              <table className="table" style={{ minWidth: '600px', fontSize: '0.85rem' }}>
+                <thead>
+                  <tr>
+                    <th style={{ width: '40px' }}>#</th>
+                    <th style={{ width: '80px' }}>Time</th>
+                    {[7,6,5,4,3,2,1,0].map(tc => <th key={tc} style={{ textAlign: 'center', width: '40px' }}>T{tc}</th>)}
+                    <th style={{ width: '50px' }}>Val</th>
+                    <th style={{ width: '30px' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {gateEntries.map((entry, idx) => (
+                    <tr key={idx}>
+                      <td style={{ color: '#64748b' }}>{idx + 1}</td>
+                      <td>
+                        <input
+                          type="number"
+                          className="form-input"
+                          value={entry.timeUs}
+                          onChange={(e) => updateEntryTime(idx, e.target.value)}
+                          style={{ width: '70px', padding: '4px' }}
+                          min="1"
+                        />
+                      </td>
+                      {[7,6,5,4,3,2,1,0].map(tc => (
+                        <td key={tc} style={{ textAlign: 'center' }}>
+                          <button
+                            onClick={() => toggleGate(idx, tc)}
+                            style={{
+                              width: '28px', height: '28px', borderRadius: '4px', border: 'none', cursor: 'pointer',
+                              background: entry.gates[tc] ? '#22c55e' : '#ef4444',
+                              color: '#fff', fontWeight: '600', fontSize: '0.7rem'
+                            }}
+                          >
+                            {entry.gates[tc] ? 'O' : 'C'}
+                          </button>
+                        </td>
+                      ))}
+                      <td style={{ fontFamily: 'monospace', color: '#64748b' }}>{gatesToInt(entry.gates)}</td>
+                      <td>
+                        <button
+                          onClick={() => removeEntry(idx)}
+                          disabled={gateEntries.length <= 1}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: gateEntries.length > 1 ? '#dc2626' : '#ccc' }}
+                        >
+                          X
+                        </button>
+                      </td>
+                    </tr>
                   ))}
-                  <td style={{ fontFamily: 'monospace', fontSize: '0.85rem', color: '#64748b' }}>
-                    {gatesToInt(entry.gates)}
-                  </td>
-                  <td>
-                    <button
-                      onClick={() => removeEntry(idx)}
-                      disabled={gateEntries.length <= 1}
-                      style={{
-                        background: 'none',
-                        border: 'none',
-                        cursor: gateEntries.length > 1 ? 'pointer' : 'not-allowed',
-                        color: gateEntries.length > 1 ? '#dc2626' : '#ccc'
-                      }}
-                    >
-                      <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                </tbody>
+              </table>
+            </div>
 
-        <div style={{ marginTop: '12px', padding: '12px', background: '#f8fafc', borderRadius: '6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <span style={{ color: '#22c55e', fontWeight: '600' }}>O</span> = Open (transmit allowed)
-            <span style={{ marginLeft: '16px', color: '#ef4444', fontWeight: '600' }}>C</span> = Closed (blocked)
+            <div style={{ marginTop: '8px', fontSize: '0.75rem', color: '#64748b' }}>
+              Total: {totalTimeUs} us | O=Open, C=Closed
+            </div>
           </div>
-          <div style={{ fontWeight: '500' }}>
-            Total: <span style={{ fontFamily: 'monospace' }}>{totalTimeUs} µs</span>
-            {totalTimeUs !== cycleTimeUs && (
-              <span style={{ marginLeft: '8px', color: totalTimeUs > cycleTimeUs ? '#ef4444' : '#eab308', fontSize: '0.85rem' }}>
-                (Cycle: {cycleTimeUs} µs)
-              </span>
-            )}
+
+          {/* Timing */}
+          <div className="card">
+            <div className="card-header">
+              <h2 className="card-title">Timing</h2>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
+              <div>
+                <label className="form-label">Gate Enabled</label>
+                <select className="form-select" value={gateEnabled} onChange={(e) => setGateEnabled(e.target.value === 'true')}>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              </div>
+              <div>
+                <label className="form-label">Cycle Time (us)</label>
+                <input type="number" className="form-input" value={cycleTimeUs} onChange={(e) => setCycleTimeUs(parseInt(e.target.value) || 0)} />
+              </div>
+              <div>
+                <label className="form-label">Extension (us)</label>
+                <input type="number" className="form-input" value={cycleTimeExtensionUs} onChange={(e) => setCycleTimeExtensionUs(parseInt(e.target.value) || 0)} />
+              </div>
+              <div>
+                <label className="form-label">Base Time (s)</label>
+                <input type="number" className="form-input" value={baseTimeSeconds} onChange={(e) => setBaseTimeSeconds(parseInt(e.target.value) || 0)} />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginTop: '16px', borderTop: '1px solid #e2e8f0', paddingTop: '16px' }}>
+              <button className="btn btn-primary" onClick={applyConfig} disabled={loading}>
+                {loading ? 'Applying...' : 'Apply Config'}
+              </button>
+              <button className="btn btn-secondary" onClick={triggerConfigChange} disabled={loading}>
+                Trigger Change
+              </button>
+              <button className="btn btn-secondary" onClick={() => setCycleTimeUs(totalTimeUs)}>
+                Cycle = Total ({totalTimeUs})
+              </button>
+            </div>
           </div>
-        </div>
-      </div>
+        </>
+      )}
 
-      {/* Timing Configuration */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Timing Configuration</h2>
-        </div>
-        <div className="form-row">
-          <div className="form-group">
-            <label className="form-label">Cycle Time (µs)</label>
-            <input
-              type="number"
-              className="form-input"
-              value={cycleTimeUs}
-              onChange={(e) => setCycleTimeUs(parseInt(e.target.value) || 0)}
-              min="1"
-            />
-            <small style={{ color: '#64748b', fontSize: '0.7rem' }}>
-              Must be ≥ total GCL time ({totalTimeUs} µs)
-            </small>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Cycle Time Extension (µs)</label>
-            <input
-              type="number"
-              className="form-input"
-              value={cycleTimeExtensionUs}
-              onChange={(e) => setCycleTimeExtensionUs(parseInt(e.target.value) || 0)}
-              min="0"
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Base Time (seconds)</label>
-            <input
-              type="number"
-              className="form-input"
-              value={baseTimeSeconds}
-              onChange={(e) => setBaseTimeSeconds(parseInt(e.target.value) || 0)}
-              min="0"
-            />
-            <small style={{ color: '#64748b', fontSize: '0.7rem' }}>
-              PTP time when schedule becomes active
-            </small>
-          </div>
-        </div>
-
-        {/* Auto-fill cycle time button */}
-        <button
-          className="btn btn-secondary"
-          onClick={() => setCycleTimeUs(totalTimeUs)}
-          style={{ marginTop: '8px' }}
-        >
-          Set Cycle Time = Total GCL Time ({totalTimeUs} µs)
-        </button>
-      </div>
-
-      {/* Apply Configuration */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Apply Configuration</h2>
-        </div>
-        <p style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '16px' }}>
-          1. Apply Config → 2. Trigger Config Change → Schedule becomes active at Base Time
-        </p>
-        <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
-          <button className="btn btn-primary" onClick={applyConfig} disabled={loading}>
-            {loading ? 'Applying...' : '1. Apply Config'}
-          </button>
-          <button className="btn btn-success" onClick={triggerConfigChange} disabled={loading}>
-            2. Trigger Config Change
-          </button>
-        </div>
-
-        <div style={{ marginTop: '16px', padding: '12px', background: '#fef3c7', borderRadius: '8px', fontSize: '0.85rem' }}>
-          <strong>Note:</strong> Base Time must be set to a future PTP time. After Config Change,
-          the Admin config becomes Operational at Base Time.
-        </div>
-      </div>
-
-      {/* Error */}
       {error && <div className="alert alert-error">{error}</div>}
 
-      {/* Result */}
-      {result && (
+      {lastResult && (
         <div className="card">
           <div className="card-header">
-            <h2 className="card-title">Result: {result.label}</h2>
-            <span className={`status-badge ${result.type === 'fetch' ? 'info' : 'success'}`}>
-              {result.type === 'fetch' ? 'Fetched' : 'Applied'}
-            </span>
+            <h2 className="card-title">Result</h2>
           </div>
-          <div className="result-container">
-            <div className="result-content">
-              <pre>{typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2)}</pre>
-            </div>
+          <div style={{ fontSize: '0.85rem' }}>
+            {lastResult.results?.map((r, i) => (
+              <div key={i} style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
+                <span style={{ color: r.success ? '#16a34a' : '#dc2626' }}>{r.success ? 'OK' : 'Fail'}</span>
+                <span>{r.path.split('/').pop()}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}

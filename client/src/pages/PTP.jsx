@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
+import { useDevices } from '../contexts/DeviceContext'
 
-function PTP({ config }) {
-  // Load devices from localStorage
-  const [devices, setDevices] = useState([])
-  const [selectedDevice, setSelectedDevice] = useState(null)
+function PTP() {
+  const { devices, selectedDevice, selectDevice } = useDevices()
   const [deviceStatuses, setDeviceStatuses] = useState({})
 
   // Configuration state
@@ -27,15 +26,6 @@ function PTP({ config }) {
   const intervalRef = useRef(null)
   const fetchingRef = useRef(false)
 
-  // Load devices from localStorage
-  useEffect(() => {
-    const savedDevices = localStorage.getItem('tsn-devices')
-    if (savedDevices) {
-      const parsed = JSON.parse(savedDevices)
-      setDevices(parsed)
-      if (parsed.length > 0) setSelectedDevice(parsed[0])
-    }
-  }, [])
 
   // Parse detailed status from YAML
   const parseStatus = (yamlStr) => {
@@ -294,7 +284,7 @@ function PTP({ config }) {
           return (
             <div
               key={device.id}
-              onClick={() => setSelectedDevice(device)}
+              onClick={() => selectDevice(device)}
               style={{
                 padding: '16px',
                 background: isSelected ? '#f1f5f9' : '#fff',
