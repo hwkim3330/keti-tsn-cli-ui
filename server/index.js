@@ -17,6 +17,8 @@ import getRoutes from './routes/get.js';
 import configRoutes from './routes/config.js';
 import rpcRoutes from './routes/rpc.js';
 import captureRoutes, { setWsClients, getCaptureState } from './routes/capture.js';
+import trafficRoutes from './routes/traffic.js';
+import ptpRoutes from './routes/ptp.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -77,6 +79,8 @@ app.use('/api/get', getRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/rpc', rpcRoutes);
 app.use('/api/capture', captureRoutes);
+app.use('/api/traffic', trafficRoutes);
+app.use('/api/ptp', ptpRoutes);
 
 // Health check (must be before static wildcard)
 app.get('/api/health', (req, res) => {

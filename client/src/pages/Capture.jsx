@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import axios from 'axios'
 import { useCapture } from '../contexts/CaptureContext'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
 
 const MAX_PACKETS = 500
 const UPDATE_INTERVAL = 200
@@ -21,11 +22,24 @@ function Capture() {
   const [autoScroll, setAutoScroll] = useState(true)
   const [protocolFilter, setProtocolFilter] = useState('all')
   const [paused, setPaused] = useState(false)
+  const [showPtpAnalysis, setShowPtpAnalysis] = useState(false)
+
+  // PTP Analysis state
+  const [ptpAnalysis, setPtpAnalysis] = useState({
+    syncPairs: [], // [{syncTime, followUpTime, sequenceId, correctionField, offset}]
+    pdelayPairs: [],
+    offsetHistory: []
+  })
 
   const tableRef = useRef(null)
   const packetBufferRef = useRef([])
   const updateTimerRef = useRef(null)
   const pausedRef = useRef(false)
+  const ptpStateRef = useRef({
+    lastSync: null,
+    lastPdelayReq: null,
+    lastPdelayResp: null
+  })
 
   // Keep pausedRef in sync
   useEffect(() => {
@@ -46,10 +60,90 @@ function Capture() {
     })
   }, [])
 
+  // PTP packet analysis
+  const analyzePtpPacket = useCallback((packet) => {
+    if (packet.protocol !== 'PTP' || !packet.ptp) return
+
+    const ptp = packet.ptp
+    const state = ptpStateRef.current
+    const timestamp = new Date(packet.time).getTime()
+
+    switch (ptp.msgType) {
+      case 'Sync':
+        state.lastSync = {
+          sequenceId: ptp.sequenceId,
+          timestamp,
+          clockId: ptp.clockId
+        }
+        break
+
+      case 'Follow_Up':
+        if (state.lastSync && state.lastSync.sequenceId === ptp.sequenceId) {
+          // Calculate offset from correction field
+          const correctionNs = ptp.correctionField || 0
+          const preciseOriginTs = ptp.preciseOriginTimestamp || 0
+
+          setPtpAnalysis(prev => {
+            const newPair = {
+              sequenceId: ptp.sequenceId,
+              syncTime: state.lastSync.timestamp,
+              followUpTime: timestamp,
+              correctionField: correctionNs,
+              preciseOriginTs,
+              time: new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+            }
+
+            const newSyncPairs = [...prev.syncPairs, newPair].slice(-100)
+
+            // Calculate offset history entry
+            const historyEntry = {
+              time: newPair.time,
+              correction: correctionNs
+            }
+
+            return {
+              ...prev,
+              syncPairs: newSyncPairs,
+              offsetHistory: [...prev.offsetHistory, historyEntry].slice(-60)
+            }
+          })
+
+          state.lastSync = null
+        }
+        break
+
+      case 'Pdelay_Req':
+        state.lastPdelayReq = {
+          sequenceId: ptp.sequenceId,
+          timestamp
+        }
+        break
+
+      case 'Pdelay_Resp':
+        if (state.lastPdelayReq && state.lastPdelayReq.sequenceId === ptp.sequenceId) {
+          const rtt = timestamp - state.lastPdelayReq.timestamp
+          setPtpAnalysis(prev => ({
+            ...prev,
+            pdelayPairs: [...prev.pdelayPairs, {
+              sequenceId: ptp.sequenceId,
+              rtt,
+              timestamp
+            }].slice(-50)
+          }))
+        }
+        break
+
+      case 'Pdelay_Resp_Follow_Up':
+        // Could be used for more precise delay calculation
+        break
+    }
+  }, [])
+
   // Handle incoming packet
   const handlePacket = useCallback((packet) => {
     packetBufferRef.current.push(packet)
-  }, [])
+    analyzePtpPacket(packet)
+  }, [analyzePtpPacket])
 
   // Register packet listener
   useEffect(() => {
@@ -112,6 +206,8 @@ function Capture() {
   const handleStart = () => {
     setPackets([])
     packetBufferRef.current = []
+    setPtpAnalysis({ syncPairs: [], pdelayPairs: [], offsetHistory: [] })
+    ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
     startCapture({
       interfaces: selectedInterfaces,
       port: parseInt(filterPort) || 5683,
@@ -124,6 +220,8 @@ function Capture() {
     setPackets([])
     packetBufferRef.current = []
     setSelectedPacket(null)
+    setPtpAnalysis({ syncPairs: [], pdelayPairs: [], offsetHistory: [] })
+    ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
   }
 
   const formatTime = (isoTime) => {
@@ -175,11 +273,142 @@ function Capture() {
     udp: packets.filter(p => p.protocol === 'UDP').length
   }), [packets])
 
+  // PTP stats
+  const ptpStats = useMemo(() => {
+    const ptpPackets = packets.filter(p => p.protocol === 'PTP')
+    const msgTypes = {}
+    ptpPackets.forEach(p => {
+      const type = p.ptp?.msgType || 'Unknown'
+      msgTypes[type] = (msgTypes[type] || 0) + 1
+    })
+    return { total: ptpPackets.length, msgTypes }
+  }, [packets])
+
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Packet Capture</h1>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            className={`btn ${showPtpAnalysis ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setShowPtpAnalysis(!showPtpAnalysis)}
+            style={{ fontSize: '0.8rem' }}
+          >
+            PTP Analysis
+          </button>
+        </div>
       </div>
+
+      {/* PTP Analysis Panel */}
+      {showPtpAnalysis && (
+        <div className="card" style={{ marginBottom: '16px' }}>
+          <div className="card-header">
+            <h2 className="card-title">PTP Analysis</h2>
+            <div style={{ display: 'flex', gap: '16px', fontSize: '0.75rem' }}>
+              {Object.entries(ptpStats.msgTypes).map(([type, count]) => (
+                <span key={type} style={{ color: '#a78bfa' }}>
+                  {type}: <b>{count}</b>
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* Sync/Follow_Up Pairs */}
+            <div>
+              <h3 style={{ fontSize: '0.85rem', marginBottom: '8px', color: '#64748b' }}>
+                Sync/Follow_Up Pairs ({ptpAnalysis.syncPairs.length})
+              </h3>
+              <div style={{
+                maxHeight: '150px', overflow: 'auto',
+                fontSize: '0.7rem', fontFamily: 'monospace',
+                background: '#f8fafc', borderRadius: '6px', padding: '8px'
+              }}>
+                {ptpAnalysis.syncPairs.length === 0 ? (
+                  <div style={{ color: '#94a3b8', textAlign: 'center', padding: '20px' }}>
+                    Waiting for Sync/Follow_Up packets...
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #e2e8f0' }}>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>SeqID</th>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>Time</th>
+                        <th style={{ textAlign: 'right', padding: '4px' }}>Correction</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ptpAnalysis.syncPairs.slice(-20).reverse().map((pair, i) => (
+                        <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                          <td style={{ padding: '4px' }}>{pair.sequenceId}</td>
+                          <td style={{ padding: '4px' }}>{pair.time}</td>
+                          <td style={{ padding: '4px', textAlign: 'right', color: '#6366f1' }}>
+                            {pair.correctionField} ns
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+
+            {/* Correction Field Graph */}
+            <div>
+              <h3 style={{ fontSize: '0.85rem', marginBottom: '8px', color: '#64748b' }}>
+                Correction Field History
+              </h3>
+              <div style={{ height: '150px' }}>
+                {ptpAnalysis.offsetHistory.length > 1 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={ptpAnalysis.offsetHistory} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="#94a3b8" interval="preserveStartEnd" />
+                      <YAxis tick={{ fontSize: 9 }} stroke="#94a3b8" />
+                      <Tooltip contentStyle={{ fontSize: '0.7rem' }} formatter={(v) => [`${v} ns`, 'Correction']} />
+                      <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                      <Line
+                        type="monotone"
+                        dataKey="correction"
+                        stroke="#a78bfa"
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{
+                    height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: '#f8fafc', borderRadius: '6px', color: '#94a3b8', fontSize: '0.8rem'
+                  }}>
+                    Waiting for data...
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Pdelay Info */}
+          {ptpAnalysis.pdelayPairs.length > 0 && (
+            <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #e2e8f0' }}>
+              <h3 style={{ fontSize: '0.85rem', marginBottom: '8px', color: '#64748b' }}>
+                Pdelay RTT (last 10)
+              </h3>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {ptpAnalysis.pdelayPairs.slice(-10).map((p, i) => (
+                  <span key={i} style={{
+                    padding: '4px 8px', background: '#f0fdf4', borderRadius: '4px',
+                    fontSize: '0.7rem', fontFamily: 'monospace'
+                  }}>
+                    #{p.sequenceId}: {p.rtt}ms
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Controls */}
       <div className="card">
@@ -405,6 +634,19 @@ function Capture() {
                     <div>{selectedPacket.ptp.domain}</div>
                   </div>
                 </div>
+                {selectedPacket.ptp.correctionField !== undefined && (
+                  <div style={{ marginTop: '8px', padding: '8px', background: '#f5f3ff', borderRadius: '6px' }}>
+                    <div style={{ fontSize: '0.65rem', color: '#6366f1' }}>Correction Field</div>
+                    <div style={{ fontSize: '1rem', fontWeight: '600', fontFamily: 'monospace' }}>
+                      {selectedPacket.ptp.correctionField} ns
+                    </div>
+                  </div>
+                )}
+                {selectedPacket.ptp.clockId && (
+                  <div style={{ marginTop: '8px', fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
+                    Clock: {selectedPacket.ptp.clockId}
+                  </div>
+                )}
               </div>
             )}
           </div>

@@ -9,6 +9,7 @@ import CBS from './pages/CBS'
 import Ports from './pages/Ports'
 import Capture from './pages/Capture'
 import Tools from './pages/Tools'
+import Traffic from './pages/Traffic'
 
 function Sidebar() {
   return (
@@ -39,6 +40,12 @@ function Sidebar() {
             </svg>
             <span>Packet Capture</span>
           </NavLink>
+          <NavLink to="/traffic" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+            <span>Traffic Generator</span>
+          </NavLink>
         </div>
 
         <div className="nav-section">
@@ -64,13 +71,7 @@ function Sidebar() {
         </div>
 
         <div className="nav-section">
-          <div className="nav-section-title">Developer</div>
-          <NavLink to="/tools" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
-            </svg>
-            <span>CLI Tools</span>
-          </NavLink>
+          <div className="nav-section-title">System</div>
           <NavLink to="/settings" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -96,6 +97,7 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/ports" element={<Ports />} />
             <Route path="/capture" element={<Capture />} />
+            <Route path="/traffic" element={<Traffic />} />
             <Route path="/ptp" element={<PTP />} />
             <Route path="/tas" element={<TAS />} />
             <Route path="/cbs" element={<CBS />} />
