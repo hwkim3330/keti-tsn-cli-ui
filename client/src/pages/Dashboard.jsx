@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
 
 const TAP_INTERFACE = 'enxc84d44231cc2'
 
@@ -21,9 +21,9 @@ function Dashboard() {
   const [tapConnected, setTapConnected] = useState(false)
   const [ptpPackets, setPtpPackets] = useState([])
   const [syncPairs, setSyncPairs] = useState([])
-  const [tapOffsetHistory, setTapOffsetHistory] = useState([])
+  const [pdelayInfo, setPdelayInfo] = useState({ lastRtt: null, count: 0 })
   const wsRef = useRef(null)
-  const ptpStateRef = useRef({ lastSync: null })
+  const ptpStateRef = useRef({ lastSync: null, lastPdelayReq: null, lastPdelayResp: null })
   const MAX_PACKETS = 50
   const MAX_SYNC_PAIRS = 30
 
@@ -177,30 +177,47 @@ function Dashboard() {
       state.lastSync = {
         sequenceId: ptp.sequenceId,
         time: now,
+        correction: ptp.correction || 0,
         timestamp: ptp.timestamp
       }
     } else if (ptp.msgType === 'Follow_Up' && state.lastSync?.sequenceId === ptp.sequenceId) {
-      // Follow_Up contains preciseOriginTimestamp
-      const preciseTs = ptp.timestamp
-      const correction = ptp.correction || 0
+      // Follow_Up contains preciseOriginTimestamp (t1)
+      const t1 = ptp.timestamp // preciseOriginTimestamp
+      const syncCorr = state.lastSync.correction || 0
+      const followUpCorr = ptp.correction || 0
+      const totalCorr = syncCorr + followUpCorr
 
       setSyncPairs(prev => [...prev, {
         sequenceId: ptp.sequenceId,
-        correction,
-        preciseTs: preciseTs ? `${preciseTs.seconds}.${preciseTs.nanoseconds.toString().padStart(9, '0')}` : null,
+        t1_sec: t1?.seconds || 0,
+        t1_ns: t1?.nanoseconds || 0,
+        syncCorr,
+        followUpCorr,
+        totalCorr,
         time: timeStr
       }].slice(-MAX_SYNC_PAIRS))
 
-      // For comparison, use the timestamp nanoseconds as indicator
-      const nsValue = preciseTs?.nanoseconds || 0
-      setTapOffsetHistory(prev => [...prev, {
-        time: timeStr,
-        tapNs: nsValue % 1000000 // Just show sub-millisecond part
-      }].slice(-MAX_HISTORY))
-
       state.lastSync = null
-    } else if (ptp.msgType === 'Pdelay_Resp') {
-      // Could track peer delay
+    } else if (ptp.msgType === 'Pdelay_Req') {
+      state.lastPdelayReq = { sequenceId: ptp.sequenceId, time: now }
+    } else if (ptp.msgType === 'Pdelay_Resp' && state.lastPdelayReq?.sequenceId === ptp.sequenceId) {
+      state.lastPdelayResp = {
+        sequenceId: ptp.sequenceId,
+        reqTime: state.lastPdelayReq.time,
+        respTime: now,
+        correction: ptp.correction || 0,
+        timestamp: ptp.timestamp
+      }
+    } else if (ptp.msgType === 'Pdelay_Resp_Follow_Up' && state.lastPdelayResp?.sequenceId === ptp.sequenceId) {
+      // Complete Pdelay exchange
+      const rtt = state.lastPdelayResp.respTime - state.lastPdelayResp.reqTime
+      setPdelayInfo(prev => ({
+        lastRtt: rtt,
+        count: prev.count + 1,
+        respTimestamp: ptp.timestamp
+      }))
+      state.lastPdelayReq = null
+      state.lastPdelayResp = null
     }
   }, [])
 
@@ -214,7 +231,8 @@ function Dashboard() {
       setTapCapturing(true)
       setPtpPackets([])
       setSyncPairs([])
-      setTapOffsetHistory([])
+      setPdelayInfo({ lastRtt: null, count: 0 })
+      ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
     } catch (e) {}
   }
 
@@ -580,7 +598,8 @@ function Dashboard() {
             <button className="btn btn-secondary" onClick={() => {
               setPtpPackets([])
               setSyncPairs([])
-              setTapOffsetHistory([])
+              setPdelayInfo({ lastRtt: null, count: 0 })
+              ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
             }} style={{ fontSize: '0.75rem', padding: '4px 12px' }}>
               Clear
             </button>
@@ -642,13 +661,16 @@ function Dashboard() {
               </div>
             </div>
 
-            {/* Sync/Follow_Up Pairs */}
+            {/* Sync/Follow_Up Pairs - offset = (t2-t1) - d - C */}
             <div>
               <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
                 Sync/Follow_Up Pairs ({syncPairs.length})
+                <span style={{ fontSize: '0.65rem', color: '#94a3b8', marginLeft: '8px' }}>
+                  offset ≈ (t2-t1) - d - C
+                </span>
               </h3>
               <div style={{
-                height: '180px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace',
+                height: '180px', overflow: 'auto', fontSize: '0.65rem', fontFamily: 'monospace',
                 background: '#f8fafc', borderRadius: '6px', padding: '8px'
               }}>
                 {syncPairs.length === 0 ? (
@@ -659,18 +681,28 @@ function Dashboard() {
                   <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
-                        <th style={{ textAlign: 'left', padding: '4px' }}>Time</th>
-                        <th style={{ textAlign: 'left', padding: '4px' }}>Seq</th>
-                        <th style={{ textAlign: 'right', padding: '4px' }}>PreciseOrigin (s.ns)</th>
+                        <th style={{ textAlign: 'left', padding: '3px' }}>Seq</th>
+                        <th style={{ textAlign: 'right', padding: '3px' }}>t1 (ns)</th>
+                        <th style={{ textAlign: 'right', padding: '3px' }}>C_sync</th>
+                        <th style={{ textAlign: 'right', padding: '3px' }}>C_fup</th>
+                        <th style={{ textAlign: 'right', padding: '3px' }}>C_total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {syncPairs.slice(-15).reverse().map((pair, i) => (
+                      {syncPairs.slice(-12).reverse().map((pair, i) => (
                         <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{ padding: '3px 4px', color: '#64748b' }}>{pair.time}</td>
-                          <td style={{ padding: '3px 4px' }}>{pair.sequenceId}</td>
-                          <td style={{ padding: '3px 4px', textAlign: 'right', fontWeight: '500', color: '#7c3aed', fontSize: '0.65rem' }}>
-                            {pair.preciseTs || '-'}
+                          <td style={{ padding: '3px', color: '#475569' }}>{pair.sequenceId}</td>
+                          <td style={{ padding: '3px', textAlign: 'right', color: '#7c3aed' }}>
+                            {pair.t1_ns?.toLocaleString()}
+                          </td>
+                          <td style={{ padding: '3px', textAlign: 'right', color: pair.syncCorr ? '#059669' : '#94a3b8' }}>
+                            {pair.syncCorr || 0}
+                          </td>
+                          <td style={{ padding: '3px', textAlign: 'right', color: pair.followUpCorr ? '#059669' : '#94a3b8' }}>
+                            {pair.followUpCorr || 0}
+                          </td>
+                          <td style={{ padding: '3px', textAlign: 'right', fontWeight: '600', color: pair.totalCorr ? '#2563eb' : '#94a3b8' }}>
+                            {pair.totalCorr || 0}
                           </td>
                         </tr>
                       ))}
@@ -682,50 +714,46 @@ function Dashboard() {
           </div>
         )}
 
-        {/* PTP Timing Graph */}
-        {tapCapturing && syncPairs.length > 1 && (
-          <div style={{ marginTop: '16px' }}>
-            <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
-              PTP Timing: ESP Offset vs Tap Nanoseconds
+        {/* PTP Analysis Summary */}
+        {tapCapturing && syncPairs.length > 0 && (
+          <div style={{ marginTop: '16px', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
+            <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '12px' }}>
+              PTP Analysis Summary
             </h3>
-            <div style={{ height: '200px' }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={syncPairs.slice(-60).map((pair, i) => ({
-                    time: pair.time,
-                    tapNs: tapOffsetHistory[i]?.tapNs,
-                    espOffset: board2Status?.ptp?.offset
-                  }))}
-                  margin={{ top: 10, right: 20, left: 0, bottom: 5 }}
-                >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                  <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="#94a3b8" interval="preserveStartEnd" />
-                  <YAxis yAxisId="left" tick={{ fontSize: 9 }} stroke="#7c3aed" orientation="left" />
-                  <YAxis yAxisId="right" tick={{ fontSize: 9 }} stroke="#0891b2" orientation="right" />
-                  <Tooltip contentStyle={{ fontSize: '0.7rem' }} />
-                  <Legend wrapperStyle={{ fontSize: '0.7rem' }} />
-                  <Line
-                    yAxisId="left"
-                    type="monotone"
-                    dataKey="tapNs"
-                    name="Tap (ns mod 1ms)"
-                    stroke="#7c3aed"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                  <Line
-                    yAxisId="right"
-                    type="monotone"
-                    dataKey="espOffset"
-                    name="ESP Offset (ns)"
-                    stroke="#0891b2"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', fontSize: '0.75rem' }}>
+              {/* ESP Reported Values */}
+              <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>ESP Offset</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#0891b2', fontFamily: 'monospace' }}>
+                  {board2Status?.ptp?.offset ?? '-'} ns
+                </div>
+              </div>
+              <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>ESP Link Delay (d)</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#059669', fontFamily: 'monospace' }}>
+                  {board2Status?.ptp?.meanLinkDelay ? (board2Status.ptp.meanLinkDelay / 65536).toFixed(0) : '-'} ns
+                </div>
+              </div>
+              {/* Tap Captured Values */}
+              <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>Tap: Total Correction (C)</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#7c3aed', fontFamily: 'monospace' }}>
+                  {syncPairs[syncPairs.length - 1]?.totalCorr ?? 0} ns
+                </div>
+              </div>
+              <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>Tap: Pdelay Count</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#475569', fontFamily: 'monospace' }}>
+                  {pdelayInfo.count} <span style={{ fontSize: '0.7rem', color: '#94a3b8' }}>exchanges</span>
+                </div>
+              </div>
+            </div>
+            {/* Formula explanation */}
+            <div style={{ marginTop: '12px', padding: '8px', background: '#fefce8', borderRadius: '4px', fontSize: '0.7rem', color: '#854d0e' }}>
+              <b>공식:</b> offset ≈ (t2 - t1) - d - C
+              <span style={{ marginLeft: '12px', color: '#a16207' }}>
+                | t1: Follow_Up timestamp (캡쳐 가능) | t2: Slave 수신 HW timestamp (캡쳐 불가) | d: Link Delay | C: Correction 합
+              </span>
             </div>
           </div>
         )}
