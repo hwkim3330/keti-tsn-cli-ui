@@ -188,12 +188,12 @@ function Capture({ config }) {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             <span style={{
               padding: '4px 8px', borderRadius: '12px', fontSize: '0.7rem', fontWeight: '500',
-              background: wsConnected ? '#dcfce7' : '#fef2f2',
-              color: wsConnected ? '#166534' : '#991b1b'
+              background: wsConnected ? '#ecfdf5' : '#fef2f2',
+              color: wsConnected ? '#059669' : '#b91c1c'
             }}>
               <span style={{
                 display: 'inline-block', width: '6px', height: '6px', borderRadius: '50%',
-                background: wsConnected ? '#22c55e' : '#ef4444', marginRight: '4px'
+                background: wsConnected ? '#059669' : '#dc2626', marginRight: '4px'
               }}></span>
               WS
             </span>
@@ -201,8 +201,8 @@ function Capture({ config }) {
             {capturing && (
               <span style={{
                 padding: '4px 10px', borderRadius: '12px', fontSize: '0.75rem', fontWeight: '500',
-                background: paused ? '#fef3c7' : '#dcfce7',
-                color: paused ? '#92400e' : '#166534'
+                background: paused ? '#fefce8' : '#ecfdf5',
+                color: paused ? '#a16207' : '#059669'
               }}>
                 {paused ? 'Paused' : 'Capturing'}
               </span>
@@ -232,8 +232,8 @@ function Capture({ config }) {
               <label key={iface.name} style={{
                 display: 'flex', alignItems: 'center', gap: '6px',
                 padding: '6px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
-                background: selectedInterfaces.includes(iface.name) ? '#dbeafe' : '#f1f5f9',
-                border: selectedInterfaces.includes(iface.name) ? '2px solid #3b82f6' : '2px solid transparent'
+                background: selectedInterfaces.includes(iface.name) ? '#f1f5f9' : '#f8fafc',
+                border: selectedInterfaces.includes(iface.name) ? '2px solid #475569' : '2px solid transparent'
               }}>
                 <input type="checkbox"
                   checked={selectedInterfaces.includes(iface.name)}
@@ -324,7 +324,7 @@ function Capture({ config }) {
               ) : (
                 filteredPackets.map(pkt => (
                   <tr key={pkt.id} onClick={() => setSelectedPacket(pkt)}
-                    style={{ cursor: 'pointer', background: selectedPacket?.id === pkt.id ? '#dbeafe' : '' }}>
+                    style={{ cursor: 'pointer', background: selectedPacket?.id === pkt.id ? '#f1f5f9' : '' }}>
                     <td>{pkt.id}</td>
                     <td>{formatTime(pkt.time)}</td>
                     <td>{pkt.interface?.split(/[:/]/)[0]}</td>

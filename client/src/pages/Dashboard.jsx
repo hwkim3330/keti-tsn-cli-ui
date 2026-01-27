@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 
 function Dashboard({ config }) {
@@ -6,50 +6,27 @@ function Dashboard({ config }) {
   const [catalogs, setCatalogs] = useState([])
   const [loading, setLoading] = useState(true)
 
-  // Board info
-  const [boardInfo, setBoardInfo] = useState(null)
-  const [boardLoading, setBoardLoading] = useState(false)
-  const [boardError, setBoardError] = useState(null)
+  // Multi-device state
+  const [devices, setDevices] = useState([])
+  const [deviceStatuses, setDeviceStatuses] = useState({})
+  const [checkingDevice, setCheckingDevice] = useState(null)
 
-  // Checksum status
-  const [checksumStatus, setChecksumStatus] = useState(null)
-  const [checksumLoading, setChecksumLoading] = useState(false)
+  // Auto PTP
+  const [configuringPtp, setConfiguringPtp] = useState(false)
+  const [ptpResult, setPtpResult] = useState(null)
+  const [ptpPort, setPtpPort] = useState(8) // Default PTP port
 
-  // Save config
-  const [saveLoading, setSaveLoading] = useState(false)
-  const [saveResult, setSaveResult] = useState(null)
-
-  // PTP status
-  const [ptpStatus, setPtpStatus] = useState(null)
-  const [ptpLoading, setPtpLoading] = useState(false)
-
-  const cacheKey = `dashboard_${config.host}`
-
-  // Load cached data on mount
+  // Load devices from localStorage
   useEffect(() => {
-    const cached = localStorage.getItem(cacheKey)
-    if (cached) {
+    const savedDevices = localStorage.getItem('tsn-devices')
+    if (savedDevices) {
       try {
-        const data = JSON.parse(cached)
-        if (data.boardInfo) setBoardInfo(data.boardInfo)
-        if (data.checksumStatus) setChecksumStatus(data.checksumStatus)
-        if (data.ptpStatus) setPtpStatus(data.ptpStatus)
+        setDevices(JSON.parse(savedDevices))
       } catch (e) {
-        console.error('Failed to load cached dashboard:', e)
+        console.error('Failed to load devices:', e)
       }
     }
-  }, [cacheKey])
-
-  // Save to cache
-  const saveCache = (board, checksum, ptp) => {
-    const data = {
-      boardInfo: board,
-      checksumStatus: checksum,
-      ptpStatus: ptp,
-      timestamp: new Date().toISOString()
-    }
-    localStorage.setItem(cacheKey, JSON.stringify(data))
-  }
+  }, [])
 
   useEffect(() => {
     const fetchData = async () => {
@@ -69,182 +46,188 @@ function Dashboard({ config }) {
     fetchData()
   }, [])
 
-  // Fetch board info when config changes (only if no cache)
-  useEffect(() => {
-    const cached = localStorage.getItem(cacheKey)
-    if (!cached) {
-      const fetchAll = async () => {
-        const board = await fetchBoardInfo()
-        const checksum = await fetchChecksumStatus()
-        const ptp = await fetchPtpStatus()
-        saveCache(board, checksum, ptp)
-      }
-      fetchAll()
-    }
-  }, [config.host])
-
-  const fetchBoardInfo = async () => {
-    setBoardLoading(true)
-    setBoardError(null)
+  // Fetch status for a single device
+  const fetchDeviceStatus = async (device) => {
+    setCheckingDevice(device.id)
     try {
-      // Fetch components sequentially (device can't handle concurrent requests)
+      // Fetch board info
       const boardRes = await axios.post('/api/fetch', {
         paths: ["/ietf-hardware:hardware/component[name='Board']"],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 10000 })
+        transport: device.transport,
+        device: device.device,
+        host: device.host,
+        port: device.port || 5683
+      }, { timeout: 8000 })
 
-      const tempRes = await axios.post('/api/fetch', {
-        paths: ["/ietf-hardware:hardware/component[name='SwTmp']"],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 10000 })
+      // Fetch PTP status
+      const ptpRes = await axios.post('/api/fetch', {
+        paths: ['/ieee1588-ptp:ptp/instances'],
+        transport: device.transport,
+        device: device.device,
+        host: device.host,
+        port: device.port || 5683
+      }, { timeout: 8000 })
 
-      const combinedResult = (boardRes.data.result || '') + '\n' + (tempRes.data.result || '')
-      const info = parseBoardInfo(combinedResult)
-      setBoardInfo(info)
-      return info
+      const boardInfo = parseBoardInfo(boardRes.data.result)
+      const ptpStatus = parsePtpStatus(ptpRes.data.result)
+
+      setDeviceStatuses(prev => ({
+        ...prev,
+        [device.id]: {
+          online: true,
+          boardInfo,
+          ptpStatus,
+          lastCheck: Date.now()
+        }
+      }))
     } catch (err) {
-      setBoardError(err.message)
-      return null
+      setDeviceStatuses(prev => ({
+        ...prev,
+        [device.id]: {
+          online: false,
+          error: err.message,
+          lastCheck: Date.now()
+        }
+      }))
     } finally {
-      setBoardLoading(false)
+      setCheckingDevice(null)
     }
   }
 
+  // Check all devices sequentially
+  const checkAllDevices = async () => {
+    for (const device of devices) {
+      await fetchDeviceStatus(device)
+      await new Promise(r => setTimeout(r, 300))
+    }
+  }
+
+  // Parse board info from YAML
   const parseBoardInfo = (result) => {
     if (!result) return null
-
-    const info = {
-      model: '-',
-      firmware: '-',
-      temperature: null,
-      manufacturer: '-',
-      chip: '-'
-    }
-
+    const info = { model: '-', firmware: '-', chip: '-' }
     const lines = result.split('\n')
     for (const line of lines) {
       const trimmed = line.trim()
-
       if (trimmed.startsWith('model-name:')) {
         const modelFull = trimmed.split(':').slice(1).join(':').trim()
         info.model = modelFull
-        // Extract chip name (e.g., LAN9692 from "LAN9692VAO - ...")
         const chipMatch = modelFull.match(/^(LAN\d+)/)
         if (chipMatch) info.chip = chipMatch[1]
       } else if (trimmed.startsWith('firmware-rev:')) {
         info.firmware = trimmed.split(':')[1]?.trim()
-      } else if (trimmed.startsWith('mfg-name:')) {
-        info.manufacturer = trimmed.split(':')[1]?.trim()
-      } else if (trimmed.startsWith('value:')) {
-        info.temperature = parseInt(trimmed.split(':')[1]?.trim())
       }
     }
-
     return info
   }
 
-  const fetchChecksumStatus = async () => {
-    setChecksumLoading(true)
-    try {
-      const response = await axios.post('/api/checksum', {
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 15000 })
-      setChecksumStatus(response.data)
-      return response.data
-    } catch (err) {
-      const errorStatus = { match: false, error: err.message }
-      setChecksumStatus(errorStatus)
-      return errorStatus
-    } finally {
-      setChecksumLoading(false)
-    }
-  }
-
-  const fetchPtpStatus = async () => {
-    setPtpLoading(true)
-    try {
-      const response = await axios.post('/api/fetch', {
-        paths: ["/ieee1588-ptp:ptp/instances"],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 10000 })
-      const status = parsePtpStatus(response.data.result)
-      setPtpStatus(status)
-      return status
-    } catch (err) {
-      const errorStatus = { error: err.message }
-      setPtpStatus(errorStatus)
-      return errorStatus
-    } finally {
-      setPtpLoading(false)
-    }
-  }
-
+  // Parse PTP status from YAML
   const parsePtpStatus = (result) => {
-    if (!result) return null
-
+    if (!result || result.includes('instance: null')) return null
     const status = {
       clockIdentity: null,
       grandmasterIdentity: null,
       isGrandmaster: false,
-      offset: null,
-      portState: null,
-      instanceIndex: null
+      servoOffset: null,
+      servoState: null,
+      portState: null
     }
-
     const lines = result.split('\n')
     for (const line of lines) {
       const trimmed = line.trim()
-
-      if (trimmed.startsWith('instance-index:')) {
-        status.instanceIndex = parseInt(trimmed.split(':')[1]?.trim())
-      } else if (trimmed.startsWith('clock-identity:')) {
+      if (trimmed.startsWith('clock-identity:')) {
         status.clockIdentity = trimmed.split(':').slice(1).join(':').trim()
       } else if (trimmed.startsWith('grandmaster-identity:')) {
         status.grandmasterIdentity = trimmed.split(':').slice(1).join(':').trim()
-      } else if (trimmed.startsWith('current-utc-offset:')) {
-        status.offset = parseInt(trimmed.split(':')[1]?.trim())
       } else if (trimmed.startsWith('port-state:')) {
         status.portState = trimmed.split(':')[1]?.trim()
       }
     }
-
-    // Determine if this device is the grandmaster
+    // Servo offset
+    const servoMatch = result.match(/servo:[\s\S]*?offset:\s*(-?\d+)[\s\S]*?state:\s*(\d+)/)
+    if (servoMatch) {
+      status.servoOffset = parseInt(servoMatch[1])
+      status.servoState = parseInt(servoMatch[2])
+    }
     if (status.clockIdentity && status.grandmasterIdentity) {
       status.isGrandmaster = status.clockIdentity === status.grandmasterIdentity
     }
-
     return status
   }
 
-  const saveConfig = async () => {
-    setSaveLoading(true)
-    setSaveResult(null)
-    try {
-      const response = await axios.post('/api/rpc/save-config', {
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
-      }, { timeout: 15000 })
-      setSaveResult({ success: true, message: 'Configuration saved!' })
-    } catch (err) {
-      const errorMsg = err.response?.data?.error || err.message
-      setSaveResult({ success: false, message: errorMsg })
-    } finally {
-      setSaveLoading(false)
+  // Auto-configure PTP: Set one device as GM and others as slaves (only online devices)
+  const autoPtpConfig = async (gmDeviceId) => {
+    // Get only online devices
+    const onlineDevices = devices.filter(d => deviceStatuses[d.id]?.online)
+
+    if (onlineDevices.length < 1) {
+      setPtpResult([{ device: 'Error', success: false, error: 'No online devices found. Refresh status first.' }])
+      return
     }
+
+    setConfiguringPtp(true)
+    setPtpResult(null)
+
+    const results = []
+
+    for (const device of onlineDevices) {
+      const isGm = device.id === gmDeviceId
+      const portRole = isGm ? 'master' : 'slave'
+
+      try {
+        const patches = [
+          {
+            path: '/ieee1588-ptp:ptp/instances/instance',
+            value: {
+              'instance-index': 0,
+              'default-ds': { 'external-port-config-enable': true },
+              'mchp-velocitysp-ptp:automotive': { profile: isGm ? 'gm' : 'bridge' },
+              'mchp-velocitysp-ptp:servos': {
+                servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }]
+              },
+              ports: {
+                port: [{
+                  'port-index': ptpPort,
+                  'external-port-config-port-ds': { 'desired-state': portRole }
+                }]
+              }
+            }
+          },
+          {
+            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+            value: {
+              'ltc-index': 0,
+              'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] }
+            }
+          }
+        ]
+
+        await axios.post('/api/patch', {
+          patches,
+          transport: device.transport,
+          device: device.device,
+          host: device.host,
+          port: device.port || 5683
+        }, { timeout: 10000 })
+
+        results.push({ device: device.name, success: true, role: isGm ? 'GM' : 'Slave', port: ptpPort })
+      } catch (err) {
+        results.push({ device: device.name, success: false, error: err.message })
+      }
+
+      await new Promise(r => setTimeout(r, 500))
+    }
+
+    setPtpResult(results)
+    setConfiguringPtp(false)
+
+    // Refresh statuses after config
+    setTimeout(() => checkAllDevices(), 1500)
+  }
+
+  const servoStateText = (state) => {
+    const states = { 0: 'Init', 1: 'Tracking', 2: 'Locked', 3: 'Holdover' }
+    return states[state] || '-'
   }
 
   if (loading) {
@@ -255,265 +238,217 @@ function Dashboard({ config }) {
     )
   }
 
-  const getTempColor = (temp) => {
-    if (temp === null) return '#64748b'
-    if (temp < 60) return '#22c55e'
-    if (temp < 80) return '#eab308'
-    return '#ef4444'
-  }
-
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Dashboard</h1>
-        <p className="page-description">TSN Switch Configuration Overview</p>
-      </div>
-
-      {/* Status Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '24px' }}>
-        {/* Server Status */}
-        <div className="card" style={{ padding: '16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{ width: '40px', height: '40px', borderRadius: '10px', background: '#dcfce7', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <svg width="20" height="20" fill="none" stroke="#16a34a" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-            </div>
-            <div>
-              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Server</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600' }}>{health ? 'Online' : 'Offline'}</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Board Temperature */}
-        <div className="card" style={{ padding: '16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{
-              width: '40px', height: '40px', borderRadius: '10px',
-              background: boardInfo && boardInfo.temperature != null ? (boardInfo.temperature < 60 ? '#dcfce7' : boardInfo.temperature < 80 ? '#fef3c7' : '#fee2e2') : '#f1f5f9',
-              display: 'flex', alignItems: 'center', justifyContent: 'center'
-            }}>
-              <svg width="20" height="20" fill="none" stroke={getTempColor(boardInfo?.temperature)} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5" />
-              </svg>
-            </div>
-            <div>
-              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Temperature</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: getTempColor(boardInfo?.temperature) }}>
-                {boardLoading ? '...' : boardInfo && boardInfo.temperature != null ? `${boardInfo.temperature}°C` : '-'}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Checksum Status */}
-        <div className="card" style={{ padding: '16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{
-              width: '40px', height: '40px', borderRadius: '10px',
-              background: checksumStatus?.cached ? '#dcfce7' : checksumStatus?.error ? '#fee2e2' : '#fef3c7',
-              display: 'flex', alignItems: 'center', justifyContent: 'center'
-            }}>
-              <svg width="20" height="20" fill="none" stroke={checksumStatus?.cached ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#d97706'} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            </div>
-            <div>
-              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Catalog Sync</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: checksumStatus?.cached ? '#16a34a' : checksumStatus?.error ? '#ef4444' : '#d97706' }}>
-                {checksumLoading ? '...' : checksumStatus?.cached ? 'OK' : checksumStatus?.error ? 'Error' : 'Need Sync'}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* PTP Status */}
-        <div className="card" style={{ padding: '16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{
-              width: '40px', height: '40px', borderRadius: '10px',
-              background: ptpStatus?.isGrandmaster ? '#fef3c7' : ptpStatus?.error ? '#fee2e2' : ptpStatus ? '#dbeafe' : '#f1f5f9',
-              display: 'flex', alignItems: 'center', justifyContent: 'center'
-            }}>
-              <svg width="20" height="20" fill="none" stroke={ptpStatus?.isGrandmaster ? '#d97706' : ptpStatus?.error ? '#ef4444' : ptpStatus ? '#2563eb' : '#64748b'} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            </div>
-            <div>
-              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>PTP Role</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600', color: ptpStatus?.isGrandmaster ? '#d97706' : ptpStatus?.error ? '#ef4444' : ptpStatus ? '#2563eb' : '#64748b' }}>
-                {ptpLoading ? '...' : ptpStatus?.isGrandmaster ? 'GM' : ptpStatus?.error ? 'Error' : ptpStatus ? 'Slave' : '-'}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Catalogs */}
-        <div className="card" style={{ padding: '16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{ width: '40px', height: '40px', borderRadius: '10px', background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <svg width="20" height="20" fill="none" stroke="#2563eb" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8" />
-              </svg>
-            </div>
-            <div>
-              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Catalogs</div>
-              <div style={{ fontSize: '1.25rem', fontWeight: '600' }}>{catalogs.length}</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Board Info */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Board Information</h2>
+        <div style={{ display: 'flex', gap: '8px' }}>
           <button
             className="btn btn-secondary"
-            onClick={async () => {
-              const board = await fetchBoardInfo()
-              const checksum = await fetchChecksumStatus()
-              const ptp = await fetchPtpStatus()
-              saveCache(board, checksum, ptp)
-            }}
-            disabled={boardLoading || checksumLoading || ptpLoading}
-            style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+            onClick={checkAllDevices}
+            disabled={checkingDevice !== null}
           >
-            {boardLoading || checksumLoading || ptpLoading ? 'Loading...' : 'Refresh'}
+            {checkingDevice ? 'Checking...' : 'Refresh All'}
           </button>
         </div>
-
-        {boardError ? (
-          <div className="alert alert-error">{boardError}</div>
-        ) : boardInfo ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px' }}>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Model</div>
-              <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{boardInfo.model}</div>
-            </div>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Firmware</div>
-              <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{boardInfo.firmware}</div>
-            </div>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Manufacturer</div>
-              <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{boardInfo.manufacturer}</div>
-            </div>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Chip</div>
-              <div style={{ fontWeight: '500', fontSize: '0.9rem', fontFamily: 'monospace' }}>{boardInfo.chip}</div>
-            </div>
-          </div>
-        ) : boardLoading ? (
-          <div style={{ padding: '20px', textAlign: 'center', color: '#64748b' }}>Loading board info...</div>
-        ) : (
-          <div style={{ padding: '20px', textAlign: 'center', color: '#64748b' }}>Click Refresh to load board info</div>
-        )}
       </div>
 
-      {/* PTP Info */}
-      {ptpStatus && !ptpStatus.error && (
+      {/* Server Status */}
+      <div className="card" style={{ marginBottom: '16px' }}>
+        <div style={{ display: 'flex', gap: '24px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div style={{
+              width: '8px', height: '8px', borderRadius: '50%',
+              background: health ? '#059669' : '#dc2626'
+            }}></div>
+            <span style={{ fontSize: '0.85rem' }}>Server: {health ? 'Online' : 'Offline'}</span>
+          </div>
+          <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
+            Catalogs: <b>{catalogs.length}</b>
+          </div>
+          <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
+            Devices: <b>{devices.length}</b> (Online: <b>{Object.values(deviceStatuses).filter(s => s?.online).length}</b>)
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginLeft: 'auto' }}>
+            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>PTP Port:</span>
+            <select
+              className="form-select"
+              value={ptpPort}
+              onChange={(e) => setPtpPort(parseInt(e.target.value))}
+              style={{ width: '70px', padding: '4px 8px', fontSize: '0.8rem' }}
+            >
+              {[1,2,3,4,5,6,7,8,9,10,11,12].map(p => (
+                <option key={p} value={p}>Port {p}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Device Cards */}
+      {devices.length === 0 ? (
+        <div className="card" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+          No devices configured. Go to Settings to add devices.
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '16px', marginBottom: '24px' }}>
+          {devices.map(device => {
+            const status = deviceStatuses[device.id]
+            const isChecking = checkingDevice === device.id
+
+            return (
+              <div key={device.id} className="card" style={{
+                padding: '16px',
+                border: status?.online ? '1px solid #d1d5db' : status?.online === false ? '1px solid #fca5a5' : '1px solid #e2e8f0'
+              }}>
+                {/* Header */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+                  <div>
+                    <div style={{ fontWeight: '600', fontSize: '1rem' }}>{device.name}</div>
+                    <div style={{ fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
+                      {device.transport === 'serial' ? device.device : `${device.host}:${device.port || 5683}`}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    {status?.ptpStatus && (
+                      <span style={{
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        fontSize: '0.7rem',
+                        fontWeight: '600',
+                        background: status.ptpStatus.isGrandmaster ? '#f5f5f4' : '#f1f5f9',
+                        color: status.ptpStatus.isGrandmaster ? '#57534e' : '#475569'
+                      }}>
+                        {status.ptpStatus.isGrandmaster ? 'GM' : 'Slave'}
+                      </span>
+                    )}
+                    <span style={{
+                      padding: '2px 8px',
+                      borderRadius: '4px',
+                      fontSize: '0.7rem',
+                      fontWeight: '500',
+                      background: isChecking ? '#f1f5f9' : status?.online ? '#ecfdf5' : status?.online === false ? '#fef2f2' : '#f8fafc',
+                      color: isChecking ? '#64748b' : status?.online ? '#059669' : status?.online === false ? '#b91c1c' : '#94a3b8'
+                    }}>
+                      {isChecking ? '...' : status?.online ? 'Online' : status?.online === false ? 'Offline' : '-'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Info */}
+                {status?.online && (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '12px' }}>
+                    <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Chip</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: '500', fontFamily: 'monospace' }}>
+                        {status.boardInfo?.chip || '-'}
+                      </div>
+                    </div>
+                    <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Firmware</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: '500' }}>
+                        {status.boardInfo?.firmware || '-'}
+                      </div>
+                    </div>
+                    {status.ptpStatus && (
+                      <>
+                        <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                          <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Servo Offset</div>
+                          <div style={{ fontSize: '0.85rem', fontWeight: '500', fontFamily: 'monospace' }}>
+                            {status.ptpStatus.servoOffset !== null ? `${status.ptpStatus.servoOffset} ns` : '-'}
+                          </div>
+                        </div>
+                        <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                          <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Servo State</div>
+                          <div style={{ fontSize: '0.85rem', fontWeight: '500' }}>
+                            {servoStateText(status.ptpStatus.servoState)}
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {status?.online === false && (
+                  <div style={{ padding: '12px', background: '#fef2f2', borderRadius: '6px', marginBottom: '12px', fontSize: '0.8rem', color: '#b91c1c' }}>
+                    {status.error || 'Device offline'}
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => fetchDeviceStatus(device)}
+                    disabled={isChecking}
+                    style={{ fontSize: '0.75rem', padding: '6px 10px' }}
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => autoPtpConfig(device.id)}
+                    disabled={configuringPtp || !status?.online}
+                    style={{ flex: 1, fontSize: '0.75rem', padding: '6px 10px' }}
+                    title={`Set this device as Grandmaster on Port ${ptpPort} and configure all other online devices as Slaves`}
+                  >
+                    Set as GM (P{ptpPort})
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* PTP Configuration Result */}
+      {ptpResult && (
         <div className="card">
           <div className="card-header">
-            <h2 className="card-title">PTP Status</h2>
-            <span style={{
-              padding: '4px 12px',
-              borderRadius: '12px',
-              fontSize: '0.75rem',
-              fontWeight: '600',
-              background: ptpStatus.isGrandmaster ? '#fef3c7' : '#dbeafe',
-              color: ptpStatus.isGrandmaster ? '#92400e' : '#1e40af'
-            }}>
-              {ptpStatus.isGrandmaster ? 'Grandmaster' : 'Slave'}
-            </span>
+            <h2 className="card-title">PTP Configuration Result</h2>
+            <button
+              className="btn btn-secondary"
+              onClick={() => setPtpResult(null)}
+              style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+            >
+              Clear
+            </button>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px' }}>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Clock Identity</div>
-              <div style={{ fontWeight: '500', fontSize: '0.8rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                {ptpStatus.clockIdentity || '-'}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {ptpResult.map((r, i) => (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'center', gap: '8px',
+                padding: '8px 12px', background: r.success ? '#ecfdf5' : '#fef2f2',
+                borderRadius: '6px', fontSize: '0.85rem'
+              }}>
+                <span style={{ fontWeight: '500' }}>{r.device}</span>
+                {r.success ? (
+                  <>
+                    <span style={{ color: '#059669' }}>OK</span>
+                    <span style={{
+                      padding: '2px 6px', borderRadius: '4px', fontSize: '0.7rem',
+                      background: r.role === 'GM' ? '#f5f5f4' : '#f1f5f9',
+                      fontWeight: '600'
+                    }}>
+                      {r.role}
+                    </span>
+                    {r.port && <span style={{ fontSize: '0.7rem', color: '#64748b' }}>Port {r.port}</span>}
+                  </>
+                ) : (
+                  <span style={{ color: '#b91c1c' }}>Failed: {r.error}</span>
+                )}
               </div>
-            </div>
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Grandmaster Identity</div>
-              <div style={{ fontWeight: '500', fontSize: '0.8rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                {ptpStatus.grandmasterIdentity || '-'}
-              </div>
-            </div>
-            {ptpStatus.portState && (
-              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Port State</div>
-                <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{ptpStatus.portState}</div>
-              </div>
-            )}
-            {ptpStatus.offset !== null && (
-              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>UTC Offset</div>
-                <div style={{ fontWeight: '500', fontSize: '0.9rem' }}>{ptpStatus.offset}s</div>
-              </div>
-            )}
+            ))}
           </div>
         </div>
       )}
 
-      {/* Connection Info */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Connection</h2>
+      {configuringPtp && (
+        <div className="card" style={{ textAlign: 'center', padding: '40px' }}>
+          <div className="spinner" style={{ margin: '0 auto 16px' }}></div>
+          <div>Configuring PTP on all devices...</div>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '12px' }}>
-          <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-            <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Transport</div>
-            <div style={{ fontWeight: '500' }}>{config.transport === 'wifi' ? 'WiFi (UDP)' : 'Serial (USB)'}</div>
-          </div>
-          {config.transport === 'wifi' ? (
-            <>
-              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Host</div>
-                <div style={{ fontWeight: '500', fontFamily: 'monospace' }}>{config.host}</div>
-              </div>
-              <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Port</div>
-                <div style={{ fontWeight: '500', fontFamily: 'monospace' }}>{config.port}</div>
-              </div>
-            </>
-          ) : (
-            <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '6px' }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '4px' }}>Device</div>
-              <div style={{ fontWeight: '500', fontFamily: 'monospace' }}>{config.device}</div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Save Configuration */}
-      <div className="card">
-        <div className="card-header">
-          <h2 className="card-title">Save Configuration</h2>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-          <button
-            className="btn btn-primary"
-            onClick={saveConfig}
-            disabled={saveLoading}
-            style={{ minWidth: '150px' }}
-          >
-            {saveLoading ? 'Saving...' : 'Save to Startup'}
-          </button>
-          {saveResult && (
-            <span style={{
-              color: saveResult.success ? '#16a34a' : '#ef4444',
-              fontSize: '0.9rem'
-            }}>
-              {saveResult.message}
-            </span>
-          )}
-        </div>
-        <p style={{ marginTop: '8px', fontSize: '0.8rem', color: '#64748b' }}>
-          Save current running configuration to startup. Applied on next reboot.
-        </p>
-      </div>
+      )}
 
       {/* Quick Actions */}
       <div className="card">
@@ -521,12 +456,11 @@ function Dashboard({ config }) {
           <h2 className="card-title">Quick Actions</h2>
         </div>
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          <a href="/ports" className="btn btn-primary">Port Status</a>
+          <a href="/ptp-monitor" className="btn btn-primary">PTP Monitor</a>
+          <a href="/ports" className="btn btn-secondary">Port Status</a>
           <a href="/ptp" className="btn btn-secondary">PTP Config</a>
-          <a href="/tas" className="btn btn-secondary">TAS (Qbv)</a>
-          <a href="/cbs" className="btn btn-secondary">CBS (Qav)</a>
+          <a href="/settings" className="btn btn-secondary">Device Settings</a>
           <a href="/fetch" className="btn btn-secondary">Fetch</a>
-          <a href="/patch" className="btn btn-secondary">Patch</a>
         </div>
       </div>
     </div>

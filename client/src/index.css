@@ -5,18 +5,18 @@
 }
 
 :root {
-  --primary-color: #2563eb;
-  --primary-hover: #1d4ed8;
-  --success-color: #16a34a;
-  --error-color: #dc2626;
-  --warning-color: #f59e0b;
-  --bg-color: #f8fafc;
+  --primary-color: #475569;
+  --primary-hover: #334155;
+  --success-color: #059669;
+  --error-color: #b91c1c;
+  --warning-color: #d97706;
+  --bg-color: #f1f5f9;
   --sidebar-bg: #1e293b;
-  --sidebar-text: #94a3b8;
-  --sidebar-active: #3b82f6;
+  --sidebar-text: #64748b;
+  --sidebar-active: #94a3b8;
   --card-bg: #ffffff;
   --border-color: #e2e8f0;
-  --text-primary: #1e293b;
+  --text-primary: #334155;
   --text-secondary: #64748b;
 }
 
@@ -91,9 +91,9 @@ body {
 }
 
 .nav-item.active {
-  background-color: rgba(59, 130, 246, 0.1);
-  color: var(--sidebar-active);
-  border-left-color: var(--sidebar-active);
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border-left-color: #94a3b8;
 }
 
 .nav-item-icon {
