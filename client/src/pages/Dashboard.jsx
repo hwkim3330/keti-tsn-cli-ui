@@ -721,15 +721,15 @@ function Dashboard() {
               PTP Analysis Summary
             </h3>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', fontSize: '0.75rem' }}>
-              {/* ESP Reported Values */}
+              {/* Slave (Board 2) Reported Values */}
               <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>ESP Offset</div>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>Slave Offset (Board 2)</div>
                 <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#0891b2', fontFamily: 'monospace' }}>
                   {board2Status?.ptp?.offset ?? '-'} ns
                 </div>
               </div>
               <div style={{ padding: '10px', background: '#fff', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>ESP Link Delay (d)</div>
+                <div style={{ fontSize: '0.65rem', color: '#64748b', marginBottom: '4px' }}>Slave Link Delay (d)</div>
                 <div style={{ fontSize: '1.1rem', fontWeight: '600', color: '#059669', fontFamily: 'monospace' }}>
                   {board2Status?.ptp?.meanLinkDelay ? (board2Status.ptp.meanLinkDelay / 65536).toFixed(0) : '-'} ns
                 </div>
@@ -751,9 +751,12 @@ function Dashboard() {
             {/* Formula explanation */}
             <div style={{ marginTop: '12px', padding: '8px', background: '#fefce8', borderRadius: '4px', fontSize: '0.7rem', color: '#854d0e' }}>
               <b>공식:</b> offset ≈ (t2 - t1) - d - C
-              <span style={{ marginLeft: '12px', color: '#a16207' }}>
-                | t1: Follow_Up timestamp (캡쳐 가능) | t2: Slave 수신 HW timestamp (캡쳐 불가) | d: Link Delay | C: Correction 합
-              </span>
+            </div>
+            <div style={{ marginTop: '4px', padding: '8px', background: '#f1f5f9', borderRadius: '4px', fontSize: '0.65rem', color: '#475569' }}>
+              <b>t1:</b> GM(Board1)이 Sync 송신 시각 (Follow_Up에서 TAP 캡쳐 ✓) &nbsp;|&nbsp;
+              <b>t2:</b> Slave(Board2)가 Sync 수신 시각 (내부값, TAP 캡쳐 ✗) &nbsp;|&nbsp;
+              <b>d:</b> Link Delay &nbsp;|&nbsp;
+              <b>C:</b> Correction 합
             </div>
           </div>
         )}
