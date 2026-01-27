@@ -41,7 +41,7 @@ const PTP_MSG_TYPES = {
   0xD: 'Management'
 };
 
-// Parse PTP packet (IEEE 1588-2008)
+// Parse PTP packet (IEEE 1588-2008 / IEEE 802.1AS)
 function parsePTP(buffer) {
   if (buffer.length < 34) return null;
 
@@ -55,14 +55,21 @@ function parsePTP(buffer) {
   const flags = buffer.readUInt16BE(6);
   const correctionNs = buffer.readBigInt64BE(8);
 
+  // Extract flags
+  const twoStepFlag = !!(flags & 0x0200); // Bit 9 (two-step)
+  const unicastFlag = !!(flags & 0x0400); // Bit 10
+
   // Source port identity (8 bytes clock ID + 2 bytes port)
   const clockId = buffer.slice(20, 28).toString('hex').match(/.{2}/g).join(':');
   const sourcePort = buffer.readUInt16BE(28);
+  const sourcePortId = `${clockId}:${sourcePort}`;
 
   const sequenceId = buffer.readUInt16BE(30);
   const controlField = buffer[32];
+  const logMessageInterval = buffer.readInt8(33); // Signed byte
 
   // Timestamp (seconds + nanoseconds) - only in some message types
+  // Offset 34-43 for Sync, Delay_Req, Pdelay_Req, Pdelay_Resp, Follow_Up, etc.
   let timestamp = null;
   if ([0x0, 0x1, 0x2, 0x3, 0x8, 0x9, 0xA].includes(msgType) && buffer.length >= 44) {
     const seconds = buffer.readUIntBE(34, 6);
@@ -70,18 +77,31 @@ function parsePTP(buffer) {
     timestamp = { seconds, nanoseconds };
   }
 
+  // requestReceiptTimestamp for Pdelay_Resp (msgType 0x3) at offset 44-53
+  let requestReceiptTimestamp = null;
+  if (msgType === 0x3 && buffer.length >= 54) {
+    const seconds = buffer.readUIntBE(44, 6);
+    const nanoseconds = buffer.readUInt32BE(50);
+    requestReceiptTimestamp = { seconds, nanoseconds };
+  }
+
   return {
     msgType: PTP_MSG_TYPES[msgType] || `Unknown(${msgType})`,
     msgTypeRaw: msgType,
     version,
     length: msgLength,
-    domain: domainNumber,
+    domainNumber,
     flags,
+    twoStepFlag,
+    unicastFlag,
     correction: Number(correctionNs) / 65536, // Convert to nanoseconds
     clockId,
     sourcePort,
+    sourcePortId,
     sequenceId,
-    timestamp
+    logMessagePeriod: logMessageInterval,
+    timestamp,
+    requestReceiptTimestamp
   };
 }
 
@@ -281,7 +301,7 @@ router.post('/start', (req, res) => {
                 protocol = 'PTP';
                 source = srcMac;
                 destination = dstMac;
-                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domain}`;
+                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domainNumber}`;
                 if (ptp.timestamp) {
                   info += ` T=${ptp.timestamp.seconds}.${ptp.timestamp.nanoseconds.toString().padStart(9, '0')}`;
                 }
@@ -306,11 +326,15 @@ router.post('/start', (req, res) => {
                   ptp: {
                     msgType: ptp.msgType,
                     sequenceId: ptp.sequenceId,
-                    domain: ptp.domain,
+                    domainNumber: ptp.domainNumber,
                     clockId: ptp.clockId,
                     sourcePort: ptp.sourcePort,
+                    sourcePortId: ptp.sourcePortId,
                     timestamp: ptp.timestamp,
-                    correction: ptp.correction
+                    correction: ptp.correction,
+                    twoStepFlag: ptp.twoStepFlag,
+                    logMessagePeriod: ptp.logMessagePeriod,
+                    requestReceiptTimestamp: ptp.requestReceiptTimestamp
                   }
                 };
 
@@ -349,7 +373,7 @@ router.post('/start', (req, res) => {
               ptp = parsePTP(udpPayload);
               if (ptp) {
                 protocol = 'PTP';
-                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domain}`;
+                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domainNumber}`;
                 if (ptp.timestamp) {
                   info += ` T=${ptp.timestamp.seconds}.${ptp.timestamp.nanoseconds.toString().padStart(9, '0')}`;
                 }
@@ -422,11 +446,15 @@ router.post('/start', (req, res) => {
             ptp: ptp ? {
               msgType: ptp.msgType,
               sequenceId: ptp.sequenceId,
-              domain: ptp.domain,
+              domainNumber: ptp.domainNumber,
               clockId: ptp.clockId,
               sourcePort: ptp.sourcePort,
+              sourcePortId: ptp.sourcePortId,
               timestamp: ptp.timestamp,
-              correction: ptp.correction
+              correction: ptp.correction,
+              twoStepFlag: ptp.twoStepFlag,
+              logMessagePeriod: ptp.logMessagePeriod,
+              requestReceiptTimestamp: ptp.requestReceiptTimestamp
             } : null,
             tcp: tcp,
             info,
