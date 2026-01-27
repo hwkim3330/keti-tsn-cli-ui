@@ -171,25 +171,36 @@ function Dashboard() {
 
     const state = ptpStateRef.current
     const now = Date.now()
+    const timeStr = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 1 })
 
     if (ptp.msgType === 'Sync') {
-      state.lastSync = { sequenceId: ptp.sequenceId, time: now }
+      state.lastSync = {
+        sequenceId: ptp.sequenceId,
+        time: now,
+        timestamp: ptp.timestamp
+      }
     } else if (ptp.msgType === 'Follow_Up' && state.lastSync?.sequenceId === ptp.sequenceId) {
+      // Follow_Up contains preciseOriginTimestamp
+      const preciseTs = ptp.timestamp
       const correction = ptp.correction || 0
-      const timeStr = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
       setSyncPairs(prev => [...prev, {
         sequenceId: ptp.sequenceId,
         correction,
+        preciseTs: preciseTs ? `${preciseTs.seconds}.${preciseTs.nanoseconds.toString().padStart(9, '0')}` : null,
         time: timeStr
       }].slice(-MAX_SYNC_PAIRS))
 
+      // For comparison, use the timestamp nanoseconds as indicator
+      const nsValue = preciseTs?.nanoseconds || 0
       setTapOffsetHistory(prev => [...prev, {
         time: timeStr,
-        tapCorrection: correction
+        tapNs: nsValue % 1000000 // Just show sub-millisecond part
       }].slice(-MAX_HISTORY))
 
       state.lastSync = null
+    } else if (ptp.msgType === 'Pdelay_Resp') {
+      // Could track peer delay
     }
   }, [])
 
@@ -597,25 +608,34 @@ function Dashboard() {
                       <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
                         <th style={{ textAlign: 'left', padding: '4px' }}>Type</th>
                         <th style={{ textAlign: 'left', padding: '4px' }}>Seq</th>
-                        <th style={{ textAlign: 'right', padding: '4px' }}>Correction</th>
+                        <th style={{ textAlign: 'right', padding: '4px' }}>Timestamp (ns)</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {ptpPackets.slice(-20).reverse().map((pkt, i) => (
-                        <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{
-                            padding: '3px 4px',
-                            color: pkt.ptp?.msgType === 'Sync' ? '#2563eb' :
-                                   pkt.ptp?.msgType === 'Follow_Up' ? '#7c3aed' : '#64748b'
-                          }}>
-                            {pkt.ptp?.msgType}
-                          </td>
-                          <td style={{ padding: '3px 4px' }}>{pkt.ptp?.sequenceId}</td>
-                          <td style={{ padding: '3px 4px', textAlign: 'right', color: '#6366f1' }}>
-                            {pkt.ptp?.correction ? `${pkt.ptp.correction.toFixed(0)} ns` : '-'}
-                          </td>
-                        </tr>
-                      ))}
+                      {ptpPackets.slice(-20).reverse().map((pkt, i) => {
+                        const msgColors = {
+                          'Sync': '#2563eb',
+                          'Follow_Up': '#7c3aed',
+                          'Pdelay_Req': '#0891b2',
+                          'Pdelay_Resp': '#059669',
+                          'Pdelay_Resp_Follow_Up': '#10b981'
+                        }
+                        return (
+                          <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                            <td style={{
+                              padding: '3px 4px',
+                              color: msgColors[pkt.ptp?.msgType] || '#64748b',
+                              fontWeight: '500'
+                            }}>
+                              {pkt.ptp?.msgType}
+                            </td>
+                            <td style={{ padding: '3px 4px' }}>{pkt.ptp?.sequenceId}</td>
+                            <td style={{ padding: '3px 4px', textAlign: 'right', color: '#475569' }}>
+                              {pkt.ptp?.timestamp?.nanoseconds?.toLocaleString() || '-'}
+                            </td>
+                          </tr>
+                        )
+                      })}
                     </tbody>
                   </table>
                 )}
@@ -640,8 +660,8 @@ function Dashboard() {
                     <thead>
                       <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
                         <th style={{ textAlign: 'left', padding: '4px' }}>Time</th>
-                        <th style={{ textAlign: 'left', padding: '4px' }}>SeqID</th>
-                        <th style={{ textAlign: 'right', padding: '4px' }}>Correction (ns)</th>
+                        <th style={{ textAlign: 'left', padding: '4px' }}>Seq</th>
+                        <th style={{ textAlign: 'right', padding: '4px' }}>PreciseOrigin (s.ns)</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -649,8 +669,8 @@ function Dashboard() {
                         <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
                           <td style={{ padding: '3px 4px', color: '#64748b' }}>{pair.time}</td>
                           <td style={{ padding: '3px 4px' }}>{pair.sequenceId}</td>
-                          <td style={{ padding: '3px 4px', textAlign: 'right', fontWeight: '600', color: '#7c3aed' }}>
-                            {pair.correction.toFixed(0)}
+                          <td style={{ padding: '3px 4px', textAlign: 'right', fontWeight: '500', color: '#7c3aed', fontSize: '0.65rem' }}>
+                            {pair.preciseTs || '-'}
                           </td>
                         </tr>
                       ))}
@@ -662,46 +682,47 @@ function Dashboard() {
           </div>
         )}
 
-        {/* Comparison Graph - ESP Offset vs Tap Correction */}
-        {tapCapturing && tapOffsetHistory.length > 1 && (
+        {/* PTP Timing Graph */}
+        {tapCapturing && syncPairs.length > 1 && (
           <div style={{ marginTop: '16px' }}>
             <h3 style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '8px' }}>
-              Offset Comparison: ESP vs Tap
+              PTP Timing: ESP Offset vs Tap Nanoseconds
             </h3>
             <div style={{ height: '200px' }}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
-                  data={tapOffsetHistory.map((tap, i) => ({
-                    time: tap.time,
-                    tapCorrection: tap.tapCorrection,
-                    espOffset: offsetHistory[offsetHistory.length - tapOffsetHistory.length + i]?.[board2?.name]
+                  data={syncPairs.slice(-60).map((pair, i) => ({
+                    time: pair.time,
+                    tapNs: tapOffsetHistory[i]?.tapNs,
+                    espOffset: board2Status?.ptp?.offset
                   }))}
                   margin={{ top: 10, right: 20, left: 0, bottom: 5 }}
                 >
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                   <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="#94a3b8" interval="preserveStartEnd" />
-                  <YAxis tick={{ fontSize: 9 }} stroke="#94a3b8" />
+                  <YAxis yAxisId="left" tick={{ fontSize: 9 }} stroke="#7c3aed" orientation="left" />
+                  <YAxis yAxisId="right" tick={{ fontSize: 9 }} stroke="#0891b2" orientation="right" />
                   <Tooltip contentStyle={{ fontSize: '0.7rem' }} />
                   <Legend wrapperStyle={{ fontSize: '0.7rem' }} />
-                  <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
                   <Line
+                    yAxisId="left"
                     type="monotone"
-                    dataKey="tapCorrection"
-                    name="Tap Correction"
+                    dataKey="tapNs"
+                    name="Tap (ns mod 1ms)"
                     stroke="#7c3aed"
                     strokeWidth={2}
                     dot={false}
                     isAnimationActive={false}
                   />
                   <Line
+                    yAxisId="right"
                     type="monotone"
                     dataKey="espOffset"
-                    name="ESP Offset"
+                    name="ESP Offset (ns)"
                     stroke="#0891b2"
                     strokeWidth={2}
                     dot={false}
                     isAnimationActive={false}
-                    connectNulls
                   />
                 </LineChart>
               </ResponsiveContainer>
