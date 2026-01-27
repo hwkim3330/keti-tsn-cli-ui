@@ -229,8 +229,9 @@ router.post('/start', (req, res) => {
         // Capture all IP packets (no filter)
         filter = 'ip';
       } else if (mode === 'ptp') {
-        // PTP uses UDP ports 319 (event) and 320 (general)
-        filter = 'udp port 319 or udp port 320';
+        // PTP/gPTP: EtherType 0x88F7 (Layer 2) OR UDP ports 319/320 (Layer 3)
+        // gPTP uses multicast 01:80:c2:00:00:0e
+        filter = 'ether proto 0x88f7 or udp port 319 or udp port 320';
       } else {
         // CoAP mode
         filter = `udp port ${port}`;
@@ -255,15 +256,6 @@ router.post('/start', (req, res) => {
           let ethInfo, ipInfo, udpInfo, tcpInfo;
           let ipOffset = 0;
 
-          if (linkType === 'ETHERNET') {
-            ethInfo = decoders.Ethernet(rawPacket);
-            if (ethInfo.info?.type !== 0x0800) return; // IPv4 only for now
-            ipOffset = ethInfo.offset;
-          }
-
-          ipInfo = decoders.IPV4(rawPacket, ipOffset);
-          const ipProtocol = ipInfo.info?.protocol;
-
           // Determine protocol and ports
           let protocol = 'IP';
           let srcPort = 0;
@@ -273,6 +265,72 @@ router.post('/start', (req, res) => {
           let tcp = null;
           let info = '';
           let udpPayload = null;
+          let srcMac = '', dstMac = '';
+          let source = '', destination = '';
+
+          if (linkType === 'ETHERNET') {
+            ethInfo = decoders.Ethernet(rawPacket);
+            srcMac = ethInfo.info?.srcmac || '';
+            dstMac = ethInfo.info?.dstmac || '';
+
+            // Check for Layer 2 PTP (gPTP) - EtherType 0x88F7
+            if (ethInfo.info?.type === 0x88F7) {
+              const ptpPayload = rawPacket.slice(ethInfo.offset);
+              ptp = parsePTP(ptpPayload);
+              if (ptp) {
+                protocol = 'PTP';
+                source = srcMac;
+                destination = dstMac;
+                info = `${ptp.msgType} Seq=${ptp.sequenceId} Domain=${ptp.domain}`;
+                if (ptp.timestamp) {
+                  info += ` T=${ptp.timestamp.seconds}.${ptp.timestamp.nanoseconds.toString().padStart(9, '0')}`;
+                }
+                if (ptp.correction !== 0) {
+                  info += ` Corr=${ptp.correction.toFixed(0)}ns`;
+                }
+
+                captureInfo.packetCount++;
+                globalPacketCount++;
+
+                const packetData = {
+                  id: globalPacketCount,
+                  time: new Date().toISOString(),
+                  interface: ifaceName,
+                  source,
+                  destination,
+                  srcPort: 0,
+                  dstPort: 0,
+                  protocol,
+                  info,
+                  length: nbytes,
+                  ptp: {
+                    msgType: ptp.msgType,
+                    sequenceId: ptp.sequenceId,
+                    domain: ptp.domain,
+                    clockId: ptp.clockId,
+                    sourcePort: ptp.sourcePort,
+                    timestamp: ptp.timestamp,
+                    correction: ptp.correction
+                  }
+                };
+
+                wsClients.forEach(ws => {
+                  if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'packet', data: packetData }));
+                  }
+                });
+              }
+              return; // Done processing gPTP packet
+            }
+
+            if (ethInfo.info?.type !== 0x0800) return; // IPv4 only after this
+            ipOffset = ethInfo.offset;
+          }
+
+          ipInfo = decoders.IPV4(rawPacket, ipOffset);
+          const ipProtocol = ipInfo.info?.protocol;
+          source = ipInfo.info?.srcaddr || '';
+          destination = ipInfo.info?.dstaddr || '';
 
           if (ipProtocol === 17) {
             // UDP

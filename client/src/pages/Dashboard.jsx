@@ -1,113 +1,49 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
 
 function Dashboard() {
   const { devices } = useDevices()
-  const [health, setHealth] = useState(null)
-  const [catalogs, setCatalogs] = useState([])
-  const [loading, setLoading] = useState(true)
-
-  // Multi-device state
   const [deviceStatuses, setDeviceStatuses] = useState({})
-  const [checkingDevice, setCheckingDevice] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [autoRefresh, setAutoRefresh] = useState(false)
+  const intervalRef = useRef(null)
 
-  // Auto PTP
+  // PTP config
+  const [ptpPort, setPtpPort] = useState(8)
   const [configuringPtp, setConfiguringPtp] = useState(false)
-  const [ptpResult, setPtpResult] = useState(null)
-  const [ptpPort, setPtpPort] = useState(8) // Default PTP port
 
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [healthRes, listRes] = await Promise.all([
-          axios.get('/api/health'),
-          axios.get('/api/list')
-        ])
-        setHealth(healthRes.data)
-        setCatalogs(listRes.data.catalogs)
-      } catch (error) {
-        console.error('Error fetching data:', error)
-      } finally {
-        setLoading(false)
-      }
-    }
-    fetchData()
-  }, [])
+  // Offset history for graph
+  const [offsetHistory, setOffsetHistory] = useState([])
+  const MAX_HISTORY = 60
 
   // Fetch status for a single device
   const fetchDeviceStatus = async (device) => {
-    setCheckingDevice(device.id)
     try {
-      // Fetch board info
-      const boardRes = await axios.post('/api/fetch', {
-        paths: ["/ietf-hardware:hardware/component[name='Board']"],
-        transport: device.transport,
-        device: device.device,
-        host: device.host,
-        port: device.port || 5683
-      }, { timeout: 8000 })
-
-      // Fetch PTP status
       const ptpRes = await axios.post('/api/fetch', {
-        paths: ['/ieee1588-ptp:ptp/instances'],
+        paths: ['/ieee1588-ptp:ptp/instances/instance[instance-index=\'0\']'],
         transport: device.transport,
         device: device.device,
         host: device.host,
         port: device.port || 5683
       }, { timeout: 8000 })
 
-      const boardInfo = parseBoardInfo(boardRes.data.result)
       const ptpStatus = parsePtpStatus(ptpRes.data.result)
 
-      setDeviceStatuses(prev => ({
-        ...prev,
-        [device.id]: {
-          online: true,
-          boardInfo,
-          ptpStatus,
-          lastCheck: Date.now()
-        }
-      }))
+      return {
+        online: true,
+        ptpStatus,
+        raw: ptpRes.data.result,
+        lastCheck: Date.now()
+      }
     } catch (err) {
-      setDeviceStatuses(prev => ({
-        ...prev,
-        [device.id]: {
-          online: false,
-          error: err.message,
-          lastCheck: Date.now()
-        }
-      }))
-    } finally {
-      setCheckingDevice(null)
-    }
-  }
-
-  // Check all devices sequentially
-  const checkAllDevices = async () => {
-    for (const device of devices) {
-      await fetchDeviceStatus(device)
-      await new Promise(r => setTimeout(r, 300))
-    }
-  }
-
-  // Parse board info from YAML
-  const parseBoardInfo = (result) => {
-    if (!result) return null
-    const info = { model: '-', firmware: '-', chip: '-' }
-    const lines = result.split('\n')
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (trimmed.startsWith('model-name:')) {
-        const modelFull = trimmed.split(':').slice(1).join(':').trim()
-        info.model = modelFull
-        const chipMatch = modelFull.match(/^(LAN\d+)/)
-        if (chipMatch) info.chip = chipMatch[1]
-      } else if (trimmed.startsWith('firmware-rev:')) {
-        info.firmware = trimmed.split(':')[1]?.trim()
+      return {
+        online: false,
+        error: err.message,
+        lastCheck: Date.now()
       }
     }
-    return info
   }
 
   // Parse PTP status from YAML
@@ -119,7 +55,10 @@ function Dashboard() {
       isGrandmaster: false,
       servoOffset: null,
       servoState: null,
-      portState: null
+      portState: null,
+      asCapable: null,
+      meanLinkDelay: null,
+      profile: null
     }
     const lines = result.split('\n')
     for (const line of lines) {
@@ -130,10 +69,17 @@ function Dashboard() {
         status.grandmasterIdentity = trimmed.split(':').slice(1).join(':').trim()
       } else if (trimmed.startsWith('port-state:')) {
         status.portState = trimmed.split(':')[1]?.trim()
+      } else if (trimmed.startsWith('as-capable:')) {
+        status.asCapable = trimmed.includes('true')
+      } else if (trimmed.startsWith('mean-link-delay:')) {
+        const val = trimmed.split(':')[1]?.trim().replace(/'/g, '')
+        status.meanLinkDelay = parseInt(val) || 0
+      } else if (trimmed.startsWith('profile:')) {
+        status.profile = trimmed.split(':')[1]?.trim()
       }
     }
-    // Servo offset
-    const servoMatch = result.match(/servo:[\s\S]*?offset:\s*(-?\d+)[\s\S]*?state:\s*(\d+)/)
+    // Servo info
+    const servoMatch = result.match(/servo:[\s\S]*?offset:\s*'?(-?\d+)'?[\s\S]*?state:\s*(\d+)/)
     if (servoMatch) {
       status.servoOffset = parseInt(servoMatch[1])
       status.servoState = parseInt(servoMatch[2])
@@ -144,40 +90,84 @@ function Dashboard() {
     return status
   }
 
-  // Auto-configure PTP: Set one device as GM and others as slaves (only online devices)
-  const autoPtpConfig = async (gmDeviceId) => {
-    // Get only online devices
-    const onlineDevices = devices.filter(d => deviceStatuses[d.id]?.online)
+  // Fetch all devices
+  const fetchAll = async () => {
+    setLoading(true)
+    const newStatuses = {}
+    const timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    const historyEntry = { time: timestamp }
 
-    if (onlineDevices.length < 1) {
-      setPtpResult([{ device: 'Error', success: false, error: 'No online devices found. Refresh status first.' }])
-      return
+    for (const device of devices) {
+      const status = await fetchDeviceStatus(device)
+      newStatuses[device.id] = status
+
+      // Add offset to history
+      if (status.ptpStatus && status.ptpStatus.servoOffset !== null && status.ptpStatus.servoOffset !== undefined) {
+        historyEntry[device.name] = status.ptpStatus.servoOffset
+      }
+      await new Promise(r => setTimeout(r, 200))
     }
 
+    setDeviceStatuses(newStatuses)
+
+    // Update offset history
+    if (Object.keys(historyEntry).length > 1) {
+      setOffsetHistory(prev => {
+        const updated = [...prev, historyEntry]
+        return updated.slice(-MAX_HISTORY)
+      })
+    }
+
+    setLoading(false)
+  }
+
+  // Initial fetch
+  useEffect(() => {
+    if (devices.length > 0) fetchAll()
+  }, [devices])
+
+  // Auto refresh
+  useEffect(() => {
+    if (autoRefresh && devices.length > 0) {
+      intervalRef.current = setInterval(fetchAll, 2000)
+    } else {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+    }
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
+  }, [autoRefresh, devices])
+
+  // Configure PTP properly based on documentation
+  const configurePtp = async (gmDeviceId) => {
     setConfiguringPtp(true)
-    setPtpResult(null)
 
-    const results = []
-
-    for (const device of onlineDevices) {
+    for (const device of devices) {
       const isGm = device.id === gmDeviceId
-      const portRole = isGm ? 'master' : 'slave'
-
       try {
+        // Based on VelocityDRIVE documentation
         const patches = [
           {
             path: '/ieee1588-ptp:ptp/instances/instance',
             value: {
               'instance-index': 0,
-              'default-ds': { 'external-port-config-enable': true },
-              'mchp-velocitysp-ptp:automotive': { profile: isGm ? 'gm' : 'bridge' },
+              'default-ds': {
+                'external-port-config-enable': true
+              },
+              'mchp-velocitysp-ptp:automotive': {
+                profile: isGm ? 'gm' : 'bridge'
+              },
               'mchp-velocitysp-ptp:servos': {
-                servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }]
+                servo: [{
+                  'servo-index': 0,
+                  'servo-type': 'pi',
+                  'ltc-index': 0
+                }]
               },
               ports: {
                 port: [{
                   'port-index': ptpPort,
-                  'external-port-config-port-ds': { 'desired-state': portRole }
+                  'external-port-config-port-ds': {
+                    'desired-state': isGm ? 'master' : 'slave'
+                  }
                 }]
               }
             }
@@ -186,7 +176,12 @@ function Dashboard() {
             path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
             value: {
               'ltc-index': 0,
-              'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] }
+              'ptp-pins': {
+                'ptp-pin': [{
+                  index: 4,
+                  function: '1pps-out'
+                }]
+              }
             }
           }
         ]
@@ -199,19 +194,15 @@ function Dashboard() {
           port: device.port || 5683
         }, { timeout: 10000 })
 
-        results.push({ device: device.name, success: true, role: isGm ? 'GM' : 'Slave', port: ptpPort })
       } catch (err) {
-        results.push({ device: device.name, success: false, error: err.message })
+        console.error(`PTP config error for ${device.name}:`, err)
       }
-
       await new Promise(r => setTimeout(r, 500))
     }
 
-    setPtpResult(results)
     setConfiguringPtp(false)
-
-    // Refresh statuses after config
-    setTimeout(() => checkAllDevices(), 1500)
+    setOffsetHistory([]) // Clear history after reconfig
+    setTimeout(fetchAll, 1500)
   }
 
   const servoStateText = (state) => {
@@ -219,237 +210,241 @@ function Dashboard() {
     return states[state] || '-'
   }
 
-  if (loading) {
-    return (
-      <div className="loading">
-        <div className="spinner"></div>
-      </div>
-    )
+  const servoStateColor = (state) => {
+    if (state === 1 || state === 2) return '#059669'
+    if (state === 3) return '#d97706'
+    return '#64748b'
   }
+
+  const portStateColor = (state) => {
+    if (state === 'master') return '#7c3aed'
+    if (state === 'slave') return '#0891b2'
+    if (state === 'passive') return '#d97706'
+    return '#94a3b8'
+  }
+
+  // Check sync status
+  const gmDevice = devices.find(d => deviceStatuses[d.id]?.ptpStatus?.isGrandmaster)
+  const slaveDevice = devices.find(d => {
+    const status = deviceStatuses[d.id]?.ptpStatus
+    return status && !status.isGrandmaster && status.servoState >= 1
+  })
+  const isSynced = gmDevice && slaveDevice
+
+  // Colors for chart
+  const chartColors = ['#6366f1', '#f59e0b']
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Dashboard</h1>
-        <div style={{ display: 'flex', gap: '8px' }}>
-          <button
-            className="btn btn-secondary"
-            onClick={checkAllDevices}
-            disabled={checkingDevice !== null}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Port:</span>
+          <select
+            className="form-select"
+            value={ptpPort}
+            onChange={(e) => setPtpPort(parseInt(e.target.value))}
+            style={{ width: '60px', padding: '4px 6px', fontSize: '0.8rem' }}
           >
-            {checkingDevice ? 'Checking...' : 'Refresh All'}
+            {[1,2,3,4,5,6,7,8,9,10,11,12].map(p => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', cursor: 'pointer' }}>
+            <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
+            Auto
+          </label>
+          <button className="btn btn-secondary" onClick={fetchAll} disabled={loading}>
+            {loading ? '...' : 'Refresh'}
           </button>
-        </div>
-      </div>
-
-      {/* Server Status */}
-      <div className="card" style={{ marginBottom: '16px' }}>
-        <div style={{ display: 'flex', gap: '24px', alignItems: 'center', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <div style={{
-              width: '8px', height: '8px', borderRadius: '50%',
-              background: health ? '#059669' : '#dc2626'
-            }}></div>
-            <span style={{ fontSize: '0.85rem' }}>Server: {health ? 'Online' : 'Offline'}</span>
-          </div>
-          <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
-            Catalogs: <b>{catalogs.length}</b>
-          </div>
-          <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
-            Devices: <b>{devices.length}</b> (Online: <b>{Object.values(deviceStatuses).filter(s => s?.online).length}</b>)
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginLeft: 'auto' }}>
-            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>PTP Port:</span>
-            <select
-              className="form-select"
-              value={ptpPort}
-              onChange={(e) => setPtpPort(parseInt(e.target.value))}
-              style={{ width: '70px', padding: '4px 8px', fontSize: '0.8rem' }}
-            >
-              {[1,2,3,4,5,6,7,8,9,10,11,12].map(p => (
-                <option key={p} value={p}>Port {p}</option>
-              ))}
-            </select>
-          </div>
         </div>
       </div>
 
       {/* Device Cards */}
       {devices.length === 0 ? (
         <div className="card" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
-          No devices configured. Go to Settings to add devices.
+          No devices configured. Go to Settings.
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '16px', marginBottom: '24px' }}>
-          {devices.map(device => {
+        <div style={{ display: 'grid', gridTemplateColumns: devices.length === 1 ? '1fr' : '1fr auto 1fr', gap: '12px', marginBottom: '16px', alignItems: 'stretch' }}>
+          {devices.map((device, idx) => {
             const status = deviceStatuses[device.id]
-            const isChecking = checkingDevice === device.id
+            const ptp = status?.ptpStatus
 
             return (
               <div key={device.id} className="card" style={{
                 padding: '16px',
-                border: status?.online ? '1px solid #d1d5db' : status?.online === false ? '1px solid #fca5a5' : '1px solid #e2e8f0'
+                background: ptp?.isGrandmaster ? '#fafaf9' : '#fff',
+                border: status?.online ? (ptp?.isGrandmaster ? '2px solid #57534e' : '1px solid #e2e8f0') : '1px solid #fca5a5'
               }}>
                 {/* Header */}
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                   <div>
                     <div style={{ fontWeight: '600', fontSize: '1rem' }}>{device.name}</div>
-                    <div style={{ fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
-                      {device.transport === 'serial' ? device.device : `${device.host}:${device.port || 5683}`}
+                    <div style={{ fontSize: '0.7rem', color: '#64748b', fontFamily: 'monospace' }}>
+                      {device.host}
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                    {status?.ptpStatus && (
-                      <span style={{
-                        padding: '2px 8px',
-                        borderRadius: '4px',
-                        fontSize: '0.7rem',
-                        fontWeight: '600',
-                        background: status.ptpStatus.isGrandmaster ? '#f5f5f4' : '#f1f5f9',
-                        color: status.ptpStatus.isGrandmaster ? '#57534e' : '#475569'
-                      }}>
-                        {status.ptpStatus.isGrandmaster ? 'GM' : 'Slave'}
-                      </span>
-                    )}
+                  {status?.online ? (
                     <span style={{
-                      padding: '2px 8px',
-                      borderRadius: '4px',
+                      padding: '3px 10px',
+                      borderRadius: '6px',
                       fontSize: '0.7rem',
-                      fontWeight: '500',
-                      background: isChecking ? '#f1f5f9' : status?.online ? '#ecfdf5' : status?.online === false ? '#fef2f2' : '#f8fafc',
-                      color: isChecking ? '#64748b' : status?.online ? '#059669' : status?.online === false ? '#b91c1c' : '#94a3b8'
+                      fontWeight: '600',
+                      background: ptp?.isGrandmaster ? '#292524' : ptp ? '#e0f2fe' : '#f1f5f9',
+                      color: ptp?.isGrandmaster ? '#fff' : ptp ? '#0369a1' : '#64748b'
                     }}>
-                      {isChecking ? '...' : status?.online ? 'Online' : status?.online === false ? 'Offline' : '-'}
+                      {ptp?.isGrandmaster ? 'GM' : ptp ? 'SLAVE' : 'NO PTP'}
                     </span>
-                  </div>
+                  ) : (
+                    <span style={{ padding: '3px 10px', borderRadius: '6px', fontSize: '0.7rem', fontWeight: '600', background: '#fef2f2', color: '#b91c1c' }}>
+                      OFFLINE
+                    </span>
+                  )}
                 </div>
 
-                {/* Info */}
-                {status?.online && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '12px' }}>
-                    <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
-                      <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Chip</div>
-                      <div style={{ fontSize: '0.85rem', fontWeight: '500', fontFamily: 'monospace' }}>
-                        {status.boardInfo?.chip || '-'}
+                {/* PTP Details */}
+                {status?.online && ptp && (
+                  <div style={{ fontSize: '0.8rem', marginBottom: '12px' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', marginBottom: '8px' }}>
+                      <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                        <div style={{ fontSize: '0.6rem', color: '#94a3b8' }}>Port State</div>
+                        <div style={{ fontWeight: '600', color: portStateColor(ptp.portState) }}>
+                          {ptp.portState || '-'}
+                        </div>
+                      </div>
+                      <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                        <div style={{ fontSize: '0.6rem', color: '#94a3b8' }}>Servo</div>
+                        <div style={{ fontWeight: '600', color: servoStateColor(ptp.servoState) }}>
+                          {servoStateText(ptp.servoState)}
+                        </div>
                       </div>
                     </div>
-                    <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
-                      <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Firmware</div>
-                      <div style={{ fontSize: '0.85rem', fontWeight: '500' }}>
-                        {status.boardInfo?.firmware || '-'}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                      <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                        <div style={{ fontSize: '0.6rem', color: '#94a3b8' }}>Offset</div>
+                        <div style={{ fontWeight: '600', fontFamily: 'monospace', color: chartColors[idx] }}>
+                          {ptp.servoOffset !== null ? `${ptp.servoOffset} ns` : '-'}
+                        </div>
+                      </div>
+                      <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
+                        <div style={{ fontSize: '0.6rem', color: '#94a3b8' }}>Link Delay</div>
+                        <div style={{ fontWeight: '500', fontFamily: 'monospace' }}>
+                          {ptp.meanLinkDelay ? `${(ptp.meanLinkDelay / 65536).toFixed(0)} ns` : '-'}
+                        </div>
                       </div>
                     </div>
-                    {status.ptpStatus && (
-                      <>
-                        <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
-                          <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Servo Offset</div>
-                          <div style={{ fontSize: '0.85rem', fontWeight: '500', fontFamily: 'monospace' }}>
-                            {status.ptpStatus.servoOffset !== null ? `${status.ptpStatus.servoOffset} ns` : '-'}
-                          </div>
-                        </div>
-                        <div style={{ padding: '8px', background: '#f8fafc', borderRadius: '6px' }}>
-                          <div style={{ fontSize: '0.65rem', color: '#64748b' }}>Servo State</div>
-                          <div style={{ fontSize: '0.85rem', fontWeight: '500' }}>
-                            {servoStateText(status.ptpStatus.servoState)}
-                          </div>
-                        </div>
-                      </>
+                    {ptp.profile && ptp.profile !== 'none' && (
+                      <div style={{ marginTop: '6px', fontSize: '0.65rem', color: '#64748b' }}>
+                        Profile: <b>{ptp.profile}</b>
+                      </div>
                     )}
                   </div>
                 )}
 
                 {status?.online === false && (
-                  <div style={{ padding: '12px', background: '#fef2f2', borderRadius: '6px', marginBottom: '12px', fontSize: '0.8rem', color: '#b91c1c' }}>
-                    {status.error || 'Device offline'}
+                  <div style={{ padding: '10px', background: '#fef2f2', borderRadius: '6px', marginBottom: '12px', fontSize: '0.75rem', color: '#b91c1c' }}>
+                    {status.error || 'Connection failed'}
                   </div>
                 )}
 
-                {/* Actions */}
-                <div style={{ display: 'flex', gap: '6px' }}>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => fetchDeviceStatus(device)}
-                    disabled={isChecking}
-                    style={{ fontSize: '0.75rem', padding: '6px 10px' }}
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => autoPtpConfig(device.id)}
-                    disabled={configuringPtp || !status?.online}
-                    style={{ flex: 1, fontSize: '0.75rem', padding: '6px 10px' }}
-                    title={`Set this device as Grandmaster on Port ${ptpPort} and configure all other online devices as Slaves`}
-                  >
-                    Set as GM (P{ptpPort})
-                  </button>
-                </div>
+                {/* Set GM Button */}
+                <button
+                  className="btn btn-primary"
+                  onClick={() => configurePtp(device.id)}
+                  disabled={configuringPtp || !status?.online}
+                  style={{ width: '100%', fontSize: '0.75rem', padding: '8px' }}
+                >
+                  {configuringPtp ? 'Configuring...' : 'Set as GM'}
+                </button>
               </div>
             )
           })}
+
+          {/* Sync Arrow */}
+          {devices.length === 2 && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
+              {isSynced ? (
+                <>
+                  <svg width="32" height="20" viewBox="0 0 32 20" fill="none">
+                    <path d="M0 10H24M24 10L18 4M24 10L18 16" stroke="#059669" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                  <span style={{ fontSize: '0.65rem', color: '#059669', fontWeight: '600' }}>SYNC</span>
+                </>
+              ) : (
+                <>
+                  <svg width="32" height="20" viewBox="0 0 32 20" fill="none">
+                    <path d="M0 10H24M24 10L18 4M24 10L18 16" stroke="#d1d5db" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                  <span style={{ fontSize: '0.65rem', color: '#94a3b8' }}>-</span>
+                </>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* PTP Configuration Result */}
-      {ptpResult && (
-        <div className="card">
+      {/* Offset Graph */}
+      {offsetHistory.length > 1 && (
+        <div className="card" style={{ marginBottom: '16px' }}>
           <div className="card-header">
-            <h2 className="card-title">PTP Configuration Result</h2>
+            <h2 className="card-title">PTP Offset History</h2>
             <button
               className="btn btn-secondary"
-              onClick={() => setPtpResult(null)}
-              style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+              onClick={() => setOffsetHistory([])}
+              style={{ fontSize: '0.7rem', padding: '4px 8px' }}
             >
               Clear
             </button>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {ptpResult.map((r, i) => (
-              <div key={i} style={{
-                display: 'flex', alignItems: 'center', gap: '8px',
-                padding: '8px 12px', background: r.success ? '#ecfdf5' : '#fef2f2',
-                borderRadius: '6px', fontSize: '0.85rem'
-              }}>
-                <span style={{ fontWeight: '500' }}>{r.device}</span>
-                {r.success ? (
-                  <>
-                    <span style={{ color: '#059669' }}>OK</span>
-                    <span style={{
-                      padding: '2px 6px', borderRadius: '4px', fontSize: '0.7rem',
-                      background: r.role === 'GM' ? '#f5f5f4' : '#f1f5f9',
-                      fontWeight: '600'
-                    }}>
-                      {r.role}
-                    </span>
-                    {r.port && <span style={{ fontSize: '0.7rem', color: '#64748b' }}>Port {r.port}</span>}
-                  </>
-                ) : (
-                  <span style={{ color: '#b91c1c' }}>Failed: {r.error}</span>
-                )}
+          <div style={{ height: '200px' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={offsetHistory} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke="#94a3b8" />
+                <YAxis tick={{ fontSize: 10 }} stroke="#94a3b8" unit=" ns" />
+                <Tooltip
+                  contentStyle={{ fontSize: '0.75rem', background: '#fff', border: '1px solid #e2e8f0' }}
+                  formatter={(value) => [`${value} ns`, '']}
+                />
+                <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                {devices.map((device, idx) => (
+                  <Line
+                    key={device.id}
+                    type="monotone"
+                    dataKey={device.name}
+                    stroke={chartColors[idx]}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ display: 'flex', gap: '16px', marginTop: '8px', justifyContent: 'center' }}>
+            {devices.map((device, idx) => (
+              <div key={device.id} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.75rem' }}>
+                <div style={{ width: '12px', height: '3px', background: chartColors[idx], borderRadius: '2px' }}></div>
+                <span>{device.name}</span>
               </div>
             ))}
           </div>
         </div>
       )}
 
-      {configuringPtp && (
-        <div className="card" style={{ textAlign: 'center', padding: '40px' }}>
-          <div className="spinner" style={{ margin: '0 auto 16px' }}></div>
-          <div>Configuring PTP on all devices...</div>
-        </div>
-      )}
-
-      {/* Quick Actions */}
+      {/* Quick Links */}
       <div className="card">
         <div className="card-header">
-          <h2 className="card-title">Quick Actions</h2>
+          <h2 className="card-title">Quick Links</h2>
         </div>
-        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          <a href="/ptp-monitor" className="btn btn-primary">PTP Monitor</a>
-          <a href="/ports" className="btn btn-secondary">Port Status</a>
-          <a href="/ptp" className="btn btn-secondary">PTP Config</a>
-          <a href="/settings" className="btn btn-secondary">Device Settings</a>
-          <a href="/fetch" className="btn btn-secondary">Fetch</a>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <a href="/ptp" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>PTP Config</a>
+          <a href="/tas" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>TAS</a>
+          <a href="/cbs" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>CBS</a>
+          <a href="/ports" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>Ports</a>
+          <a href="/capture" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>Capture</a>
+          <a href="/settings" className="btn btn-secondary" style={{ fontSize: '0.8rem' }}>Settings</a>
         </div>
       </div>
     </div>

@@ -5,7 +5,7 @@ import { useCapture } from '../contexts/CaptureContext'
 const MAX_PACKETS = 500
 const UPDATE_INTERVAL = 200
 
-function Capture({ config }) {
+function Capture() {
   const {
     capturing, status, error, wsConnected, activeInterfaces,
     startCapture, stopCapture, addPacketListener, setError

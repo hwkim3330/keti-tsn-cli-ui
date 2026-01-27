@@ -404,11 +404,18 @@ function Settings() {
           fontFamily: 'monospace',
           fontSize: '0.9rem'
         }}>
-          <div><strong>Transport:</strong> {config.transport === 'serial' ? 'USB (Serial)' : 'WiFi (UDP)'}</div>
-          {config.transport === 'serial' ? (
-            <div><strong>Device:</strong> {config.device}</div>
+          {selectedDevice ? (
+            <>
+              <div><strong>Name:</strong> {selectedDevice.name}</div>
+              <div><strong>Transport:</strong> {selectedDevice.transport === 'serial' ? 'USB (Serial)' : 'WiFi (UDP)'}</div>
+              {selectedDevice.transport === 'serial' ? (
+                <div><strong>Device:</strong> {selectedDevice.device}</div>
+              ) : (
+                <div><strong>Host:</strong> {selectedDevice.host}:{selectedDevice.port}</div>
+              )}
+            </>
           ) : (
-            <div><strong>Host:</strong> {config.host}:{config.port}</div>
+            <div style={{ color: '#94a3b8' }}>No device selected</div>
           )}
         </div>
       </div>

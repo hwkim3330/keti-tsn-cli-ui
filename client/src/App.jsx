@@ -1,6 +1,6 @@
 import { BrowserRouter as Router, Routes, Route, NavLink } from 'react-router-dom'
 import { CaptureProvider } from './contexts/CaptureContext'
-import { DeviceProvider, useDevices } from './contexts/DeviceContext'
+import { DeviceProvider } from './contexts/DeviceContext'
 import Dashboard from './pages/Dashboard'
 import Settings from './pages/Settings'
 import PTP from './pages/PTP'
@@ -8,43 +8,15 @@ import TAS from './pages/TAS'
 import CBS from './pages/CBS'
 import Ports from './pages/Ports'
 import Capture from './pages/Capture'
+import Tools from './pages/Tools'
 
 function Sidebar() {
-  const { devices, selectedDevice, selectDevice } = useDevices()
-
   return (
     <aside className="sidebar">
       <div className="sidebar-header" style={{ padding: '20px 16px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
         <img src="/keti.png" alt="KETI" style={{ height: '32px', marginBottom: '8px', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
         <div style={{ fontSize: '0.75rem', fontWeight: '500', color: 'rgba(255,255,255,0.5)' }}>TSN Switch Manager</div>
       </div>
-
-      {/* Device Selector */}
-      {devices.length > 0 && (
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-          <div style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.4)', marginBottom: '6px' }}>Active Device</div>
-          <select
-            value={selectedDevice?.id || ''}
-            onChange={(e) => selectDevice(e.target.value)}
-            style={{
-              width: '100%',
-              padding: '8px 10px',
-              background: 'rgba(255,255,255,0.1)',
-              border: '1px solid rgba(255,255,255,0.15)',
-              borderRadius: '6px',
-              color: '#fff',
-              fontSize: '0.8rem',
-              cursor: 'pointer'
-            }}
-          >
-            {devices.map(d => (
-              <option key={d.id} value={d.id} style={{ background: '#1e293b', color: '#fff' }}>
-                {d.name}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
 
       <nav>
         <div className="nav-section">
@@ -91,7 +63,14 @@ function Sidebar() {
           </NavLink>
         </div>
 
-        <div className="nav-section" style={{ marginTop: 'auto' }}>
+        <div className="nav-section">
+          <div className="nav-section-title">Developer</div>
+          <NavLink to="/tools" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+            </svg>
+            <span>CLI Tools</span>
+          </NavLink>
           <NavLink to="/settings" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <svg className="nav-item-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -120,6 +99,7 @@ function App() {
             <Route path="/ptp" element={<PTP />} />
             <Route path="/tas" element={<TAS />} />
             <Route path="/cbs" element={<CBS />} />
+            <Route path="/tools" element={<Tools />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>

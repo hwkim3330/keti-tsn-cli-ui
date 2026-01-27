@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import { useDevices } from '../contexts/DeviceContext'
 
-function Ports({ config }) {
+function Ports() {
+  const { selectedDevice } = useDevices()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [ports, setPorts] = useState([])
@@ -20,7 +22,7 @@ function Ports({ config }) {
   const pollIntervalRef = useRef(null)
 
   const portCount = 12 // LAN9692: 7 PHY + 4 SFP + 1 internal
-  const cacheKey = `ports_${config.host}`
+  const cacheKey = `ports_${selectedDevice?.host || selectedDevice?.device || 'default'}`
 
   // Load cached data on mount
   useEffect(() => {
@@ -48,14 +50,16 @@ function Ports({ config }) {
 
   // Fetch single port basic status with timeout
   const fetchPortStatus = async (portNum) => {
+    if (!selectedDevice) return { number: portNum, operStatus: 'unknown', error: 'No device selected' }
+
     const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
     try {
       const response = await axios.post('/api/fetch', {
         paths: [`${basePath}/oper-status`],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 8000 })
 
       const result = response.data.result || ''
@@ -84,10 +88,11 @@ function Ports({ config }) {
     // Save successful fetch to cache
     saveCache(portData)
     setLoading(false)
-  }, [config, cacheKey])
+  }, [selectedDevice, cacheKey])
 
   // Fetch detailed info for selected port
   const fetchPortDetail = async (portNum) => {
+    if (!selectedDevice) return
     setDetailLoading(true)
     const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
 
@@ -100,10 +105,10 @@ function Ports({ config }) {
           `${basePath}/phys-address`,
           `${basePath}/mchp-velocitysp-port:eth-port/config`
         ],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 10000 })
 
       const detail = parseDetailResponse(response.data.result, portNum)
@@ -112,10 +117,10 @@ function Ports({ config }) {
       // Fetch statistics separately
       const statsResponse = await axios.post('/api/fetch', {
         paths: [`${basePath}/statistics`],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 10000 })
 
       const stats = parseStatsResponse(statsResponse.data.result)
@@ -206,14 +211,15 @@ function Ports({ config }) {
 
   // Fetch stats for monitoring (lightweight, no state updates except stats)
   const fetchStatsOnly = async (portNum) => {
+    if (!selectedDevice) return null
     const basePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']`
     try {
       const response = await axios.post('/api/fetch', {
         paths: [`${basePath}/statistics`],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 5000 })
       return parseStatsResponse(response.data.result)
     } catch {
@@ -304,6 +310,7 @@ function Ports({ config }) {
 
   // Toggle port enabled state
   const togglePort = async (portNum, currentEnabled) => {
+    if (!selectedDevice) return
     setDetailLoading(true)
     try {
       await axios.post('/api/patch', {
@@ -311,10 +318,10 @@ function Ports({ config }) {
           path: `/ietf-interfaces:interfaces/interface[name='${portNum}']/enabled`,
           value: !currentEnabled
         }],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 10000 })
 
       // Refresh detail
@@ -332,6 +339,7 @@ function Ports({ config }) {
 
   // Clear port counters
   const clearCounters = async (portNum) => {
+    if (!selectedDevice) return
     setDetailLoading(true)
     try {
       await axios.post('/api/patch', {
@@ -339,10 +347,10 @@ function Ports({ config }) {
           path: `/ietf-interfaces:interfaces/interface[name='${portNum}']/mchp-velocitysp-port:eth-port/statistics/clear-statistics`,
           value: null
         }],
-        transport: config.transport,
-        device: config.device,
-        host: config.host,
-        port: config.port
+        transport: selectedDevice.transport,
+        device: selectedDevice.device,
+        host: selectedDevice.host,
+        port: selectedDevice.port || 5683
       }, { timeout: 10000 })
 
       await fetchPortDetail(portNum)
@@ -355,11 +363,12 @@ function Ports({ config }) {
 
   // Initial fetch only if no cache
   useEffect(() => {
+    if (!selectedDevice) return
     const cached = localStorage.getItem(cacheKey)
     if (!cached) {
       fetchAllPorts()
     }
-  }, [config.host])
+  }, [selectedDevice])
 
   // Fetch detail when port selected
   useEffect(() => {
@@ -408,7 +417,7 @@ function Ports({ config }) {
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px', background: '#f8fafc', borderRadius: '6px' }}>
           <span style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
-            {config.transport === 'wifi' ? `${config.host}:${config.port}` : config.device}
+            {selectedDevice ? (selectedDevice.transport === 'wifi' ? `${selectedDevice.host}:${selectedDevice.port}` : selectedDevice.device) : 'No device selected'}
           </span>
           {lastFetched && (
             <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
