@@ -217,8 +217,8 @@ function Dashboard() {
     const historyEntry = { time: timestamp }
     const newStatus = { ...boardStatus }
 
-    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
-    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
+    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
+    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
 
     if (slaveDevice) {
       const result = await fetchSlaveOffset(slaveDevice)
@@ -446,7 +446,7 @@ function Dashboard() {
   }, [offsetModel, ptpFeatures.t1_ns_history, ptpFeatures.delta_t1_jitter])
 
   useEffect(() => {
-    const slaveDevice = devices.find(d => d.host === '10.42.0.12')
+    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || (d.transport === 'serial' && d.device?.includes('ACM1')))
     const currentOffset = boardStatus[slaveDevice?.id]?.ptp?.offset
     const currentD = boardStatus[slaveDevice?.id]?.ptp?.meanLinkDelay
     if (currentOffset !== undefined && currentOffset !== null) {
@@ -508,8 +508,8 @@ function Dashboard() {
   }
 
   const autoSetup = async () => {
-    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
-    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
+    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
+    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
 
     if (!gmDevice || !slaveDevice) {
       setAutoSetupStatus('error')
@@ -555,8 +555,9 @@ function Dashboard() {
 
   const servoStateText = (state) => ({ 0: 'Init', 1: 'Tracking', 2: 'Locked', 3: 'Holdover' }[state] ?? '-')
 
-  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
-  const board2 = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
+  // Support both serial and wifi devices
+  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')) || (d.transport === 'serial' && d.device?.includes('ACM0')))
+  const board2 = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')) || (d.transport === 'serial' && d.device?.includes('ACM1')))
   const board1Status = board1 ? boardStatus[board1.id] : null
   const board2Status = board2 ? boardStatus[board2.id] : null
   const isSynced = board1Status?.online && board2Status?.online && board1Status?.ptp?.isGM && board2Status?.ptp?.portState === 'slave' && board2Status?.ptp?.servoState >= 1

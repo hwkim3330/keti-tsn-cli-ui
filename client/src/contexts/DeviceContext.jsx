@@ -4,11 +4,10 @@ const DeviceContext = createContext()
 
 const STORAGE_KEY = 'tsn-devices'
 const STORAGE_VERSION_KEY = 'tsn-devices-version'
-const DEVICES_VERSION = 6
+const DEVICES_VERSION = 7  // Bump version to reset to serial
 
 const defaultDevices = [
-  { id: 'board1', name: 'LAN9692 #1', transport: 'wifi', host: '10.42.0.11', port: 5683 },
-  { id: 'board2', name: 'LAN9692 #2', transport: 'wifi', host: '10.42.0.12', port: 5683 },
+  { id: 'board1', name: 'LAN9692 #1', transport: 'serial', device: '/dev/ttyACM0' },
 ]
 
 export function DeviceProvider({ children }) {
