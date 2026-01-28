@@ -10,10 +10,12 @@ function Settings() {
   const [editingDevice, setEditingDevice] = useState(null)
   const [hotspot, setHotspot] = useState({ active: false, devices: [] })
   const [scanningHotspot, setScanningHotspot] = useState(false)
+  const [togglingHotspot, setTogglingHotspot] = useState(false)
 
   useEffect(() => {
     fetchSerialPorts()
     scanHotspot()
+    autoAddSerialDevices()
   }, [])
 
   const fetchSerialPorts = async () => {
@@ -37,6 +39,42 @@ function Settings() {
       console.error('Failed to scan hotspot:', err)
     } finally {
       setScanningHotspot(false)
+    }
+  }
+
+  // Auto-add serial devices if not already added
+  const autoAddSerialDevices = async () => {
+    try {
+      const res = await axios.get('/api/config/ports')
+      const acmPorts = res.data.ports.filter(p => p.path.includes('ttyACM'))
+
+      acmPorts.forEach((port, idx) => {
+        const exists = devices.some(d => d.device === port.path)
+        if (!exists) {
+          addDevice({
+            id: `serial${Date.now()}_${idx}`,
+            name: `LAN9692 #${idx + 1}`,
+            transport: 'serial',
+            device: port.path
+          })
+        }
+      })
+    } catch (err) {
+      console.error('Failed to auto-add serial devices:', err)
+    }
+  }
+
+  // Toggle hotspot on/off
+  const toggleHotspot = async () => {
+    setTogglingHotspot(true)
+    try {
+      await axios.post('/api/config/hotspot/toggle')
+      setTimeout(scanHotspot, 2000) // Rescan after 2s
+    } catch (err) {
+      console.error('Failed to toggle hotspot:', err)
+      alert('핫스팟 토글 실패: ' + err.message)
+    } finally {
+      setTogglingHotspot(false)
     }
   }
 
@@ -285,22 +323,34 @@ function Settings() {
         </button>
       </div>
 
-      {/* Hotspot Detection */}
-      {hotspot.active && (
-        <div className="card" style={{ background: '#f8fafc', border: '1px solid #e2e8f0', marginBottom: '16px' }}>
-          <div className="card-header">
-            <h2 className="card-title">
-              Hotspot Active - {hotspot.hostIP}
-            </h2>
+      {/* Hotspot Control */}
+      <div className="card" style={{ background: '#f8fafc', border: '1px solid #e2e8f0', marginBottom: '16px' }}>
+        <div className="card-header">
+          <h2 className="card-title">
+            WiFi Hotspot {hotspot.active ? `- ${hotspot.hostIP}` : '(OFF)'}
+          </h2>
+          <div style={{ display: 'flex', gap: '8px' }}>
             <button
-              className="btn btn-secondary"
-              onClick={scanHotspot}
-              disabled={scanningHotspot}
+              className={`btn ${hotspot.active ? 'btn-danger' : 'btn-primary'}`}
+              onClick={toggleHotspot}
+              disabled={togglingHotspot}
               style={{ fontSize: '0.75rem' }}
             >
-              {scanningHotspot ? 'Scanning...' : 'Rescan'}
+              {togglingHotspot ? '...' : hotspot.active ? 'Turn OFF' : 'Turn ON'}
             </button>
+            {hotspot.active && (
+              <button
+                className="btn btn-secondary"
+                onClick={scanHotspot}
+                disabled={scanningHotspot}
+                style={{ fontSize: '0.75rem' }}
+              >
+                {scanningHotspot ? 'Scanning...' : 'Rescan'}
+              </button>
+            )}
           </div>
+        </div>
+        {hotspot.active && (
           {hotspot.devices.length > 0 ? (
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
               {hotspot.devices.map(dev => {
@@ -342,8 +392,8 @@ function Settings() {
           ) : (
             <p style={{ color: '#64748b', fontSize: '0.85rem' }}>No devices detected on hotspot</p>
           )}
-        </div>
-      )}
+        )}
+      </div>
 
       {/* USB Devices */}
       <div className="card">

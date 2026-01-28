@@ -115,4 +115,44 @@ router.get('/hotspot', async (req, res) => {
   }
 });
 
+// Toggle hotspot on/off using nmcli
+router.post('/hotspot/toggle', async (req, res) => {
+  try {
+    // Check current hotspot status
+    const interfaces = os.networkInterfaces();
+    let isActive = false;
+
+    for (const [name, addrs] of Object.entries(interfaces)) {
+      for (const addr of addrs) {
+        if (addr.family === 'IPv4' && addr.address.startsWith('10.42.0.')) {
+          isActive = true;
+          break;
+        }
+      }
+    }
+
+    if (isActive) {
+      // Turn off hotspot
+      execSync('nmcli connection down Hotspot 2>/dev/null || true', { encoding: 'utf-8' });
+      res.json({ success: true, action: 'off', message: 'Hotspot turned off' });
+    } else {
+      // Turn on hotspot
+      try {
+        execSync('nmcli connection up Hotspot', { encoding: 'utf-8' });
+        res.json({ success: true, action: 'on', message: 'Hotspot turned on' });
+      } catch (e) {
+        // Try to create hotspot if it doesn't exist
+        try {
+          execSync('nmcli device wifi hotspot ifname wlp0s20f3 ssid KETI-TSN password keti1234', { encoding: 'utf-8' });
+          res.json({ success: true, action: 'created', message: 'Hotspot created and turned on' });
+        } catch (e2) {
+          throw new Error('Failed to start hotspot: ' + e2.message);
+        }
+      }
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;
