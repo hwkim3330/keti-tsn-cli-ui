@@ -391,7 +391,7 @@ function Settings() {
             </div>
           ) : (
             <p style={{ color: '#64748b', fontSize: '0.85rem' }}>No devices detected on hotspot</p>
-          )}
+          )
         )}
       </div>
 
