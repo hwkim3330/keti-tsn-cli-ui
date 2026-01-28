@@ -33,44 +33,68 @@ const tcColors = [
 // Credit 시계열 그래프 컴포넌트
 const CreditGraph = ({ creditHistory, selectedTCs, maxTime, shapingEvents }) => {
   const width = 800
-  const height = 280
-  const padding = { top: 30, right: 20, bottom: 40, left: 70 }
+  const height = 300
+  const padding = { top: 30, right: 120, bottom: 45, left: 80 }
   const chartW = width - padding.left - padding.right
   const chartH = height - padding.top - padding.bottom
 
-  // Y축 범위 계산 (credit 값)
+  // 현재 시간 (데이터 기반)
+  const currentTime = creditHistory.length > 0 ? creditHistory[creditHistory.length - 1].time : 0
+
+  // X축 동적 범위 계산
+  const { xMin, xMax } = useMemo(() => {
+    if (!creditHistory.length) return { xMin: 0, xMax: maxTime }
+    const lastTime = creditHistory[creditHistory.length - 1].time
+    // 데이터가 있으면 현재 시간 기준으로 동적 범위
+    if (lastTime > 0) {
+      return { xMin: 0, xMax: Math.max(lastTime * 1.1, 1000) }
+    }
+    return { xMin: 0, xMax: maxTime }
+  }, [creditHistory, maxTime])
+
+  // Y축 범위 계산 (credit 값) - 동적
   const { minCredit, maxCredit } = useMemo(() => {
-    if (!creditHistory.length) return { minCredit: -1000, maxCredit: 1000 }
+    if (!creditHistory.length || creditHistory.length < 2) return { minCredit: -1000, maxCredit: 1000 }
     let min = 0, max = 0
     creditHistory.forEach(entry => {
       selectedTCs.forEach(tc => {
-        const val = entry.credit[tc] || 0
+        const val = entry.credit?.[tc] ?? 0
         if (val < min) min = val
         if (val > max) max = val
       })
     })
-    // 여유 마진 추가
-    const range = Math.max(Math.abs(min), Math.abs(max), 500)
-    return { minCredit: -range * 1.2, maxCredit: range * 1.2 }
+    // 실제 데이터 범위에 맞춰 동적 조정
+    const absMax = Math.max(Math.abs(min), Math.abs(max), 200)
+    return { minCredit: -absMax * 1.3, maxCredit: absMax * 1.3 }
   }, [creditHistory, selectedTCs])
 
-  const xScale = (time) => padding.left + (time / maxTime) * chartW
+  const xScale = (time) => padding.left + ((time - xMin) / (xMax - xMin)) * chartW
   const yScale = (val) => {
     const range = maxCredit - minCredit
+    if (range === 0) return padding.top + chartH / 2
     return padding.top + chartH - ((val - minCredit) / range) * chartH
   }
 
-  // X축 틱 (1초 단위)
+  // X축 틱 (동적 간격)
   const xTicks = useMemo(() => {
+    const range = xMax - xMin
+    let step = 1000
+    if (range > 10000) step = 2000
+    if (range > 20000) step = 5000
+    if (range < 2000) step = 500
     const ticks = []
-    for (let i = 0; i <= maxTime; i += 1000) ticks.push(i)
+    for (let i = 0; i <= xMax; i += step) ticks.push(i)
     return ticks
-  }, [maxTime])
+  }, [xMin, xMax])
 
-  // Y축 틱
+  // Y축 틱 (동적 간격)
   const yTicks = useMemo(() => {
     const range = maxCredit - minCredit
-    const step = Math.ceil(range / 6 / 100) * 100
+    if (range === 0) return [0]
+    let step = 200
+    if (range > 2000) step = 500
+    if (range > 5000) step = 1000
+    if (range < 500) step = 100
     const ticks = []
     for (let v = Math.floor(minCredit / step) * step; v <= maxCredit; v += step) {
       ticks.push(v)
@@ -80,19 +104,30 @@ const CreditGraph = ({ creditHistory, selectedTCs, maxTime, shapingEvents }) => 
 
   // 0 라인 위치
   const zeroY = yScale(0)
+  const zeroInRange = zeroY >= padding.top && zeroY <= padding.top + chartH
+
+  // TC별 라인 스타일 (구분 명확화)
+  const tcLineStyles = [
+    { dash: '', width: 2.5 },
+    { dash: '', width: 2.5 },
+    { dash: '8,4', width: 2.5 },
+    { dash: '8,4', width: 2.5 },
+    { dash: '4,4', width: 2.5 },
+    { dash: '4,4', width: 2.5 },
+    { dash: '12,4,4,4', width: 2.5 },
+    { dash: '12,4,4,4', width: 2.5 },
+  ]
 
   return (
     <div style={{ background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '6px', padding: '16px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <span style={{ fontWeight: '600', fontSize: '0.9rem' }}>Credit Evolution (Real-time)</span>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            {selectedTCs.map(tc => (
-              <span key={tc} style={{ fontSize: '0.65rem', padding: '2px 6px', borderRadius: '3px', background: `${tcColors[tc]}20`, color: tcColors[tc], fontWeight: '600' }}>
-                TC{tc}
-              </span>
-            ))}
-          </div>
+          <span style={{ fontWeight: '600', fontSize: '0.9rem' }}>Credit Evolution</span>
+          {creditHistory.length > 1 && (
+            <span style={{ fontSize: '0.75rem', color: colors.success, fontWeight: '500' }}>
+              {(currentTime / 1000).toFixed(1)}s
+            </span>
+          )}
         </div>
         <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>
           <span style={{ color: colors.error }}>■</span> Shaping Zone (credit {'<'} 0)
@@ -100,99 +135,146 @@ const CreditGraph = ({ creditHistory, selectedTCs, maxTime, shapingEvents }) => 
       </div>
 
       <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet">
+        <defs>
+          {selectedTCs.map(tc => (
+            <linearGradient key={tc} id={`gradient-tc${tc}`} x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stopColor={tcColors[tc]} stopOpacity="0.3" />
+              <stop offset="100%" stopColor={tcColors[tc]} stopOpacity="0.05" />
+            </linearGradient>
+          ))}
+        </defs>
+
         {/* Shaping Zone (credit < 0) */}
-        <rect x={padding.left} y={zeroY} width={chartW} height={padding.top + chartH - zeroY}
-          fill={colors.error} opacity="0.08" />
+        {zeroInRange && (
+          <rect x={padding.left} y={zeroY} width={chartW} height={Math.min(padding.top + chartH - zeroY, chartH)}
+            fill={colors.error} opacity="0.1" />
+        )}
 
         {/* Y축 그리드 */}
-        {yTicks.map(tick => (
-          <g key={tick}>
-            <line x1={padding.left} y1={yScale(tick)} x2={width - padding.right} y2={yScale(tick)}
+        {yTicks.map((tick, i) => (
+          <g key={`y-${tick}-${i}`}>
+            <line x1={padding.left} y1={yScale(tick)} x2={padding.left + chartW} y2={yScale(tick)}
               stroke={tick === 0 ? colors.text : colors.border} strokeWidth={tick === 0 ? 1.5 : 0.5}
               strokeDasharray={tick === 0 ? '' : '3,3'} />
-            <text x={padding.left - 8} y={yScale(tick)} textAnchor="end" alignmentBaseline="middle"
-              fontSize="9" fill={colors.textMuted} fontFamily="monospace">
+            <text x={padding.left - 10} y={yScale(tick)} textAnchor="end" alignmentBaseline="middle"
+              fontSize="10" fill={colors.textMuted} fontFamily="monospace">
               {tick >= 0 ? `+${tick}` : tick}
             </text>
           </g>
         ))}
 
         {/* X축 그리드 */}
-        {xTicks.map(tick => (
-          <g key={tick}>
-            <line x1={xScale(tick)} y1={padding.top} x2={xScale(tick)} y2={height - padding.bottom}
+        {xTicks.map((tick, i) => (
+          <g key={`x-${tick}-${i}`}>
+            <line x1={xScale(tick)} y1={padding.top} x2={xScale(tick)} y2={padding.top + chartH}
               stroke={colors.border} strokeWidth="0.5" strokeDasharray="3,3" />
-            <text x={xScale(tick)} y={height - padding.bottom + 14} textAnchor="middle"
-              fontSize="9" fill={colors.textMuted}>{tick / 1000}s</text>
+            <text x={xScale(tick)} y={padding.top + chartH + 16} textAnchor="middle"
+              fontSize="10" fill={colors.textMuted}>{(tick / 1000).toFixed(1)}s</text>
           </g>
         ))}
 
-        {/* Shaping 이벤트 마커 */}
-        {shapingEvents.map((event, i) => (
-          <g key={i}>
-            <line x1={xScale(event.time)} y1={padding.top} x2={xScale(event.time)} y2={height - padding.bottom}
-              stroke={event.type === 'enter' ? colors.error : colors.success} strokeWidth="1.5" strokeDasharray="4,2" />
-            <circle cx={xScale(event.time)} cy={yScale(0)} r="4"
-              fill={event.type === 'enter' ? colors.error : colors.success} />
-            <text x={xScale(event.time)} y={padding.top - 8} textAnchor="middle" fontSize="8"
-              fill={event.type === 'enter' ? colors.error : colors.success} fontWeight="600">
-              {event.type === 'enter' ? 'SHAPE' : 'EXIT'}
-            </text>
-          </g>
-        ))}
+        {/* 현재 시간 마커 */}
+        {creditHistory.length > 1 && (
+          <line x1={xScale(currentTime)} y1={padding.top} x2={xScale(currentTime)} y2={padding.top + chartH}
+            stroke={colors.success} strokeWidth="2" strokeDasharray="6,3" opacity="0.7" />
+        )}
 
         {/* Credit 라인 (TC별) */}
-        {selectedTCs.map(tc => {
+        {selectedTCs.map((tc, tcIdx) => {
           if (creditHistory.length < 2) return null
-          const points = creditHistory.map(entry => ({
-            x: xScale(entry.time),
-            y: yScale(entry.credit[tc] || 0)
-          }))
+          const style = tcLineStyles[tc] || tcLineStyles[0]
+
+          const points = creditHistory
+            .filter(entry => entry.credit && entry.credit[tc] !== undefined)
+            .map(entry => ({
+              x: xScale(entry.time),
+              y: yScale(entry.credit[tc])
+            }))
+
+          if (points.length < 2) return null
           const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 
           return (
             <g key={tc}>
               {/* 라인 */}
-              <path d={pathD} fill="none" stroke={tcColors[tc]} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              {/* 현재 포인트 */}
+              <path d={pathD} fill="none" stroke={tcColors[tc]} strokeWidth={style.width}
+                strokeLinecap="round" strokeLinejoin="round" strokeDasharray={style.dash} />
+              {/* 현재 포인트 (크게) */}
               {points.length > 0 && (
-                <circle cx={points[points.length - 1].x} cy={points[points.length - 1].y}
-                  r="4" fill={tcColors[tc]} stroke="#fff" strokeWidth="1.5" />
+                <>
+                  <circle cx={points[points.length - 1].x} cy={points[points.length - 1].y}
+                    r="6" fill={tcColors[tc]} stroke="#fff" strokeWidth="2" />
+                  <text x={points[points.length - 1].x + 10} y={points[points.length - 1].y + 4}
+                    fontSize="10" fill={tcColors[tc]} fontWeight="600" fontFamily="monospace">
+                    TC{tc}
+                  </text>
+                </>
               )}
             </g>
           )
         })}
+
+        {/* Shaping 이벤트 마커 */}
+        {shapingEvents.map((event, i) => (
+          <g key={`event-${i}`}>
+            <line x1={xScale(event.time)} y1={padding.top} x2={xScale(event.time)} y2={padding.top + chartH}
+              stroke={event.type === 'enter' ? colors.error : colors.success} strokeWidth="1.5" strokeDasharray="4,2" />
+            <circle cx={xScale(event.time)} cy={zeroInRange ? zeroY : padding.top + chartH / 2} r="5"
+              fill={event.type === 'enter' ? colors.error : colors.success} stroke="#fff" strokeWidth="1.5" />
+            <text x={xScale(event.time)} y={padding.top - 6} textAnchor="middle" fontSize="9"
+              fill={event.type === 'enter' ? colors.error : colors.success} fontWeight="600">
+              TC{event.tc} {event.type === 'enter' ? 'SHAPE' : 'EXIT'}
+            </text>
+          </g>
+        ))}
 
         {/* 축 테두리 */}
         <rect x={padding.left} y={padding.top} width={chartW} height={chartH}
           fill="none" stroke={colors.border} strokeWidth="1" />
 
         {/* 라벨 */}
-        <text x={12} y={height / 2} textAnchor="middle" fontSize="10" fill={colors.textMuted}
-          transform={`rotate(-90, 12, ${height / 2})`}>Credit (bits)</text>
-        <text x={width / 2} y={height - 5} textAnchor="middle" fontSize="10" fill={colors.textMuted}>Time (seconds)</text>
+        <text x={20} y={height / 2} textAnchor="middle" fontSize="11" fill={colors.textMuted} fontWeight="500"
+          transform={`rotate(-90, 20, ${height / 2})`}>Credit (bits)</text>
+        <text x={padding.left + chartW / 2} y={height - 8} textAnchor="middle" fontSize="11" fill={colors.textMuted} fontWeight="500">Time</text>
 
         {/* 범례 - 0 라인 */}
-        <text x={padding.left + 5} y={zeroY - 5} fontSize="9" fill={colors.text} fontWeight="600">Credit = 0</text>
+        {zeroInRange && (
+          <text x={padding.left + 5} y={zeroY - 6} fontSize="9" fill={colors.text} fontWeight="600">0</text>
+        )}
+
+        {/* 범례 (오른쪽) */}
+        <g transform={`translate(${width - padding.right + 15}, ${padding.top + 10})`}>
+          {selectedTCs.map((tc, i) => {
+            const style = tcLineStyles[tc] || tcLineStyles[0]
+            return (
+              <g key={tc} transform={`translate(0, ${i * 24})`}>
+                <line x1="0" y1="8" x2="25" y2="8" stroke={tcColors[tc]} strokeWidth={style.width} strokeDasharray={style.dash} />
+                <circle cx="25" cy="8" r="4" fill={tcColors[tc]} />
+                <text x="32" y="11" fontSize="10" fill={tcColors[tc]} fontWeight="600">TC{tc}</text>
+              </g>
+            )
+          })}
+        </g>
       </svg>
 
       {/* 현재 Credit 값 */}
       {creditHistory.length > 0 && (
-        <div style={{ display: 'flex', gap: '12px', marginTop: '12px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '10px', marginTop: '12px', flexWrap: 'wrap' }}>
           {selectedTCs.map(tc => {
-            const latest = creditHistory[creditHistory.length - 1]?.credit[tc] || 0
+            const latest = creditHistory[creditHistory.length - 1]?.credit?.[tc] ?? 0
             const isShaping = latest < 0
             return (
               <div key={tc} style={{
-                padding: '8px 12px', borderRadius: '4px', fontFamily: 'monospace', fontSize: '0.75rem',
-                background: isShaping ? '#fef2f2' : colors.bgAlt,
-                border: `1px solid ${isShaping ? colors.error : colors.border}`
+                padding: '10px 14px', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.8rem',
+                background: isShaping ? '#fef2f2' : `${tcColors[tc]}10`,
+                border: `2px solid ${isShaping ? colors.error : tcColors[tc]}`,
+                minWidth: '120px'
               }}>
-                <span style={{ color: tcColors[tc], fontWeight: '600' }}>TC{tc}</span>
-                <span style={{ marginLeft: '8px', color: isShaping ? colors.error : colors.text, fontWeight: '600' }}>
-                  {latest >= 0 ? '+' : ''}{Math.round(latest)} bits
-                </span>
-                {isShaping && <span style={{ marginLeft: '6px', color: colors.error, fontSize: '0.65rem' }}>SHAPING</span>}
+                <div style={{ color: tcColors[tc], fontWeight: '700', marginBottom: '4px' }}>TC{tc}</div>
+                <div style={{ color: isShaping ? colors.error : colors.text, fontWeight: '600', fontSize: '1rem' }}>
+                  {latest >= 0 ? '+' : ''}{Math.round(latest)}
+                </div>
+                {isShaping && <div style={{ color: colors.error, fontSize: '0.7rem', marginTop: '4px', fontWeight: '600' }}>SHAPING</div>}
               </div>
             )
           })}
@@ -366,17 +448,17 @@ function CBSDashboard() {
 
   const applyCBS = async () => {
     if (!cbsBoard) return
-    setStatus({ type: 'info', msg: 'Applying...' })
+    setStatus({ type: 'info', msg: `Applying to Port ${cbsPort}...` })
     try {
       const patches = []
       for (let tc = 0; tc < 8; tc++) {
         patches.push({
-          path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
+          path: `${getQosPath(cbsPort)}/traffic-class-shapers`,
           value: { 'traffic-class': tc, 'credit-based': { 'idle-slope': idleSlope[tc] || LINK_SPEED } }
         })
       }
       await axios.post('/api/patch', { patches, transport: cbsBoard.transport, device: cbsBoard.device, host: cbsBoard.host }, { timeout: 30000 })
-      setStatus({ type: 'success', msg: 'CBS Applied' })
+      setStatus({ type: 'success', msg: `CBS Applied (Port ${cbsPort})` })
       setTimeout(() => { fetchCBS(); setStatus(null) }, 1500)
     } catch (err) {
       setStatus({ type: 'error', msg: err.message })
@@ -385,12 +467,12 @@ function CBSDashboard() {
 
   const resetCBS = async () => {
     if (!cbsBoard) return
-    setStatus({ type: 'info', msg: 'Resetting...' })
+    setStatus({ type: 'info', msg: `Resetting Port ${cbsPort}...` })
     try {
       const patches = []
       for (let tc = 0; tc < 8; tc++) {
         patches.push({
-          path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
+          path: `${getQosPath(cbsPort)}/traffic-class-shapers`,
           value: { 'traffic-class': tc, 'credit-based': { 'idle-slope': LINK_SPEED } }
         })
       }
@@ -398,7 +480,7 @@ function CBSDashboard() {
       const resetSlope = {}
       for (let tc = 0; tc < 8; tc++) resetSlope[tc] = LINK_SPEED
       setIdleSlope(resetSlope)
-      setStatus({ type: 'success', msg: 'CBS Reset' })
+      setStatus({ type: 'success', msg: `CBS Reset (Port ${cbsPort})` })
       setTimeout(() => { fetchCBS(); setStatus(null) }, 1500)
     } catch (err) {
       setStatus({ type: 'error', msg: err.message })
@@ -521,10 +603,10 @@ function CBSDashboard() {
     creditRef.current = {}
     monitorTCs.forEach(tc => { creditRef.current[tc] = 0 })
 
-    const simStart = Date.now()
+    // 선택된 트래픽 TC 기준으로 PPS 계산
     const tcCount = selectedTCs.length || 1
     const ppsPerTc = packetsPerSecond / tcCount
-    const intervalMs = 50  // 50ms 간격으로 시뮬레이션
+    const intervalMs = 30  // 30ms 간격으로 시뮬레이션 (더 부드럽게)
 
     // 초기 credit entry
     const initCredit = {}
@@ -532,7 +614,7 @@ function CBSDashboard() {
     setCreditHistory([{ time: 0, credit: initCredit, packets: {} }])
 
     let simTime = 0
-    const events = []
+    let allEvents = []
 
     simulationRef.current = setInterval(() => {
       simTime += intervalMs
@@ -543,33 +625,51 @@ function CBSDashboard() {
       }
 
       const newCredit = {}
+      const newEvents = []
+
       monitorTCs.forEach(tc => {
         const slope = idleSlope[tc] || LINK_SPEED
         const prevCredit = creditRef.current[tc] ?? 0
 
-        // 패킷 전송 시뮬레이션 (ppsPerTc * intervalMs / 1000 패킷)
-        const packetsInInterval = (ppsPerTc * intervalMs) / 1000
+        // 이 TC가 트래픽 대상인지 확인
+        const isTrafficTC = selectedTCs.includes(tc)
 
-        // Credit 계산
-        // Idle recovery: idleSlope * dt
-        const idleRecovery = (slope / 1000) * intervalMs  // bits
-        // TX cost: packets * packetSize * (1 - idleSlope/linkSpeed)
-        const txCost = packetsInInterval * PACKET_SIZE * (1 - slope / LINK_SPEED)
+        // 패킷 전송 시뮬레이션 (트래픽 TC만 패킷 전송)
+        const packetsInInterval = isTrafficTC ? (ppsPerTc * intervalMs) / 1000 : 0
+
+        // IEEE 802.1Qav Credit 계산
+        // idleSlope: 대기 시간 동안 credit 회복 속도 (bits/s)
+        // sendSlope: 전송 시 credit 소비 속도 = idleSlope - portTransmitRate
+        const sendSlope = slope - LINK_SPEED  // 음수값 (kbps)
+
+        // 시간당 credit 변화
+        // - 전송 중: credit += sendSlope * txTime
+        // - 대기 중: credit += idleSlope * idleTime
+        // 단순화: intervalMs 동안 패킷 전송과 대기가 혼합됨
+
+        // 패킷 전송 시간 (ms)
+        const txTimePerPkt = (PACKET_SIZE / 1000) / LINK_SPEED  // ms per packet
+        const totalTxTime = packetsInInterval * txTimePerPkt  // ms
+        const idleTime = intervalMs - totalTxTime  // ms
+
+        // Credit 변화 계산
+        const idleRecovery = (slope / 1000) * Math.max(idleTime, 0)  // bits (idle 동안 회복)
+        const txCost = packetsInInterval * PACKET_SIZE * Math.abs(1 - slope / LINK_SPEED)  // bits (전송 동안 소비)
 
         let credit = prevCredit + idleRecovery - txCost
 
         // Credit bounds
-        const hiCredit = PACKET_SIZE
-        const loCredit = -PACKET_SIZE * 4
+        const hiCredit = PACKET_SIZE * 2  // 최대 2 패킷 크기
+        const loCredit = -PACKET_SIZE * 8  // 최소 -8 패킷 크기
 
         // Shaping 이벤트 감지
         const wasShaping = prevCredit < 0
         const isShaping = credit < 0
 
         if (!wasShaping && isShaping) {
-          events.push({ type: 'enter', tc, time: simTime, credit })
+          newEvents.push({ type: 'enter', tc, time: simTime, credit })
         } else if (wasShaping && !isShaping) {
-          events.push({ type: 'exit', tc, time: simTime, credit })
+          newEvents.push({ type: 'exit', tc, time: simTime, credit })
         }
 
         credit = Math.max(loCredit, Math.min(hiCredit, credit))
@@ -579,11 +679,13 @@ function CBSDashboard() {
 
       setCreditHistory(prev => {
         const entry = { time: simTime, credit: { ...newCredit }, packets: {} }
-        return [...prev, entry]
+        // 최대 300개 포인트 유지
+        const newHistory = [...prev, entry]
+        return newHistory.length > 300 ? newHistory.slice(-300) : newHistory
       })
 
-      if (events.length > 0) {
-        setShapingEvents(prev => [...prev, ...events.splice(0)])
+      if (newEvents.length > 0) {
+        setShapingEvents(prev => [...prev, ...newEvents])
       }
     }, intervalMs)
   }
@@ -703,7 +805,7 @@ function CBSDashboard() {
             <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>CBS Port</div>
             <select value={cbsPort} onChange={e => setCbsPort(parseInt(e.target.value))}
               style={{ width: '100%', padding: '6px 8px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontFamily: 'monospace', fontSize: '0.875rem' }}>
-              {[1,2,3,4,5,6,7,8].map(p => (
+              {[1,2,3,4,5,6,7,8,9,10,11,12].map(p => (
                 <option key={p} value={p}>Port {p}</option>
               ))}
             </select>
