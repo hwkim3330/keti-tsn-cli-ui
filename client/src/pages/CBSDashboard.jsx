@@ -236,10 +236,11 @@ const ShapingAnalysis = ({ shapingEvents, selectedTCs, estimates, duration }) =>
     <div style={{ background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '6px', padding: '16px' }}>
       <div style={{ fontWeight: '600', fontSize: '0.9rem', marginBottom: '12px' }}>Shaping Analysis</div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px' }}>
-        {selectedTCs.filter(tc => estimates[tc]?.isLimited).map(tc => {
+        {selectedTCs.map(tc => {
           const s = stats[tc] || {}
-          const est = estimates[tc]
+          const est = estimates[tc] || {}
           const cbsOk = s.enterCount > 0  // CBS가 동작하고 있음
+          const isLimited = est.isLimited
 
           return (
             <div key={tc} style={{
@@ -251,27 +252,31 @@ const ShapingAnalysis = ({ shapingEvents, selectedTCs, estimates, duration }) =>
                 <span style={{ color: tcColors[tc], fontWeight: '700', fontSize: '0.85rem' }}>TC{tc}</span>
                 <span style={{
                   padding: '2px 6px', borderRadius: '3px', fontSize: '0.65rem', fontWeight: '600',
-                  background: cbsOk ? colors.error : colors.success,
+                  background: !isLimited ? colors.textMuted : cbsOk ? colors.error : colors.success,
                   color: '#fff'
                 }}>
-                  {cbsOk ? 'CBS ACTIVE' : 'NO SHAPING'}
+                  {!isLimited ? 'UNLIMITED' : cbsOk ? 'CBS ACTIVE' : 'NO SHAPING'}
                 </span>
               </div>
 
               <div style={{ fontFamily: 'monospace', lineHeight: '1.6' }}>
-                <div>Idle Slope: <span style={{ fontWeight: '600' }}>{(est.slope / 1000).toFixed(0)}M</span>bps</div>
-                <div>Traffic: <span style={{ fontWeight: '600' }}>{(est.trafficKbps / 1000).toFixed(1)}M</span>bps</div>
+                <div>Idle Slope: <span style={{ fontWeight: '600' }}>{((est.slope || LINK_SPEED) / 1000).toFixed(0)}M</span>bps</div>
+                <div>Traffic: <span style={{ fontWeight: '600' }}>{((est.trafficKbps || 0) / 1000).toFixed(1)}M</span>bps</div>
                 <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: `1px solid ${colors.border}` }}>
-                  Shaping Events: <span style={{ fontWeight: '600', color: s.enterCount > 0 ? colors.error : colors.success }}>{s.enterCount}</span>
+                  Shaping Events: <span style={{ fontWeight: '600', color: s.enterCount > 0 ? colors.error : colors.success }}>{s.enterCount || 0}</span>
                 </div>
                 {s.firstShaping !== null && (
                   <div>First Shaping: <span style={{ fontWeight: '600' }}>{(s.firstShaping / 1000).toFixed(2)}s</span></div>
                 )}
-                <div>Shaping Ratio: <span style={{ fontWeight: '600', color: s.shapingRatio > 50 ? colors.error : colors.warning }}>{s.shapingRatio.toFixed(1)}%</span></div>
+                <div>Shaping Ratio: <span style={{ fontWeight: '600', color: s.shapingRatio > 50 ? colors.error : s.shapingRatio > 0 ? colors.warning : colors.success }}>{(s.shapingRatio || 0).toFixed(1)}%</span></div>
               </div>
 
               <div style={{ marginTop: '8px', padding: '6px', background: 'rgba(0,0,0,0.03)', borderRadius: '4px', fontSize: '0.7rem' }}>
-                {cbsOk ? (
+                {!isLimited ? (
+                  <span style={{ color: colors.textMuted }}>
+                    Idle slope = link speed (no shaping)
+                  </span>
+                ) : cbsOk ? (
                   <span style={{ color: colors.error }}>
                     Traffic exceeds idle slope → CBS is shaping
                   </span>
@@ -302,9 +307,11 @@ function CBSDashboard() {
   const [trafficInterface, setTrafficInterface] = useState(null)
   const [trafficRunning, setTrafficRunning] = useState(false)
   const [selectedTCs, setSelectedTCs] = useState([1, 2, 3, 4, 5, 6, 7])
+  const [monitorTCs, setMonitorTCs] = useState([1, 2])  // Credit 모니터링할 TC
   const [vlanId, setVlanId] = useState(100)
   const [packetsPerSecond, setPacketsPerSecond] = useState(2000)
   const [duration, setDuration] = useState(5)
+  const [cbsPort, setCbsPort] = useState(8)  // CBS 설정할 포트
 
   const [tapConnected, setTapConnected] = useState(false)
   const [captureStats, setCaptureStats] = useState(null)
@@ -313,10 +320,10 @@ function CBSDashboard() {
   const [startTime, setStartTime] = useState(null)
   const wsRef = useRef(null)
   const creditRef = useRef({})  // 현재 credit 값 추적
+  const simulationRef = useRef(null)  // 시뮬레이션 타이머
 
   const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
   const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
-  const CBS_PORT = 8
   const cbsBoard = board1 || board2
 
   const getQosPath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/mchp-velocitysp-port:eth-qos/config`
@@ -326,7 +333,7 @@ function CBSDashboard() {
     setLoading(true)
     try {
       const res = await axios.post('/api/fetch', {
-        paths: [`${getQosPath(CBS_PORT)}/traffic-class-shapers`],
+        paths: [`${getQosPath(cbsPort)}/traffic-class-shapers`],
         transport: cbsBoard.transport || 'serial',
         device: cbsBoard.device,
         host: cbsBoard.host,
@@ -398,8 +405,15 @@ function CBSDashboard() {
     }
   }
 
-  useEffect(() => { if (cbsBoard) fetchCBS() }, [cbsBoard])
+  useEffect(() => { if (cbsBoard) fetchCBS() }, [cbsBoard, cbsPort])
   useEffect(() => { setTrafficInterface(TRAFFIC_INTERFACE) }, [])
+
+  // 시뮬레이션 정리
+  useEffect(() => {
+    return () => {
+      if (simulationRef.current) clearInterval(simulationRef.current)
+    }
+  }, [])
 
   // WebSocket for capture data
   useEffect(() => {
@@ -434,7 +448,7 @@ function CBSDashboard() {
     const newCredit = { ...creditRef.current }
     const newEvents = []
 
-    selectedTCs.forEach(tc => {
+    monitorTCs.forEach(tc => {
       const slope = idleSlope[tc] || LINK_SPEED
       const sendSlope = slope - LINK_SPEED  // negative (bits/ms)
 
@@ -486,7 +500,7 @@ function CBSDashboard() {
         credit: { ...newCredit },
         packets: {}
       }
-      selectedTCs.forEach(tc => {
+      monitorTCs.forEach(tc => {
         entry.packets[tc] = stats.tc?.[tc]?.count || 0
       })
       return [...prev.slice(-100), entry]
@@ -498,20 +512,104 @@ function CBSDashboard() {
     }
   }
 
+  // Credit 시뮬레이션 (실제 트래픽 없이 예상 크레딧 변화 시뮬레이션)
+  const simulateCredit = () => {
+    if (simulationRef.current) clearInterval(simulationRef.current)
+
+    setCreditHistory([])
+    setShapingEvents([])
+    creditRef.current = {}
+    monitorTCs.forEach(tc => { creditRef.current[tc] = 0 })
+
+    const simStart = Date.now()
+    const tcCount = selectedTCs.length || 1
+    const ppsPerTc = packetsPerSecond / tcCount
+    const intervalMs = 50  // 50ms 간격으로 시뮬레이션
+
+    // 초기 credit entry
+    const initCredit = {}
+    monitorTCs.forEach(tc => { initCredit[tc] = 0 })
+    setCreditHistory([{ time: 0, credit: initCredit, packets: {} }])
+
+    let simTime = 0
+    const events = []
+
+    simulationRef.current = setInterval(() => {
+      simTime += intervalMs
+      if (simTime > duration * 1000) {
+        clearInterval(simulationRef.current)
+        simulationRef.current = null
+        return
+      }
+
+      const newCredit = {}
+      monitorTCs.forEach(tc => {
+        const slope = idleSlope[tc] || LINK_SPEED
+        const prevCredit = creditRef.current[tc] ?? 0
+
+        // 패킷 전송 시뮬레이션 (ppsPerTc * intervalMs / 1000 패킷)
+        const packetsInInterval = (ppsPerTc * intervalMs) / 1000
+
+        // Credit 계산
+        // Idle recovery: idleSlope * dt
+        const idleRecovery = (slope / 1000) * intervalMs  // bits
+        // TX cost: packets * packetSize * (1 - idleSlope/linkSpeed)
+        const txCost = packetsInInterval * PACKET_SIZE * (1 - slope / LINK_SPEED)
+
+        let credit = prevCredit + idleRecovery - txCost
+
+        // Credit bounds
+        const hiCredit = PACKET_SIZE
+        const loCredit = -PACKET_SIZE * 4
+
+        // Shaping 이벤트 감지
+        const wasShaping = prevCredit < 0
+        const isShaping = credit < 0
+
+        if (!wasShaping && isShaping) {
+          events.push({ type: 'enter', tc, time: simTime, credit })
+        } else if (wasShaping && !isShaping) {
+          events.push({ type: 'exit', tc, time: simTime, credit })
+        }
+
+        credit = Math.max(loCredit, Math.min(hiCredit, credit))
+        newCredit[tc] = credit
+        creditRef.current[tc] = credit
+      })
+
+      setCreditHistory(prev => {
+        const entry = { time: simTime, credit: { ...newCredit }, packets: {} }
+        return [...prev, entry]
+      })
+
+      if (events.length > 0) {
+        setShapingEvents(prev => [...prev, ...events.splice(0)])
+      }
+    }, intervalMs)
+  }
+
+  const stopSimulation = () => {
+    if (simulationRef.current) {
+      clearInterval(simulationRef.current)
+      simulationRef.current = null
+    }
+  }
+
   const startTest = async () => {
     if (!trafficInterface || selectedTCs.length === 0) return
+    stopSimulation()
     setCaptureStats(null)
     setCreditHistory([])
     setShapingEvents([])
     creditRef.current = {}
-    selectedTCs.forEach(tc => { creditRef.current[tc] = 0 })
+    monitorTCs.forEach(tc => { creditRef.current[tc] = 0 })
 
     const now = Date.now()
     setStartTime(now)
 
     // 초기 credit entry
     const initCredit = {}
-    selectedTCs.forEach(tc => { initCredit[tc] = 0 })
+    monitorTCs.forEach(tc => { initCredit[tc] = 0 })
     setCreditHistory([{ time: 0, credit: initCredit, packets: {} }])
 
     try {
@@ -530,6 +628,7 @@ function CBSDashboard() {
 
   const stopTest = async () => {
     setTrafficRunning(false)
+    stopSimulation()
     try { await axios.post(`${TRAFFIC_API}/api/traffic/stop-precision`, {}) } catch {}
     try { await axios.post('/api/capture/stop-c', {}) } catch {}
   }
@@ -591,38 +690,106 @@ function CBSDashboard() {
       </div>
 
       {/* Connection Info */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '16px' }}>
-        {[
-          { label: 'Board', value: cbsBoard?.name || 'Not Connected', sub: `${cbsBoard?.device || '-'} / Port ${CBS_PORT}` },
-          { label: 'TX Interface', value: trafficInterface || 'Not Found', ok: !!trafficInterface },
-          { label: 'RX Interface', value: TAP_INTERFACE, ok: tapConnected, sub: tapConnected ? 'Ready' : 'Disconnected' }
-        ].map((item, i) => (
-          <div key={i} style={{ ...card, marginBottom: 0 }}>
-            <div style={cardBody}>
-              <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>{item.label}</div>
-              <div style={{ fontSize: '0.875rem', fontFamily: 'monospace', color: item.ok === false ? colors.error : colors.text }}>{item.value}</div>
-              {item.sub && <div style={{ fontSize: '0.75rem', color: item.ok === false ? colors.error : item.ok ? colors.success : colors.textMuted, marginTop: '4px' }}>{item.sub}</div>}
-            </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', marginBottom: '16px' }}>
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={cardBody}>
+            <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>Board</div>
+            <div style={{ fontSize: '0.875rem', fontFamily: 'monospace' }}>{cbsBoard?.name || 'Not Connected'}</div>
+            <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginTop: '4px' }}>{cbsBoard?.device || '-'}</div>
           </div>
-        ))}
+        </div>
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={cardBody}>
+            <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>CBS Port</div>
+            <select value={cbsPort} onChange={e => setCbsPort(parseInt(e.target.value))}
+              style={{ width: '100%', padding: '6px 8px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontFamily: 'monospace', fontSize: '0.875rem' }}>
+              {[1,2,3,4,5,6,7,8].map(p => (
+                <option key={p} value={p}>Port {p}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={cardBody}>
+            <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>TX Interface</div>
+            <div style={{ fontSize: '0.875rem', fontFamily: 'monospace', color: trafficInterface ? colors.text : colors.error }}>{trafficInterface || 'Not Found'}</div>
+          </div>
+        </div>
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={cardBody}>
+            <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>RX Interface</div>
+            <div style={{ fontSize: '0.875rem', fontFamily: 'monospace' }}>{TAP_INTERFACE}</div>
+            <div style={{ fontSize: '0.75rem', color: tapConnected ? colors.success : colors.error, marginTop: '4px' }}>{tapConnected ? 'Ready' : 'Disconnected'}</div>
+          </div>
+        </div>
       </div>
 
-      {/* Credit Graph - 실시간 모니터링 */}
-      <div style={{ marginBottom: '16px' }}>
-        <CreditGraph
-          creditHistory={creditHistory}
-          selectedTCs={selectedTCs.filter(tc => estimates[tc]?.isLimited)}
-          maxTime={maxGraphTime}
-          shapingEvents={shapingEvents}
-        />
+      {/* Credit Monitor - TC 선택 및 시뮬레이션 */}
+      <div style={{ ...card, marginBottom: '16px' }}>
+        <div style={cardHeader}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ fontWeight: '600' }}>Credit Monitor</span>
+            <span style={{ fontSize: '0.75rem', color: colors.textMuted }}>Select TCs to monitor</span>
+          </div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button className="btn btn-secondary" onClick={simulateCredit} disabled={monitorTCs.length === 0 || trafficRunning}
+              style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
+              Simulate
+            </button>
+            <button className="btn btn-secondary" onClick={() => { stopSimulation(); setCreditHistory([]); setShapingEvents([]) }}
+              style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
+              Clear
+            </button>
+          </div>
+        </div>
+        <div style={cardBody}>
+          {/* TC 선택 */}
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>
+            {[0,1,2,3,4,5,6,7].map(tc => {
+              const isSelected = monitorTCs.includes(tc)
+              const slope = idleSlope[tc] || LINK_SPEED
+              const isLimited = slope < LINK_SPEED
+              return (
+                <button key={tc} onClick={() => setMonitorTCs(prev => prev.includes(tc) ? prev.filter(t => t !== tc) : [...prev, tc].sort())}
+                  style={{
+                    padding: '8px 14px', borderRadius: '4px', cursor: 'pointer',
+                    border: `2px solid ${isSelected ? tcColors[tc] : colors.border}`,
+                    background: isSelected ? `${tcColors[tc]}15` : '#fff',
+                    color: isSelected ? tcColors[tc] : colors.textMuted,
+                    fontWeight: '600', fontSize: '0.8rem',
+                    opacity: isLimited ? 1 : 0.5
+                  }}>
+                  TC{tc}
+                  <span style={{ marginLeft: '6px', fontSize: '0.7rem', fontWeight: '400' }}>
+                    {formatBw(slope)}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Credit Graph */}
+          {monitorTCs.length > 0 ? (
+            <CreditGraph
+              creditHistory={creditHistory}
+              selectedTCs={monitorTCs}
+              maxTime={maxGraphTime}
+              shapingEvents={shapingEvents}
+            />
+          ) : (
+            <div style={{ padding: '40px', textAlign: 'center', color: colors.textMuted, background: colors.bgAlt, borderRadius: '6px' }}>
+              Select TC(s) to monitor credit changes
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Shaping Analysis */}
-      {creditHistory.length > 1 && (
+      {creditHistory.length > 1 && monitorTCs.length > 0 && (
         <div style={{ marginBottom: '16px' }}>
           <ShapingAnalysis
             shapingEvents={shapingEvents}
-            selectedTCs={selectedTCs}
+            selectedTCs={monitorTCs}
             estimates={estimates}
             duration={duration}
           />
