@@ -351,7 +351,7 @@ function Settings() {
           </div>
         </div>
         {hotspot.active && (
-          {hotspot.devices.length > 0 ? (
+          hotspot.devices.length > 0 ? (
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
               {hotspot.devices.map(dev => {
                 const exists = devices.some(d => d.host === dev.ip)
