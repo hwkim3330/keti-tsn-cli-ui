@@ -500,9 +500,14 @@ function TASDashboard() {
         <div className="card">
           <div className="card-header">
             <h2 className="card-title">TAS Configuration</h2>
-            <span style={{ fontSize: '0.65rem', color: tasData.port8?.gateEnabled ? colors.success : colors.textLight, fontWeight: '600' }}>
-              {tasData.port8?.gateEnabled ? 'ENABLED' : 'DISABLED'}
-            </span>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.6rem', color: colors.textMuted }}>
+                {board1 ? `Board1: ${board1.host}` : 'Board1 not found'}
+              </span>
+              <span style={{ fontSize: '0.65rem', color: tasData.port8?.gateEnabled ? colors.success : colors.textLight, fontWeight: '600' }}>
+                {tasData.port8?.gateEnabled ? 'ENABLED' : 'DISABLED'}
+              </span>
+            </div>
           </div>
 
           {tasData.port8?.online ? (
@@ -691,31 +696,62 @@ function TASDashboard() {
         </div>
       )}
 
-      {/* Time Series Chart */}
-      {timeSeriesData.length > 1 && (
+      {/* Packet Timeline - Time (X) vs TC (Y) */}
+      {capturedPackets.length > 0 && (
         <div className="card" style={{ marginBottom: '16px' }}>
           <div className="card-header">
-            <h2 className="card-title">Captured Packets Over Time</h2>
+            <h2 className="card-title">Packet Timeline (Time vs TC)</h2>
+            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+              TAS OFF: 무작위 | TAS ON: TC별 시간 슬롯
+            </span>
           </div>
 
-          <div style={{ height: '250px' }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={timeSeriesData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
-                <XAxis dataKey="second" tick={{ fontSize: 10 }} stroke={colors.textLight} />
-                <YAxis tick={{ fontSize: 10 }} stroke={colors.textLight} />
-                <Tooltip contentStyle={{ fontSize: '0.7rem' }} />
-                <Legend wrapperStyle={{ fontSize: '0.65rem' }} />
-                {selectedTCs.map(tc => (
-                  <Area key={tc} type="monotone" dataKey={`cap${tc}`} name={`TC${tc}`} stroke={tcColors[tc]} fill={tcColors[tc]} fillOpacity={0.6} stackId="1" />
+          {/* Simple visual timeline */}
+          <div style={{ padding: '10px', background: colors.bgAlt, borderRadius: '4px' }}>
+            {/* Y-axis labels (TC) */}
+            <div style={{ display: 'flex' }}>
+              <div style={{ width: '40px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', paddingRight: '4px' }}>
+                {[7, 6, 5, 4, 3, 2, 1, 0].map(tc => (
+                  <div key={tc} style={{ height: '20px', fontSize: '0.6rem', color: tcColors[tc], fontWeight: '600', textAlign: 'right' }}>TC{tc}</div>
                 ))}
-              </AreaChart>
-            </ResponsiveContainer>
+              </div>
+              {/* Timeline area */}
+              <div style={{ flex: 1, position: 'relative', height: '160px', background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '4px', overflow: 'hidden' }}>
+                {(() => {
+                  const rxPackets = capturedPackets.filter(p => p.direction === 'RX').slice(-200)
+                  if (rxPackets.length === 0) return <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight }}>No RX packets</div>
+                  const minTime = rxPackets[0]?.time || 0
+                  const maxTime = rxPackets[rxPackets.length - 1]?.time || 1
+                  const timeRange = Math.max(maxTime - minTime, 1)
+                  return rxPackets.map((pkt, idx) => {
+                    const x = ((pkt.time - minTime) / timeRange) * 100
+                    const y = (7 - pkt.pcp) * 20 + 2
+                    return (
+                      <div key={idx} style={{
+                        position: 'absolute',
+                        left: `${x}%`,
+                        top: `${y}px`,
+                        width: '4px',
+                        height: '16px',
+                        background: tcColors[pkt.pcp],
+                        borderRadius: '2px',
+                        opacity: 0.8
+                      }} />
+                    )
+                  })
+                })()}
+              </div>
+            </div>
+            {/* X-axis label */}
+            <div style={{ marginLeft: '40px', display: 'flex', justifyContent: 'space-between', fontSize: '0.6rem', color: colors.textMuted, marginTop: '4px' }}>
+              <span>Start</span>
+              <span>Time →</span>
+              <span>End</span>
+            </div>
           </div>
 
           <div style={{ marginTop: '10px', padding: '10px', background: colors.bgAlt, borderRadius: '6px', fontSize: '0.7rem', color: colors.textMuted }}>
-            <b>TAS 동작 원리:</b> 각 TC 패킷은 GCL에 정의된 시간 슬롯에서만 전송됨.
-            TC{selectedTCs.join(', TC')}가 선택되었으며, TAS가 활성화되면 각 TC는 할당된 125μs 슬롯에서만 통과.
+            <b>TAS 동작 원리:</b> TAS OFF시 패킷이 무작위로 도착. TAS ON시 각 TC가 할당된 125μs 슬롯에서만 전송되어 시간별로 정렬됨.
           </div>
         </div>
       )}
