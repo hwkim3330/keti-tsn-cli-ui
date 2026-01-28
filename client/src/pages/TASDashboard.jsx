@@ -81,7 +81,11 @@ function TASDashboard() {
   const [capturedCounts, setCapturedCounts] = useState({}) // TC -> count
   const startTimeRef = useRef(null)
 
-  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
+  // Board1: Serial connection via ttyACM0
+  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || d.transport === 'serial')
+
+  // TAS on Port 9 (PC → Board1 ingress port)
+  const TAS_PORT = 9
 
   const getBasePath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-sched-bridge:gate-parameter-table`
 
@@ -113,12 +117,12 @@ function TASDashboard() {
   // Fetch TAS status (fetch individual fields to avoid CBOR size issues)
   const fetchTASStatus = async () => {
     if (!board1) {
-      setTasData(prev => ({ ...prev, port8: { online: false, error: 'Board 1 not found' } }))
+      setTasData(prev => ({ ...prev, tasPort: { online: false, error: 'Board 1 not found' } }))
       return
     }
     setLoading(true)
     try {
-      const basePath = getBasePath(8)
+      const basePath = getBasePath(TAS_PORT)
       const fields = ['gate-enabled', 'admin-gate-states', 'admin-cycle-time', 'admin-control-list']
       const results = await Promise.all(fields.map(field =>
         axios.post('/api/fetch', {
@@ -153,9 +157,9 @@ function TASDashboard() {
           }
         }
       })
-      setTasData(prev => ({ ...prev, port8: status }))
+      setTasData(prev => ({ ...prev, tasPort: status }))
     } catch (err) {
-      setTasData(prev => ({ ...prev, port8: { online: false, error: 'Connection failed' } }))
+      setTasData(prev => ({ ...prev, tasPort: { online: false, error: 'Connection failed' } }))
     }
     setLoading(false)
   }
@@ -172,7 +176,7 @@ function TASDashboard() {
     setAutoSetupMessage('Configuring TAS...')
 
     try {
-      const basePath = getBasePath(8)
+      const basePath = getBasePath(TAS_PORT)
       // TC1-7 only (TC0 always open - Best Effort background)
       const gclEntries = []
       for (let i = 1; i <= 7; i++) {
@@ -218,7 +222,7 @@ function TASDashboard() {
     setAutoSetupMessage('Disabling TAS...')
 
     try {
-      const basePath = getBasePath(8)
+      const basePath = getBasePath(TAS_PORT)
       await axios.post('/api/patch', {
         patches: [{ path: `${basePath}/gate-enabled`, value: false }],
         transport: board1.transport, host: board1.host, port: board1.port || 5683
@@ -502,26 +506,26 @@ function TASDashboard() {
             <h2 className="card-title">TAS Configuration</h2>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
               <span style={{ fontSize: '0.6rem', color: colors.textMuted }}>
-                {board1 ? `Board1: ${board1.host}` : 'Board1 not found'}
+                {board1 ? `Board1 Port${TAS_PORT} (${board1.transport || 'serial'})` : 'Board1 not found'}
               </span>
-              <span style={{ fontSize: '0.65rem', color: tasData.port8?.gateEnabled ? colors.success : colors.textLight, fontWeight: '600' }}>
-                {tasData.port8?.gateEnabled ? 'ENABLED' : 'DISABLED'}
+              <span style={{ fontSize: '0.65rem', color: tasData.tasPort?.gateEnabled ? colors.success : colors.textLight, fontWeight: '600' }}>
+                {tasData.tasPort?.gateEnabled ? 'ENABLED' : 'DISABLED'}
               </span>
             </div>
           </div>
 
-          {tasData.port8?.online ? (
+          {tasData.tasPort?.online ? (
             <div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '12px' }}>
-                <div style={statBox}><div style={statLabel}>Cycle</div><div style={statValue}>{tasData.port8.cycleTimeNs ? `${(tasData.port8.cycleTimeNs / 1000).toFixed(0)} μs` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>Slots</div><div style={statValue}>{tasData.port8.adminControlList?.length || 0}</div></div>
-                <div style={statBox}><div style={statLabel}>Gate States</div><div style={statValue}>{tasData.port8.adminGateStates ?? '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Cycle</div><div style={statValue}>{tasData.tasPort.cycleTimeNs ? `${(tasData.tasPort.cycleTimeNs / 1000).toFixed(0)} μs` : '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Slots</div><div style={statValue}>{tasData.tasPort.adminControlList?.length || 0}</div></div>
+                <div style={statBox}><div style={statLabel}>Gate States</div><div style={statValue}>{tasData.tasPort.adminGateStates ?? '-'}</div></div>
               </div>
-              {tasData.port8.gateEnabled && tasData.port8.adminControlList?.length > 0 && renderGCLTimeline(tasData.port8.adminControlList, tasData.port8.cycleTimeNs)}
+              {tasData.tasPort.gateEnabled && tasData.tasPort.adminControlList?.length > 0 && renderGCLTimeline(tasData.tasPort.adminControlList, tasData.tasPort.cycleTimeNs)}
             </div>
           ) : (
             <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight, fontSize: '0.8rem' }}>
-              {tasData.port8?.error || 'Loading...'}
+              {tasData.tasPort?.error || 'Loading...'}
             </div>
           )}
         </div>
