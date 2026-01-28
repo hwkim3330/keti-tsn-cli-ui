@@ -274,13 +274,39 @@ function TASDashboard() {
 
   // Handle captured packet
   const handleCapturedPacket = useCallback((packet) => {
-    // Count all IP packets (switch may strip VLAN tags)
-    // Use packet length or other characteristics to identify test traffic
-    if (packet.protocol === 'PTP') return  // Skip PTP packets
+    // Skip PTP packets
+    if (packet.protocol === 'PTP') return
+    // Skip non-test traffic (only count packets with our test characteristics)
+    // Test packets have specific length pattern: ~100 bytes
+    if (packet.length < 60 || packet.length > 200) return
 
-    const pcp = packet.vlan?.pcp || 0
-    setCapturedPackets(prev => [...prev, { time: Date.now(), pcp, length: packet.length, vid: packet.vlan?.vid }].slice(-500))
+    const pcp = packet.vlan?.pcp ?? 0  // Default to TC0 if no VLAN tag
+    const vid = packet.vlan?.vid ?? 0
+
+    setCapturedPackets(prev => [...prev, {
+      time: Date.now(),
+      pcp,
+      length: packet.length,
+      vid,
+      src: packet.source,
+      dst: packet.destination
+    }].slice(-1000))
+
     setCapturedCounts(prev => ({ ...prev, [pcp]: (prev[pcp] || 0) + 1 }))
+  }, [])
+
+  // Poll traffic status for real-time sent counts
+  const pollTrafficStatus = useCallback(async () => {
+    try {
+      const res = await axios.get(`${TRAFFIC_API}/api/traffic/status`)
+      if (res.data.sent) {
+        setSentCounts(res.data.sent)
+        setTrafficStats(prev => ({ ...prev, total: res.data.total || 0 }))
+      }
+      if (!res.data.running) {
+        setTrafficRunning(false)
+      }
+    } catch {}
   }, [])
 
   // Start test (traffic + capture)
@@ -305,8 +331,6 @@ function TASDashboard() {
 
     // Start traffic generator (all TCs in round-robin)
     setTrafficRunning(true)
-    const totalPackets = packetsPerSecond * duration
-    const packetsPerTC = Math.floor(totalPackets / selectedTCs.length)
 
     try {
       await axios.post(`${TRAFFIC_API}/api/traffic/start`, {
@@ -318,16 +342,15 @@ function TASDashboard() {
         packetsPerSecond: packetsPerSecond,
         duration: duration
       })
-      // Set expected sent count per TC
-      selectedTCs.forEach(tc => setSentCounts(prev => ({ ...prev, [tc]: packetsPerTC })))
     } catch (err) {
       console.error('Failed to start traffic:', err)
+      setTrafficRunning(false)
     }
 
-    // Auto stop after duration + 1s buffer
+    // Auto stop after duration + 2s buffer
     setTimeout(() => {
       stopTest()
-    }, (duration + 1) * 1000)
+    }, (duration + 2) * 1000)
   }
 
   // Stop test
@@ -346,13 +369,18 @@ function TASDashboard() {
     } catch {}
   }
 
-  // Update time series data periodically
+  // Update time series data and poll traffic status periodically
   useEffect(() => {
     if (!trafficRunning && !capturing) return
 
     const interval = setInterval(() => {
       const now = Date.now()
       const elapsed = startTimeRef.current ? Math.floor((now - startTimeRef.current) / 1000) : 0
+
+      // Poll traffic server for real-time sent counts
+      if (trafficRunning) {
+        pollTrafficStatus()
+      }
 
       setTimeSeriesData(prev => {
         const newEntry = { time: elapsed, second: `${elapsed}s` }
@@ -362,10 +390,10 @@ function TASDashboard() {
         }
         return [...prev, newEntry].slice(-60)
       })
-    }, 1000)
+    }, 500) // Poll every 500ms for smoother updates
 
     return () => clearInterval(interval)
-  }, [trafficRunning, capturing, sentCounts, capturedCounts])
+  }, [trafficRunning, capturing, sentCounts, capturedCounts, pollTrafficStatus])
 
   // Clear all
   const clearAll = () => {
@@ -563,6 +591,24 @@ function TASDashboard() {
             <button className="btn btn-secondary" onClick={clearAll} disabled={trafficRunning}>Clear</button>
           </div>
 
+          {/* Progress Bar */}
+          {(trafficRunning || capturing) && (
+            <div style={{ marginTop: '12px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
+                <span>{trafficRunning ? 'Sending...' : 'Capturing...'}</span>
+                <span>{startTimeRef.current ? `${Math.floor((Date.now() - startTimeRef.current) / 1000)}s / ${duration}s` : ''}</span>
+              </div>
+              <div style={{ height: '4px', background: colors.bgAlt, borderRadius: '2px', overflow: 'hidden' }}>
+                <div style={{
+                  width: `${startTimeRef.current ? Math.min(100, ((Date.now() - startTimeRef.current) / (duration * 1000)) * 100) : 0}%`,
+                  height: '100%',
+                  background: trafficRunning ? colors.success : colors.accent,
+                  transition: 'width 0.5s'
+                }} />
+              </div>
+            </div>
+          )}
+
           {/* Status */}
           <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
             <div style={{ ...statBox, flex: 1, background: trafficRunning ? '#ecfdf5' : colors.bg }}>
@@ -658,6 +704,57 @@ function TASDashboard() {
           <div style={{ marginTop: '10px', padding: '10px', background: colors.bgAlt, borderRadius: '6px', fontSize: '0.7rem', color: colors.textMuted }}>
             <b>TAS 동작 원리:</b> 각 TC 패킷은 GCL에 정의된 시간 슬롯에서만 전송됨.
             TC{selectedTCs.join(', TC')}가 선택되었으며, TAS가 활성화되면 각 TC는 할당된 125μs 슬롯에서만 통과.
+          </div>
+        </div>
+      )}
+
+      {/* Recent Captured Packets */}
+      {capturedPackets.length > 0 && (
+        <div className="card" style={{ marginBottom: '16px' }}>
+          <div className="card-header">
+            <h2 className="card-title">Recent Captured Packets</h2>
+            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
+          </div>
+          <div style={{ maxHeight: '200px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead style={{ position: 'sticky', top: 0, background: colors.bg }}>
+                <tr style={{ borderBottom: `1px solid ${colors.border}` }}>
+                  <th style={{ padding: '4px 8px', textAlign: 'left', width: '80px' }}>Time</th>
+                  <th style={{ padding: '4px 8px', textAlign: 'center', width: '50px' }}>PCP</th>
+                  <th style={{ padding: '4px 8px', textAlign: 'center', width: '60px' }}>VID</th>
+                  <th style={{ padding: '4px 8px', textAlign: 'right', width: '60px' }}>Length</th>
+                  <th style={{ padding: '4px 8px', textAlign: 'left' }}>Source</th>
+                  <th style={{ padding: '4px 8px', textAlign: 'left' }}>Destination</th>
+                </tr>
+              </thead>
+              <tbody>
+                {capturedPackets.slice(-50).reverse().map((pkt, idx) => (
+                  <tr key={idx} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>
+                      {new Date(pkt.time).toLocaleTimeString()}
+                    </td>
+                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
+                      <span style={{
+                        display: 'inline-block',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        background: tcColors[pkt.pcp] || colors.bgAlt,
+                        color: pkt.pcp > 0 ? '#fff' : colors.text,
+                        fontWeight: '600'
+                      }}>
+                        {pkt.pcp}
+                      </span>
+                    </td>
+                    <td style={{ padding: '4px 8px', textAlign: 'center', color: pkt.vid ? colors.text : colors.textLight }}>
+                      {pkt.vid || '-'}
+                    </td>
+                    <td style={{ padding: '4px 8px', textAlign: 'right' }}>{pkt.length}</td>
+                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>{pkt.src || '-'}</td>
+                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>{pkt.dst || '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
