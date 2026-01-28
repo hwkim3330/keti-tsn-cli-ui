@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
 
@@ -305,6 +305,41 @@ function TASDashboard() {
   txPackets.forEach(p => { if (p.hasVlan) txByTc[p.pcp] = (txByTc[p.pcp] || 0) + 1 })
   rxPackets.forEach(p => { if (p.hasVlan) rxByTc[p.pcp] = (rxByTc[p.pcp] || 0) + 1 })
 
+  // GCL Analysis - analyze RX packets to estimate gate schedule
+  const cycleTimeMs = tasData.cycleTimeNs ? tasData.cycleTimeNs / 1000000 : 700
+  const numSlots = tasData.adminControlList?.length || 7
+  const slotTimeMs = cycleTimeMs / numSlots
+
+  // Calculate slot distribution for each TC
+  const gclAnalysis = useMemo(() => {
+    if (rxPackets.length < 2) return null
+    const firstTime = rxPackets[0]?.time || 0
+    const slotHits = {}  // slotHits[slot][tc] = count
+
+    for (let i = 0; i < numSlots; i++) {
+      slotHits[i] = {}
+      for (let tc = 0; tc < 8; tc++) slotHits[i][tc] = 0
+    }
+
+    rxPackets.forEach(p => {
+      if (!p.hasVlan) return
+      const relTime = p.time - firstTime
+      const cyclePos = relTime % cycleTimeMs
+      const slot = Math.floor(cyclePos / slotTimeMs) % numSlots
+      slotHits[slot][p.pcp]++
+    })
+
+    // Find max for normalization
+    let maxHits = 1
+    for (let i = 0; i < numSlots; i++) {
+      for (let tc = 0; tc < 8; tc++) {
+        if (slotHits[i][tc] > maxHits) maxHits = slotHits[i][tc]
+      }
+    }
+
+    return { slotHits, maxHits }
+  }, [rxPackets, cycleTimeMs, numSlots, slotTimeMs])
+
   const cellStyle = { padding: '6px 10px', borderBottom: `1px solid ${colors.border}`, fontSize: '0.75rem' }
   const headerStyle = { ...cellStyle, fontWeight: '600', background: colors.bgAlt }
 
@@ -567,6 +602,101 @@ function TASDashboard() {
                     </div>
                   )
                 })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GCL Analysis - Estimated Gate Schedule from RX */}
+      {gclAnalysis && rxPackets.length > 10 && (
+        <div className="card" style={{ marginBottom: '16px' }}>
+          <div className="card-header">
+            <h2 className="card-title">GCL Analysis (Estimated)</h2>
+            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+              Cycle: {cycleTimeMs.toFixed(0)}ms | Slot: {slotTimeMs.toFixed(1)}ms | {rxPackets.length} RX packets
+            </span>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* Estimated GCL Heatmap */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
+                Slot별 TC 통과량 (히트맵)
+              </div>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.6rem', fontFamily: 'monospace' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ ...cellStyle, width: '40px', textAlign: 'center', background: colors.bgAlt }}>Slot</th>
+                      {[0,1,2,3,4,5,6,7].map(tc => (
+                        <th key={tc} style={{ ...cellStyle, width: '35px', textAlign: 'center', background: tcColors[tc], color: '#fff', padding: '4px' }}>
+                          {tc}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Array.from({ length: numSlots }, (_, slot) => (
+                      <tr key={slot}>
+                        <td style={{ ...cellStyle, textAlign: 'center', fontWeight: '600', padding: '4px' }}>#{slot}</td>
+                        {[0,1,2,3,4,5,6,7].map(tc => {
+                          const hits = gclAnalysis.slotHits[slot]?.[tc] || 0
+                          const intensity = hits / gclAnalysis.maxHits
+                          const isOpen = tasData.adminControlList?.[slot] ? ((tasData.adminControlList[slot].gateStates >> tc) & 1) : 1
+                          return (
+                            <td key={tc} style={{
+                              ...cellStyle,
+                              textAlign: 'center',
+                              padding: '4px',
+                              background: hits > 0
+                                ? `rgba(${isOpen ? '34,197,94' : '239,68,68'}, ${0.2 + intensity * 0.8})`
+                                : (isOpen ? '#f0fdf4' : '#fef2f2'),
+                              fontWeight: hits > 0 ? '600' : '400',
+                              color: hits > 0 ? '#000' : colors.textLight
+                            }}>
+                              {hits > 0 ? hits : '-'}
+                            </td>
+                          )
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Config vs Actual Comparison */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
+                설정 vs 실측 비교
+              </div>
+              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                {[1,2,3,4,5,6,7].map(tc => {
+                  const configSlot = tasData.adminControlList?.findIndex(e => ((e.gateStates >> tc) & 1) && !((e.gateStates >> (tc-1 || 0)) & 1 && tc > 1))
+                  const actualSlots = Object.entries(gclAnalysis.slotHits)
+                    .filter(([_, tcs]) => tcs[tc] > 0)
+                    .map(([slot]) => parseInt(slot))
+                  const mainSlot = actualSlots.reduce((max, slot) =>
+                    (gclAnalysis.slotHits[slot][tc] > (gclAnalysis.slotHits[max]?.[tc] || 0)) ? slot : max, actualSlots[0])
+
+                  return (
+                    <div key={tc} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', fontSize: '0.6rem' }}>
+                      <span style={{ padding: '2px 6px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', minWidth: '30px', textAlign: 'center' }}>
+                        TC{tc}
+                      </span>
+                      <span style={{ color: colors.textMuted }}>설정:</span>
+                      <span style={{ fontWeight: '600' }}>#{tc-1}</span>
+                      <span style={{ color: colors.textMuted }}>→ 실측:</span>
+                      <span style={{ fontWeight: '600', color: mainSlot === tc-1 ? colors.success : colors.warning }}>
+                        {mainSlot !== undefined ? `#${mainSlot}` : '-'}
+                      </span>
+                      <span style={{ color: mainSlot === tc-1 ? colors.success : colors.warning }}>
+                        {mainSlot === tc-1 ? '✓' : '≠'}
+                      </span>
+                    </div>
+                  )
+                })}
               </div>
             </div>
           </div>

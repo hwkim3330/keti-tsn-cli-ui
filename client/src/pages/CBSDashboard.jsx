@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
 
@@ -277,6 +277,66 @@ function CBSDashboard() {
   const shaperByTc = {}
   cbsData.shapers?.forEach(s => { shaperByTc[s.tc] = s.idleSlope })
 
+  // CBS Credit Analysis - estimate credit state from packet timing
+  const cbsAnalysis = useMemo(() => {
+    if (rxPackets.length < 10) return null
+
+    const LINK_SPEED_KBPS = 1000000  // 1 Gbps
+    const PACKET_SIZE_BITS = 60 * 8  // 60 bytes * 8 bits
+
+    const tcStats = {}
+    for (let tc = 0; tc < 8; tc++) {
+      const tcPackets = rxPackets.filter(p => p.hasVlan && p.pcp === tc).sort((a, b) => a.time - b.time)
+      if (tcPackets.length < 2) continue
+
+      const idleSlope = shaperByTc[tc] || 0
+      const sendSlope = idleSlope > 0 ? (idleSlope - LINK_SPEED_KBPS) : 0
+
+      // Calculate inter-arrival times and throughput
+      const intervals = []
+      for (let i = 1; i < tcPackets.length; i++) {
+        intervals.push(tcPackets[i].time - tcPackets[i-1].time)
+      }
+
+      const totalTime = (tcPackets[tcPackets.length-1].time - tcPackets[0].time) / 1000  // seconds
+      const totalBits = tcPackets.length * PACKET_SIZE_BITS
+      const actualThroughput = totalTime > 0 ? (totalBits / totalTime / 1000) : 0  // kbps
+
+      // Simulate credit changes
+      const creditHistory = []
+      let credit = 0
+      let lastTime = tcPackets[0]?.time || 0
+
+      tcPackets.forEach((p, i) => {
+        const dt = (p.time - lastTime) / 1000  // seconds
+        if (idleSlope > 0 && dt > 0) {
+          // Credit increases during idle time
+          credit += idleSlope * dt
+          credit = Math.min(credit, idleSlope * 0.01)  // hi-credit limit
+        }
+        // Credit decreases when sending
+        if (sendSlope < 0) {
+          const sendTime = PACKET_SIZE_BITS / LINK_SPEED_KBPS  // seconds
+          credit += sendSlope * sendTime
+          credit = Math.max(credit, sendSlope * 0.01)  // lo-credit limit
+        }
+        creditHistory.push({ time: p.time, credit })
+        lastTime = p.time
+      })
+
+      tcStats[tc] = {
+        count: tcPackets.length,
+        avgInterval: intervals.length > 0 ? intervals.reduce((a,b) => a+b, 0) / intervals.length : 0,
+        throughput: actualThroughput,
+        idleSlope,
+        utilization: idleSlope > 0 ? (actualThroughput / idleSlope * 100) : 0,
+        creditHistory
+      }
+    }
+
+    return tcStats
+  }, [rxPackets, shaperByTc])
+
   return (
     <div>
       <div className="page-header">
@@ -537,6 +597,121 @@ function CBSDashboard() {
                     </div>
                   )
                 })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CBS Credit Analysis */}
+      {cbsAnalysis && Object.keys(cbsAnalysis).length > 0 && (
+        <div className="card" style={{ marginBottom: '16px' }}>
+          <div className="card-header">
+            <h2 className="card-title">CBS Analysis (Estimated)</h2>
+            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+              Credit-Based Shaper 분석 | {rxPackets.length} RX packets
+            </span>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* Throughput Analysis */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
+                TC별 Throughput (설정 vs 실측)
+              </div>
+              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                {[0,1,2,3,4,5,6,7].map(tc => {
+                  const stats = cbsAnalysis[tc]
+                  if (!stats) return null
+                  const idleSlope = shaperByTc[tc] || 0
+                  const barWidth = idleSlope > 0 ? Math.min(100, stats.utilization) : (stats.throughput > 0 ? 100 : 0)
+
+                  return (
+                    <div key={tc} style={{ marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' }}>
+                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', fontSize: '0.55rem', minWidth: '28px', textAlign: 'center' }}>
+                          TC{tc}
+                        </span>
+                        <span style={{ fontSize: '0.55rem', color: colors.textMuted }}>
+                          {idleSlope > 0 ? `${(idleSlope/1000).toFixed(0)}M 설정` : 'CBS 없음'}
+                        </span>
+                        <span style={{ fontSize: '0.55rem', fontWeight: '600' }}>
+                          → {(stats.throughput/1000).toFixed(1)} Mbps
+                        </span>
+                        {idleSlope > 0 && (
+                          <span style={{ fontSize: '0.55rem', color: stats.utilization > 100 ? colors.error : colors.success }}>
+                            ({stats.utilization.toFixed(0)}%)
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ height: '4px', background: '#e2e8f0', borderRadius: '2px', overflow: 'hidden' }}>
+                        <div style={{
+                          width: `${barWidth}%`,
+                          height: '100%',
+                          background: idleSlope > 0
+                            ? (stats.utilization > 100 ? colors.error : colors.success)
+                            : tcColors[tc],
+                          transition: 'width 0.3s'
+                        }} />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* Credit Simulation */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
+                Credit 상태 (시뮬레이션)
+              </div>
+              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                {[0,1,2,3,4,5,6,7].map(tc => {
+                  const stats = cbsAnalysis[tc]
+                  if (!stats || !shaperByTc[tc]) return null
+
+                  const history = stats.creditHistory || []
+                  const lastCredit = history[history.length - 1]?.credit || 0
+                  const maxCredit = shaperByTc[tc] * 0.01
+                  const minCredit = (shaperByTc[tc] - 1000000) * 0.01
+                  const creditRange = maxCredit - minCredit
+                  const creditPercent = creditRange > 0 ? ((lastCredit - minCredit) / creditRange * 100) : 50
+
+                  return (
+                    <div key={tc} style={{ marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' }}>
+                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', fontSize: '0.55rem', minWidth: '28px', textAlign: 'center' }}>
+                          TC{tc}
+                        </span>
+                        <span style={{ fontSize: '0.55rem', color: colors.textMuted }}>
+                          Credit:
+                        </span>
+                        <span style={{ fontSize: '0.55rem', fontWeight: '600', color: lastCredit >= 0 ? colors.success : colors.error }}>
+                          {lastCredit >= 0 ? '+' : ''}{lastCredit.toFixed(2)}
+                        </span>
+                        <span style={{ fontSize: '0.5rem', color: colors.textMuted }}>
+                          ({stats.count} pkts, {stats.avgInterval.toFixed(1)}ms avg)
+                        </span>
+                      </div>
+                      <div style={{ height: '8px', background: '#fef2f2', borderRadius: '4px', overflow: 'hidden', position: 'relative' }}>
+                        <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: '1px', background: '#666' }} />
+                        <div style={{
+                          position: 'absolute',
+                          left: lastCredit >= 0 ? '50%' : `${creditPercent}%`,
+                          width: lastCredit >= 0 ? `${Math.min(50, creditPercent - 50)}%` : `${50 - creditPercent}%`,
+                          height: '100%',
+                          background: lastCredit >= 0 ? colors.success : colors.error,
+                          transition: 'all 0.3s'
+                        }} />
+                      </div>
+                    </div>
+                  )
+                })}
+                {Object.keys(cbsAnalysis).filter(tc => shaperByTc[tc]).length === 0 && (
+                  <div style={{ fontSize: '0.6rem', color: colors.textMuted, textAlign: 'center', padding: '10px' }}>
+                    CBS가 설정된 TC가 없습니다. Auto Setup으로 설정하세요.
+                  </div>
+                )}
               </div>
             </div>
           </div>
