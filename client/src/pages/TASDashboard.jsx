@@ -39,7 +39,7 @@ function TASDashboard() {
 
   const [trafficInterface, setTrafficInterface] = useState(null)
   const [trafficRunning, setTrafficRunning] = useState(false)
-  const [selectedTCs, setSelectedTCs] = useState([0, 1, 2, 3, 4, 5, 6, 7])
+  const [selectedTCs, setSelectedTCs] = useState([0, 1, 2, 3, 4, 5, 6, 7])  // TC0 included (CBS 설정 필요)
   const [vlanId, setVlanId] = useState(100)
   const [packetsPerSecond, setPacketsPerSecond] = useState(100)
   const [duration, setDuration] = useState(7)
@@ -72,7 +72,15 @@ function TASDashboard() {
       }, { timeout: 15000 })
 
       const yaml = res.data?.result || ''
-      const status = { gateEnabled: false, adminGateStates: 255, cycleTimeNs: 0, adminControlList: [], online: true }
+      const status = {
+        gateEnabled: false,
+        adminGateStates: 255,
+        cycleTimeNs: 0,
+        cycleTimeExtensionNs: 0,  // Guard band
+        tickGranularity: 0,
+        adminControlList: [],
+        online: true
+      }
 
       status.gateEnabled = /gate-enabled:\s*true/.test(yaml)
 
@@ -81,6 +89,14 @@ function TASDashboard() {
 
       const cycleMatch = yaml.match(/admin-cycle-time:[\s\S]*?numerator:\s*(\d+)/)
       if (cycleMatch) status.cycleTimeNs = parseInt(cycleMatch[1])
+
+      // Parse cycle-time-extension (guard band)
+      const extMatch = yaml.match(/admin-cycle-time-extension:\s*(\d+)/)
+      if (extMatch) status.cycleTimeExtensionNs = parseInt(extMatch[1])
+
+      // Parse tick-granularity
+      const tickMatch = yaml.match(/tick-granularity:\s*(\d+)/)
+      if (tickMatch) status.tickGranularity = parseInt(tickMatch[1])
 
       const adminListMatch = yaml.match(/admin-control-list:[\s\S]*?gate-control-entry:([\s\S]*?)(?=oper-|$)/)
       if (adminListMatch) {
@@ -168,7 +184,15 @@ function TASDashboard() {
         }, { timeout: 15000 })
 
         const yaml = res.data?.result || ''
-        const status = { gateEnabled: false, adminGateStates: 255, cycleTimeNs: 0, adminControlList: [], online: true }
+        const status = {
+          gateEnabled: false,
+          adminGateStates: 255,
+          cycleTimeNs: 0,
+          cycleTimeExtensionNs: 0,
+          tickGranularity: 0,
+          adminControlList: [],
+          online: true
+        }
 
         // Parse gate-enabled
         status.gateEnabled = /gate-enabled:\s*true/.test(yaml)
@@ -180,6 +204,14 @@ function TASDashboard() {
         // Parse admin-cycle-time numerator
         const cycleMatch = yaml.match(/admin-cycle-time:[\s\S]*?numerator:\s*(\d+)/)
         if (cycleMatch) status.cycleTimeNs = parseInt(cycleMatch[1])
+
+        // Parse cycle-time-extension (guard band)
+        const extMatch = yaml.match(/admin-cycle-time-extension:\s*(\d+)/)
+        if (extMatch) status.cycleTimeExtensionNs = parseInt(extMatch[1])
+
+        // Parse tick-granularity
+        const tickMatch = yaml.match(/tick-granularity:\s*(\d+)/)
+        if (tickMatch) status.tickGranularity = parseInt(tickMatch[1])
 
         // Parse admin-control-list entries
         const adminListMatch = yaml.match(/admin-control-list:[\s\S]*?gate-control-entry:([\s\S]*?)(?=oper-|$)/)
@@ -245,8 +277,20 @@ function TASDashboard() {
     if (isRx && !hasVlan) return
 
     if (isTx || isRx) {
+      // Use high-resolution capture timestamp if available (nanoseconds)
+      // Convert to milliseconds for consistency with Date.now()
+      let captureTimeMs = Date.now()
+      try {
+        if (packet.captureNs) {
+          captureTimeMs = Number(BigInt(packet.captureNs) / 1000000n)
+        }
+      } catch {
+        // Fallback to Date.now() if BigInt conversion fails
+      }
+
       setCapturedPackets(prev => [...prev, {
-        time: Date.now(),
+        time: captureTimeMs,
+        timeNs: packet.captureNs,  // Keep original nanosecond precision
         pcp,
         length: packet.length,
         vid,
@@ -273,16 +317,17 @@ function TASDashboard() {
 
     setTrafficRunning(true)
     try {
-      await axios.post(`${TRAFFIC_API}/api/traffic/start`, {
+      // Use precision C sender for accurate timing
+      await axios.post(`${TRAFFIC_API}/api/traffic/start-precision`, {
         interface: trafficInterface,
         dstMac: BOARD2_PORT8_MAC,  // Board 2로 전송 (Board 1 Port 8 egress에서 TAS 적용)
         vlanId,
         tcList: selectedTCs,
-        packetSize: 100,
         packetsPerSecond,
         duration
       })
-    } catch {
+    } catch (err) {
+      console.error('Failed to start precision traffic:', err)
       setTrafficRunning(false)
     }
 
@@ -291,7 +336,7 @@ function TASDashboard() {
 
   const stopTest = async () => {
     setTrafficRunning(false)
-    try { await axios.post(`${TRAFFIC_API}/api/traffic/stop`, { interface: trafficInterface }) } catch {}
+    try { await axios.post(`${TRAFFIC_API}/api/traffic/stop-precision`, {}) } catch {}
     try { await axios.post('/api/capture/stop', {}); setCapturing(false) } catch {}
   }
 
@@ -307,26 +352,155 @@ function TASDashboard() {
 
   // GCL Analysis - analyze RX packets to estimate gate schedule
   const cycleTimeMs = tasData.cycleTimeNs ? tasData.cycleTimeNs / 1000000 : 700
+  const guardBandMs = tasData.cycleTimeExtensionNs ? tasData.cycleTimeExtensionNs / 1000000 : 0
   const numSlots = tasData.adminControlList?.length || 7
-  const slotTimeMs = cycleTimeMs / numSlots
 
-  // Calculate slot distribution for each TC
+  // Calculate actual slot times and start positions from config
+  const slotTimes = useMemo(() => {
+    const slots = []
+    let startMs = 0
+    if (tasData.adminControlList?.length > 0) {
+      tasData.adminControlList.forEach((entry, idx) => {
+        const durationMs = entry.timeInterval / 1000000  // ns to ms
+        slots.push({
+          index: idx,
+          startMs,
+          endMs: startMs + durationMs,
+          durationMs,
+          gateStates: entry.gateStates
+        })
+        startMs += durationMs
+      })
+      // TC7 (last slot) gets guard band extra time
+      if (slots.length > 0) {
+        slots[slots.length - 1].endMs += guardBandMs
+        slots[slots.length - 1].durationMs += guardBandMs
+        slots[slots.length - 1].hasGuardBand = true
+      }
+    } else {
+      // Default: equal slots
+      const defaultSlotMs = cycleTimeMs / 7
+      for (let i = 0; i < 7; i++) {
+        slots.push({
+          index: i,
+          startMs: i * defaultSlotMs,
+          endMs: (i + 1) * defaultSlotMs + (i === 6 ? guardBandMs : 0),
+          durationMs: defaultSlotMs + (i === 6 ? guardBandMs : 0),
+          gateStates: (1 << (i + 1)) | 1,  // TC0 + TCx
+          hasGuardBand: i === 6
+        })
+      }
+    }
+    return slots
+  }, [tasData.adminControlList, cycleTimeMs, guardBandMs])
+
+  const slotTimeMs = cycleTimeMs / numSlots  // Average for backward compat
+
+  // Calculate slot distribution for each TC with auto offset correction
   const gclAnalysis = useMemo(() => {
-    if (rxPackets.length < 2) return null
-    const firstTime = rxPackets[0]?.time || 0
-    const slotHits = {}  // slotHits[slot][tc] = count
+    if (rxPackets.length < 5) return null
+    // Include TC0-7 (TC0 is always open, TC7 has slack time after last slot)
+    const vlanPackets = rxPackets.filter(p => p.hasVlan && p.pcp >= 0 && p.pcp <= 7)
+    if (vlanPackets.length < 5) return null
 
+    const firstTime = vlanPackets[0]?.time || 0
+
+    // Try different offsets to find best alignment with expected GCL
+    // Expected: TC1 in slot0, TC2 in slot1, ..., TC7 in slot6
+    // TC0 is always open (no expected slot)
+    // TC7 has slack time - can overflow to slot0 of next cycle
+    let bestOffset = 0
+    let bestScore = 0
+    const searchStep = Math.max(1, slotTimeMs / 20)  // 5ms for 100ms slots
+
+    // Helper function for slot calculation using actual slot boundaries
+    const getSlot = (relTime) => {
+      const cyclePos = ((relTime % cycleTimeMs) + cycleTimeMs) % cycleTimeMs
+      // Use actual slot boundaries from config
+      for (let i = 0; i < slotTimes.length; i++) {
+        if (cyclePos >= slotTimes[i].startMs && cyclePos < slotTimes[i].endMs) {
+          return i
+        }
+      }
+      return Math.max(0, slotTimes.length - 1)  // Default to last slot
+    }
+
+    // Score function considering TC0 (always open) and TC7 (slack time)
+    const calcScore = (offsetMs) => {
+      let score = 0
+      let penalty = 0
+      vlanPackets.forEach(p => {
+        const relTime = p.time - firstTime + offsetMs
+        const slot = getSlot(relTime)
+
+        if (p.pcp === 0) {
+          // TC0 is always open - any slot is valid, small bonus
+          score += 0.5
+        } else {
+          const expectedSlot = p.pcp - 1
+          if (slot === expectedSlot) {
+            score += 2  // Correct slot: +2
+          } else if (p.pcp === 7 && slot === 0) {
+            // TC7 slack: slot0 (next cycle start) is acceptable
+            score += 1  // Partial credit for TC7 overflow
+          } else {
+            // Wrong slot: penalty based on distance
+            const dist = Math.min(Math.abs(slot - expectedSlot), numSlots - Math.abs(slot - expectedSlot))
+            penalty += dist * 0.5
+          }
+        }
+      })
+      return score - penalty
+    }
+
+    for (let offsetMs = 0; offsetMs < cycleTimeMs; offsetMs += searchStep) {
+      const netScore = calcScore(offsetMs)
+      if (netScore > bestScore) {
+        bestScore = netScore
+        bestOffset = offsetMs
+      }
+    }
+
+    // Fine-tune offset with 1ms precision around best offset
+    const fineStart = Math.max(0, bestOffset - searchStep)
+    const fineEnd = Math.min(cycleTimeMs - 1, bestOffset + searchStep)
+    for (let offsetMs = fineStart; offsetMs <= fineEnd; offsetMs += 1) {
+      const netScore = calcScore(offsetMs)
+      if (netScore > bestScore) {
+        bestScore = netScore
+        bestOffset = offsetMs
+      }
+    }
+
+    // Calculate slot hits with best offset
+    const slotHits = {}
     for (let i = 0; i < numSlots; i++) {
       slotHits[i] = {}
       for (let tc = 0; tc < 8; tc++) slotHits[i][tc] = 0
     }
 
-    rxPackets.forEach(p => {
-      if (!p.hasVlan) return
-      const relTime = p.time - firstTime
-      const cyclePos = relTime % cycleTimeMs
-      const slot = Math.floor(cyclePos / slotTimeMs) % numSlots
-      slotHits[slot][p.pcp]++
+    // Also track per-cycle data for analysis
+    const cycleData = []
+    let lastCycle = -1
+
+    vlanPackets.forEach(p => {
+      const relTime = p.time - firstTime + bestOffset
+      const slot = getSlot(relTime)
+      const cyclePos = ((relTime % cycleTimeMs) + cycleTimeMs) % cycleTimeMs
+      const cycleNum = Math.floor(relTime / cycleTimeMs)
+
+      if (slotHits[slot]) {
+        slotHits[slot][p.pcp] = (slotHits[slot][p.pcp] || 0) + 1
+      }
+
+      // Track cycle data
+      if (cycleNum !== lastCycle) {
+        cycleData.push({ cycle: cycleNum, packets: [] })
+        lastCycle = cycleNum
+      }
+      if (cycleData.length > 0) {
+        cycleData[cycleData.length - 1].packets.push({ tc: p.pcp, slot, cyclePos })
+      }
     })
 
     // Find max for normalization
@@ -337,8 +511,81 @@ function TASDashboard() {
       }
     }
 
-    return { slotHits, maxHits }
-  }, [rxPackets, cycleTimeMs, numSlots, slotTimeMs])
+    // Calculate accuracy - TC0 excluded (always open), TC7 allows slot0 overflow
+    let correctCount = 0
+    let nearCorrectCount = 0  // ±1 slot
+    let totalCount = 0
+    let tc0Count = 0  // TC0 is always open, track separately
+    for (let i = 0; i < numSlots; i++) {
+      // TC0: always open, count all hits
+      tc0Count += slotHits[i][0] || 0
+
+      // TC1-7: check expected slots
+      for (let tc = 1; tc <= 7; tc++) {
+        const hits = slotHits[i][tc] || 0
+        totalCount += hits
+        const expectedSlot = tc - 1
+
+        if (i === expectedSlot) {
+          correctCount += hits
+        } else if (tc === 7 && i === 0) {
+          // TC7 slack: slot0 (next cycle) counts as correct
+          correctCount += hits
+        } else if (Math.abs(i - expectedSlot) === 1 || Math.abs(i - expectedSlot) === numSlots - 1) {
+          nearCorrectCount += hits
+        }
+      }
+    }
+    const accuracy = totalCount > 0 ? (correctCount / totalCount * 100) : 0
+    const nearAccuracy = totalCount > 0 ? ((correctCount + nearCorrectCount) / totalCount * 100) : 0
+
+    // Calculate jitter from expected slot position using actual slot times
+    const slotJitters = {}
+    // TC0: jitter not meaningful (always open)
+    slotJitters[0] = null
+
+    for (let tc = 1; tc <= 7; tc++) {
+      const expectedSlot = tc - 1
+      // Use actual slot start time from config
+      const expectedStartMs = slotTimes[expectedSlot]?.startMs ?? (expectedSlot * slotTimeMs)
+      const expectedEndMs = slotTimes[expectedSlot]?.endMs ?? ((expectedSlot + 1) * slotTimeMs)
+      const tcPackets = vlanPackets.filter(p => p.pcp === tc)
+      if (tcPackets.length > 0) {
+        const deviations = tcPackets.map(p => {
+          const relTime = p.time - firstTime + bestOffset
+          let cyclePos = ((relTime % cycleTimeMs) + cycleTimeMs) % cycleTimeMs
+
+          // TC7: if in slot0 area, consider it as end of cycle (guard band overflow)
+          if (tc === 7 && cyclePos < slotTimes[0]?.endMs) {
+            cyclePos += cycleTimeMs  // Treat as overflow
+          }
+
+          // Distance from expected slot start (0 if within slot)
+          if (cyclePos >= expectedStartMs && cyclePos < expectedEndMs) {
+            return 0  // Within expected slot - no deviation
+          }
+          return Math.min(
+            Math.abs(cyclePos - expectedStartMs),
+            Math.abs(cyclePos - expectedEndMs)
+          )
+        })
+        const avgDev = deviations.reduce((a, b) => a + b, 0) / deviations.length
+        slotJitters[tc] = avgDev
+      }
+    }
+
+    return {
+      slotHits,
+      maxHits,
+      bestOffset,
+      accuracy,
+      nearAccuracy,
+      totalPackets: vlanPackets.length,
+      tc0Count,  // TC0는 항상 열림
+      cycleCount: cycleData.length,
+      slotJitters
+    }
+  }, [rxPackets, cycleTimeMs, numSlots, slotTimeMs, slotTimes])
 
   const cellStyle = { padding: '6px 10px', borderBottom: `1px solid ${colors.border}`, fontSize: '0.75rem' }
   const headerStyle = { ...cellStyle, fontWeight: '600', background: colors.bgAlt }
@@ -423,13 +670,16 @@ function TASDashboard() {
           </div>
 
           {/* Cycle Info */}
-          <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted }}>
+          <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted, flexWrap: 'wrap' }}>
             <span>Cycle: {tasData.cycleTimeNs
               ? (tasData.cycleTimeNs >= 1000000
                   ? `${(tasData.cycleTimeNs / 1000000).toFixed(0)}ms`
                   : `${(tasData.cycleTimeNs / 1000).toFixed(0)}μs`)
               : '-'}</span>
             <span>Entries: {tasData.adminControlList?.length || 0}</span>
+            {tasData.cycleTimeExtensionNs > 0 && (
+              <span style={{ color: colors.accent }}>Guard Band: {tasData.cycleTimeExtensionNs}ns</span>
+            )}
             <span>TC0: Always Open</span>
           </div>
         </div>
@@ -613,9 +863,33 @@ function TASDashboard() {
         <div className="card" style={{ marginBottom: '16px' }}>
           <div className="card-header">
             <h2 className="card-title">GCL Analysis (Estimated)</h2>
-            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
-              Cycle: {cycleTimeMs.toFixed(0)}ms | Slot: {slotTimeMs.toFixed(1)}ms | {rxPackets.length} RX packets
-            </span>
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{
+                fontSize: '0.7rem',
+                padding: '2px 8px',
+                borderRadius: '4px',
+                background: gclAnalysis.accuracy >= 80 ? '#dcfce7' : gclAnalysis.accuracy >= 50 ? '#fef3c7' : '#fef2f2',
+                color: gclAnalysis.accuracy >= 80 ? colors.success : gclAnalysis.accuracy >= 50 ? colors.warning : colors.error,
+                fontWeight: '600'
+              }}>
+                정확: {gclAnalysis.accuracy.toFixed(1)}%
+              </span>
+              <span style={{
+                fontSize: '0.65rem',
+                padding: '2px 6px',
+                borderRadius: '4px',
+                background: gclAnalysis.nearAccuracy >= 90 ? '#dcfce7' : colors.bgAlt,
+                color: gclAnalysis.nearAccuracy >= 90 ? colors.success : colors.textMuted
+              }}>
+                ±1슬롯: {gclAnalysis.nearAccuracy?.toFixed(1) || '-'}%
+              </span>
+              <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+                Offset: {gclAnalysis.bestOffset.toFixed(0)}ms
+              </span>
+              <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+                {cycleTimeMs.toFixed(0)}ms×{gclAnalysis.cycleCount || 0} cycles | {gclAnalysis.totalPackets} pkts
+              </span>
+            </div>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
@@ -672,28 +946,66 @@ function TASDashboard() {
                 설정 vs 실측 비교
               </div>
               <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                {/* TC0 - Always Open */}
+                {gclAnalysis.tc0Count > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px', fontSize: '0.55rem' }}>
+                    <span style={{ padding: '2px 6px', borderRadius: '3px', background: tcColors[0], color: '#fff', fontWeight: '600', minWidth: '28px', textAlign: 'center' }}>
+                      TC0
+                    </span>
+                    <span style={{ fontWeight: '600', color: colors.textMuted }}>항상열림</span>
+                    <span style={{ color: colors.textMuted }}>→</span>
+                    <span style={{ fontWeight: '600', color: colors.success }}>
+                      {gclAnalysis.tc0Count}개
+                    </span>
+                    <span style={{ fontSize: '0.5rem', color: colors.textMuted }}>
+                      (전 슬롯 분산)
+                    </span>
+                  </div>
+                )}
+                {/* TC1-7 */}
                 {[1,2,3,4,5,6,7].map(tc => {
-                  const configSlot = tasData.adminControlList?.findIndex(e => ((e.gateStates >> tc) & 1) && !((e.gateStates >> (tc-1 || 0)) & 1 && tc > 1))
                   const actualSlots = Object.entries(gclAnalysis.slotHits)
                     .filter(([_, tcs]) => tcs[tc] > 0)
                     .map(([slot]) => parseInt(slot))
                   const mainSlot = actualSlots.reduce((max, slot) =>
                     (gclAnalysis.slotHits[slot][tc] > (gclAnalysis.slotHits[max]?.[tc] || 0)) ? slot : max, actualSlots[0])
+                  const jitter = gclAnalysis.slotJitters?.[tc]
+                  const totalHits = Object.values(gclAnalysis.slotHits).reduce((s, h) => s + (h[tc] || 0), 0)
+                  // TC7: slot0 also counts as correct (overflow to next cycle)
+                  const expectedSlot = tc - 1
+                  let correctHits = gclAnalysis.slotHits[expectedSlot]?.[tc] || 0
+                  if (tc === 7) {
+                    correctHits += gclAnalysis.slotHits[0]?.[tc] || 0  // TC7 slack
+                  }
+                  const tcAccuracy = totalHits > 0 ? (correctHits / totalHits * 100) : 0
+                  const isTC7Overflow = tc === 7 && mainSlot === 0
 
                   return (
-                    <div key={tc} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', fontSize: '0.6rem' }}>
-                      <span style={{ padding: '2px 6px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', minWidth: '30px', textAlign: 'center' }}>
+                    <div key={tc} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px', fontSize: '0.55rem' }}>
+                      <span style={{ padding: '2px 6px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', minWidth: '28px', textAlign: 'center' }}>
                         TC{tc}
                       </span>
-                      <span style={{ color: colors.textMuted }}>설정:</span>
-                      <span style={{ fontWeight: '600' }}>#{tc-1}</span>
-                      <span style={{ color: colors.textMuted }}>→ 실측:</span>
-                      <span style={{ fontWeight: '600', color: mainSlot === tc-1 ? colors.success : colors.warning }}>
+                      <span style={{ fontWeight: '600', minWidth: '18px' }}>#{expectedSlot}</span>
+                      <span style={{ color: colors.textMuted }}>→</span>
+                      <span style={{ fontWeight: '600', color: (mainSlot === expectedSlot || isTC7Overflow) ? colors.success : colors.warning, minWidth: '18px' }}>
                         {mainSlot !== undefined ? `#${mainSlot}` : '-'}
+                        {isTC7Overflow && <span style={{ fontSize: '0.45rem' }}>(여유)</span>}
                       </span>
-                      <span style={{ color: mainSlot === tc-1 ? colors.success : colors.warning }}>
-                        {mainSlot === tc-1 ? '✓' : '≠'}
+                      <span style={{
+                        padding: '1px 4px',
+                        borderRadius: '3px',
+                        fontSize: '0.5rem',
+                        background: tcAccuracy >= 80 ? '#dcfce7' : tcAccuracy >= 50 ? '#fef3c7' : '#fef2f2',
+                        color: tcAccuracy >= 80 ? colors.success : tcAccuracy >= 50 ? colors.warning : colors.error,
+                        fontWeight: '600'
+                      }}>
+                        {tcAccuracy.toFixed(0)}%
                       </span>
+                      {jitter !== undefined && (
+                        <span style={{ fontSize: '0.5rem', color: colors.textMuted }}>
+                          ±{jitter.toFixed(0)}ms
+                        </span>
+                      )}
                     </div>
                   )
                 })}

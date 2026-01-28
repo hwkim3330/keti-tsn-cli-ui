@@ -13,6 +13,7 @@ app.use(express.json());
 
 let activeProcess = null;
 let stats = null;
+let cSenderProcess = null;
 
 function getInterfaceMac(ifaceName) {
   try {
@@ -39,6 +40,65 @@ app.get('/api/traffic/interfaces', (req, res) => {
     mac: getInterfaceMac(name)
   }));
   res.json(interfaces);
+});
+
+// Precision C sender endpoint
+app.post('/api/traffic/start-precision', (req, res) => {
+  const { interface: ifaceName, dstMac, srcMac, vlanId = 100, tcList = [1,2,3,4,5,6,7], packetsPerSecond = 100, duration = 7 } = req.body;
+
+  if (!ifaceName || !dstMac) return res.status(400).json({ error: 'Interface and dstMac required' });
+
+  // Stop existing C sender if running
+  if (cSenderProcess) {
+    try { cSenderProcess.kill('SIGTERM'); } catch {}
+    cSenderProcess = null;
+  }
+
+  const sourceMac = srcMac || getInterfaceMac(ifaceName);
+  const tcListStr = Array.isArray(tcList) ? tcList.join(',') : String(tcList);
+  const senderPath = path.join(__dirname, 'traffic-sender');
+
+  console.log(`Starting C sender: sudo ${senderPath} ${ifaceName} ${dstMac} ${sourceMac} ${vlanId} "${tcListStr}" ${packetsPerSecond} ${duration}`);
+
+  try {
+    cSenderProcess = spawn('sudo', [senderPath, ifaceName, dstMac, sourceMac, String(vlanId), tcListStr, String(packetsPerSecond), String(duration)], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+    cSenderProcess.stdout.on('data', (data) => { stdout += data.toString(); });
+    cSenderProcess.stderr.on('data', (data) => { console.log('C sender:', data.toString().trim()); });
+
+    cSenderProcess.on('close', (code) => {
+      console.log(`C sender exited with code ${code}`);
+      try {
+        if (stdout.trim()) {
+          const result = JSON.parse(stdout.trim());
+          console.log('C sender result:', result);
+        }
+      } catch {}
+      cSenderProcess = null;
+    });
+
+    cSenderProcess.on('error', (err) => {
+      console.error('C sender error:', err);
+      cSenderProcess = null;
+    });
+
+    res.json({ success: true, message: 'Precision traffic started (C)', config: { interface: ifaceName, dstMac, srcMac: sourceMac, vlanId, tcList, packetsPerSecond, duration } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/traffic/stop-precision', (req, res) => {
+  if (cSenderProcess) {
+    try { cSenderProcess.kill('SIGTERM'); } catch {}
+    cSenderProcess = null;
+  }
+  // Also kill via pkill in case orphaned
+  try { execSync('sudo pkill -f traffic-sender 2>/dev/null || true'); } catch {}
+  res.json({ success: true, message: 'Precision traffic stopped' });
 });
 
 app.post('/api/traffic/start', (req, res) => {

@@ -1,8 +1,15 @@
 import express from 'express';
 import Cap from 'cap';
+import { spawn } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 const { Cap: CapLib } = Cap;
+
+// Active C sender process
+let cSenderProcess = null;
 
 // Active traffic generators
 const generators = new Map();
@@ -313,6 +320,124 @@ router.get('/status', (req, res) => {
     active: generators.size,
     generators: status
   });
+});
+
+// Start precision traffic using C sender
+router.post('/start-precision', (req, res) => {
+  const {
+    interface: ifaceName,
+    dstMac,
+    srcMac,
+    vlanId = 100,
+    tcList = [1, 2, 3, 4, 5, 6, 7],
+    packetsPerSecond = 100,
+    duration = 7
+  } = req.body;
+
+  if (!ifaceName || !dstMac) {
+    return res.status(400).json({ error: 'Interface and dstMac required' });
+  }
+
+  // Stop existing C sender if running
+  if (cSenderProcess) {
+    try {
+      cSenderProcess.kill('SIGTERM');
+    } catch (e) {}
+    cSenderProcess = null;
+  }
+
+  // Get source MAC if not provided
+  const sourceMac = srcMac || getInterfaceMac(ifaceName);
+
+  // Build TC list string
+  const tcListStr = Array.isArray(tcList) ? tcList.join(',') : String(tcList);
+
+  // Path to C binary
+  const senderPath = path.join(__dirname, '..', 'traffic-sender');
+
+  const args = [
+    ifaceName,
+    dstMac,
+    sourceMac,
+    String(vlanId),
+    tcListStr,
+    String(packetsPerSecond),
+    String(duration)
+  ];
+
+  console.log(`Starting C sender: sudo ${senderPath} ${args.join(' ')}`);
+
+  try {
+    // Use sudo for raw socket access
+    cSenderProcess = spawn('sudo', [senderPath, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    cSenderProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    cSenderProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+      console.log('C sender:', data.toString().trim());
+    });
+
+    cSenderProcess.on('close', (code) => {
+      console.log(`C sender exited with code ${code}`);
+      cSenderProcess = null;
+
+      // Try to parse JSON result
+      try {
+        if (stdout.trim()) {
+          const result = JSON.parse(stdout.trim());
+          console.log('C sender result:', result);
+        }
+      } catch (e) {
+        console.log('C sender output:', stdout);
+      }
+    });
+
+    cSenderProcess.on('error', (err) => {
+      console.error('C sender error:', err);
+      cSenderProcess = null;
+    });
+
+    res.json({
+      success: true,
+      message: 'Precision traffic generator started (C)',
+      config: {
+        interface: ifaceName,
+        dstMac,
+        srcMac: sourceMac,
+        vlanId,
+        tcList,
+        packetsPerSecond,
+        duration
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stop precision traffic (C sender)
+router.post('/stop-precision', (req, res) => {
+  if (cSenderProcess) {
+    try {
+      cSenderProcess.kill('SIGTERM');
+      // Also kill via sudo
+      spawn('sudo', ['pkill', '-f', 'traffic-sender'], { stdio: 'ignore' });
+    } catch (e) {}
+    cSenderProcess = null;
+    res.json({ success: true, message: 'Precision traffic stopped' });
+  } else {
+    // Try to kill anyway in case it's orphaned
+    spawn('sudo', ['pkill', '-f', 'traffic-sender'], { stdio: 'ignore' });
+    res.json({ success: true, message: 'No active precision traffic' });
+  }
 });
 
 // Send single packet (for testing)

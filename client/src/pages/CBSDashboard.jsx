@@ -38,7 +38,7 @@ function CBSDashboard() {
 
   const [trafficInterface, setTrafficInterface] = useState(null)
   const [trafficRunning, setTrafficRunning] = useState(false)
-  const [selectedTCs, setSelectedTCs] = useState([0, 1, 2, 3, 4, 5, 6, 7])
+  const [selectedTCs, setSelectedTCs] = useState([1, 2, 3, 4, 5, 6, 7])  // TC0 excluded - no CBS config
   const [vlanId, setVlanId] = useState(100)
   const [packetsPerSecond, setPacketsPerSecond] = useState(1000)
   const [duration, setDuration] = useState(3)
@@ -90,17 +90,24 @@ function CBSDashboard() {
     setLoading(false)
   }
 
-  // Auto Setup CBS - Configure idle-slope for each TC
+  // Auto Setup CBS - Configure idle-slope for each TC (low values for test traffic ~50kbps)
   const autoSetupCBS = async () => {
     if (!cbsBoard) return
     setAutoSetupStatus('running')
     setAutoSetupMessage('Configuring CBS...')
     try {
       const patches = []
-      // Configure CBS for TC2 and TC3 (common for AVB)
+      // TC1~7에 낮은 idle-slope 설정 (테스트 트래픽 ~50kbps에 맞춤)
+      // TC0은 Best Effort로 CBS 없이
       const cbsConfigs = [
-        { tc: 2, idleSlope: 50000 },  // 50 Mbps
-        { tc: 3, idleSlope: 50000 },  // 50 Mbps
+        { tc: 0, idleSlope: 100 },   // 100 kbps - TC0 포함
+        { tc: 1, idleSlope: 100 },   // 100 kbps
+        { tc: 2, idleSlope: 100 },   // 100 kbps
+        { tc: 3, idleSlope: 100 },   // 100 kbps
+        { tc: 4, idleSlope: 100 },   // 100 kbps
+        { tc: 5, idleSlope: 100 },   // 100 kbps
+        { tc: 6, idleSlope: 100 },   // 100 kbps
+        { tc: 7, idleSlope: 100 },   // 100 kbps
       ]
 
       for (const cfg of cbsConfigs) {
@@ -238,16 +245,17 @@ function CBSDashboard() {
 
     setTrafficRunning(true)
     try {
-      await axios.post(`${TRAFFIC_API}/api/traffic/start`, {
+      // Use precision C sender for accurate timing
+      await axios.post(`${TRAFFIC_API}/api/traffic/start-precision`, {
         interface: trafficInterface,
         dstMac: BOARD2_PORT8_MAC,
         vlanId,
         tcList: selectedTCs,
-        packetSize: 100,
         packetsPerSecond,
         duration
       })
-    } catch {
+    } catch (err) {
+      console.error('Failed to start precision traffic:', err)
       setTrafficRunning(false)
     }
 
@@ -256,7 +264,7 @@ function CBSDashboard() {
 
   const stopTest = async () => {
     setTrafficRunning(false)
-    try { await axios.post(`${TRAFFIC_API}/api/traffic/stop`, { interface: trafficInterface }) } catch {}
+    try { await axios.post(`${TRAFFIC_API}/api/traffic/stop-precision`, {}) } catch {}
     try { await axios.post('/api/capture/stop', {}); setCapturing(false) } catch {}
   }
 
@@ -387,8 +395,8 @@ function CBSDashboard() {
                     const slope = shaperByTc[tc]
                     const hasSlope = slope && slope > 0
                     return (
-                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', background: hasSlope ? '#dcfce7' : '#fef2f2' }}>
-                        {hasSlope ? `${(slope / 1000).toFixed(0)}M` : '-'}
+                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', background: hasSlope ? '#dcfce7' : '#fef2f2', fontWeight: '600' }}>
+                        {hasSlope ? (slope >= 1000 ? `${(slope / 1000).toFixed(0)}M` : `${slope}k`) : '-'}
                       </td>
                     )
                   })}
@@ -399,7 +407,7 @@ function CBSDashboard() {
                     const hasSlope = slope && slope > 0
                     return (
                       <td key={tc} style={{ ...cellStyle, textAlign: 'center', fontSize: '0.6rem', color: colors.textMuted }}>
-                        {hasSlope ? `${slope} kbps` : '-'}
+                        {hasSlope ? (slope >= 1000 ? `${(slope/1000).toFixed(1)} Mbps` : `${slope} kbps`) : '-'}
                       </td>
                     )
                   })}
@@ -410,19 +418,21 @@ function CBSDashboard() {
 
           {/* Total Bandwidth */}
           <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted }}>
-            <span>Total: {cbsData.shapers?.reduce((s, x) => s + (x.idleSlope || 0), 0) / 1000 || 0} Mbps</span>
-            <span>Shapers: {cbsData.shapers?.length || 0}</span>
+            {(() => {
+              const total = cbsData.shapers?.reduce((s, x) => s + (x.idleSlope || 0), 0) || 0
+              return <span>Total: {total >= 1000 ? `${(total / 1000).toFixed(1)} Mbps` : `${total} kbps`}</span>
+            })()}
+            <span>Shapers: {cbsData.shapers?.filter(s => s.idleSlope > 0).length || 0}</span>
           </div>
 
           {/* Shaper Details */}
-          {cbsData.shapers?.length > 0 && (
+          {cbsData.shapers?.filter(s => s.idleSlope > 0).length > 0 && (
             <div style={{ marginTop: '8px', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.7rem' }}>
               <div style={{ fontWeight: '600', marginBottom: '4px' }}>Active Shapers:</div>
-              {cbsData.shapers.map((s, idx) => (
+              {cbsData.shapers.filter(s => s.idleSlope > 0).map((s, idx) => (
                 <div key={idx} style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
                   <span style={{ padding: '1px 6px', borderRadius: '3px', background: tcColors[s.tc], color: '#fff', fontWeight: '600' }}>TC{s.tc}</span>
-                  <span>Idle Slope: {s.idleSlope} kbps</span>
-                  <span style={{ color: colors.textMuted }}>({(s.idleSlope / 1000).toFixed(1)} Mbps)</span>
+                  <span>Idle Slope: {s.idleSlope >= 1000 ? `${(s.idleSlope/1000).toFixed(1)} Mbps` : `${s.idleSlope} kbps`}</span>
                 </div>
               ))}
             </div>
@@ -633,10 +643,10 @@ function CBSDashboard() {
                           TC{tc}
                         </span>
                         <span style={{ fontSize: '0.55rem', color: colors.textMuted }}>
-                          {idleSlope > 0 ? `${(idleSlope/1000).toFixed(0)}M 설정` : 'CBS 없음'}
+                          {idleSlope > 0 ? (idleSlope >= 1000 ? `${(idleSlope/1000).toFixed(0)}M` : `${idleSlope}k`) + ' 설정' : 'CBS 없음'}
                         </span>
                         <span style={{ fontSize: '0.55rem', fontWeight: '600' }}>
-                          → {(stats.throughput/1000).toFixed(1)} Mbps
+                          → {stats.throughput >= 1000 ? `${(stats.throughput/1000).toFixed(1)} Mbps` : `${stats.throughput.toFixed(0)} kbps`}
                         </span>
                         {idleSlope > 0 && (
                           <span style={{ fontSize: '0.55rem', color: stats.utilization > 100 ? colors.error : colors.success }}>
