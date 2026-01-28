@@ -1,7 +1,17 @@
 import express from 'express';
 import Cap from 'cap';
+import { spawn } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const router = express.Router();
+
+// C capture process state
+let cCaptureProcess = null;
+let cCaptureStats = null;
 const { Cap: CapLib, decoders } = Cap;
 
 // Multiple captures (one per interface)
@@ -570,7 +580,134 @@ router.get('/status', (req, res) => {
     activeCaptures: active,
     totalInterfaces: captures.size,
     clients: wsClients.size,
-    globalPacketCount
+    globalPacketCount,
+    cCapture: cCaptureProcess ? {
+      running: true,
+      stats: cCaptureStats
+    } : null
+  });
+});
+
+// ============================================
+// C Capture Integration (High-precision)
+// ============================================
+
+// Start C capture (uses traffic-capture binary)
+router.post('/start-c', (req, res) => {
+  const { interface: iface, duration = 10, vlanId = 100 } = req.body;
+
+  if (!iface) {
+    return res.status(400).json({ error: 'Interface required' });
+  }
+
+  if (cCaptureProcess) {
+    return res.status(400).json({ error: 'C capture already running' });
+  }
+
+  const binaryPath = path.join(__dirname, '..', 'traffic-capture');
+
+  try {
+    cCaptureStats = { startTime: Date.now(), interface: iface, vlanId, packets: 0, tc: {} };
+
+    // Spawn the C capture process (requires cap_net_raw capability)
+    cCaptureProcess = spawn(binaryPath, [iface, String(duration), String(vlanId), 'json'], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let buffer = '';
+
+    cCaptureProcess.stdout.on('data', (data) => {
+      buffer += data.toString();
+
+      // Process complete JSON lines
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // Keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const json = JSON.parse(line);
+
+          // Update stats
+          cCaptureStats.elapsed_ms = json.elapsed_ms;
+          cCaptureStats.packets = json.total || 0;
+
+          if (json.tc) {
+            cCaptureStats.tc = json.tc;
+          }
+
+          if (json.final) {
+            cCaptureStats.final = true;
+            cCaptureStats.analysis = json.tc;
+          }
+
+          // Broadcast to WebSocket clients
+          broadcast({
+            type: 'c-capture-stats',
+            data: {
+              elapsed_ms: json.elapsed_ms,
+              total: json.total,
+              tc: json.tc,
+              final: json.final || false
+            }
+          });
+        } catch (e) {
+          // Ignore parse errors
+        }
+      }
+    });
+
+    cCaptureProcess.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg && !msg.includes('password')) {
+        console.log('[C-capture]', msg);
+      }
+    });
+
+    cCaptureProcess.on('close', (code) => {
+      console.log(`[C-capture] Process exited with code ${code}`);
+      cCaptureProcess = null;
+      broadcast({ type: 'c-capture-stopped', stats: cCaptureStats });
+    });
+
+    cCaptureProcess.on('error', (err) => {
+      console.error('[C-capture] Error:', err.message);
+      cCaptureProcess = null;
+    });
+
+    res.json({
+      success: true,
+      message: `C capture started on ${iface}`,
+      interface: iface,
+      duration,
+      vlanId
+    });
+  } catch (err) {
+    cCaptureProcess = null;
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stop C capture
+router.post('/stop-c', (req, res) => {
+  if (!cCaptureProcess) {
+    return res.json({ success: true, message: 'No C capture running' });
+  }
+
+  try {
+    // Send SIGTERM to gracefully stop
+    cCaptureProcess.kill('SIGTERM');
+    res.json({ success: true, message: 'C capture stopped', stats: cCaptureStats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get C capture status
+router.get('/status-c', (req, res) => {
+  res.json({
+    running: !!cCaptureProcess,
+    stats: cCaptureStats
   });
 });
 

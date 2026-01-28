@@ -116,6 +116,9 @@ const colors = {
   warning: '#d97706',
   error: '#dc2626',
   info: '#0284c7',
+  // Slave colors for graph
+  slave1: '#3b82f6',  // Blue for Board 2
+  slave2: '#8b5cf6',  // Purple for Board 3
 }
 
 // Section component with description
@@ -283,24 +286,37 @@ function Dashboard() {
     const historyEntry = { time: timestamp }
     const newStatus = { ...boardStatus }
 
-    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
-    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
+    // Find all boards
+    const gmDevice = devices.find(d => d.name?.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
+    const slave1Device = devices.find(d => d.name?.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
+    const slave2Device = devices.find(d => d.name?.includes('#3') || (d.transport === 'serial' && d.device?.includes('ACM2')))
 
-    if (slaveDevice) {
-      const result = await fetchSlaveOffset(slaveDevice)
-      newStatus[slaveDevice.id] = { ...newStatus[slaveDevice.id], ...result }
-      if (result.ptp?.offset !== null && result.ptp?.offset !== undefined) {
-        historyEntry[slaveDevice.name] = result.ptp.offset
-      }
-    }
-
+    // Fetch GM status
     if (gmDevice) {
       const result = await fetchGmHealth(gmDevice)
       newStatus[gmDevice.id] = result
     }
 
+    // Fetch Slave 1 status
+    if (slave1Device) {
+      const result = await fetchSlaveOffset(slave1Device)
+      newStatus[slave1Device.id] = { ...newStatus[slave1Device.id], ...result }
+      if (result.ptp?.offset !== null && result.ptp?.offset !== undefined) {
+        historyEntry[slave1Device.name] = result.ptp.offset
+      }
+    }
+
+    // Fetch Slave 2 status
+    if (slave2Device) {
+      const result = await fetchSlaveOffset(slave2Device)
+      newStatus[slave2Device.id] = { ...newStatus[slave2Device.id], ...result }
+      if (result.ptp?.offset !== null && result.ptp?.offset !== undefined) {
+        historyEntry[slave2Device.name] = result.ptp.offset
+      }
+    }
+
     setBoardStatus(newStatus)
-    if (historyEntry[slaveDevice?.name] !== undefined) {
+    if (Object.keys(historyEntry).length > 1) {  // Has at least one offset besides time
       setOffsetHistory(prev => [...prev, historyEntry].slice(-MAX_HISTORY))
     }
     setLoading(false)
@@ -573,21 +589,44 @@ function Dashboard() {
     ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
   }
 
-  const autoSetup = async () => {
-    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
-    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
+  // Auto Setup configuration state - GM 1개 (multiple master ports) + Slave 2개
+  const [autoSetupConfig, setAutoSetupConfig] = useState({
+    gmDevice: 'board1',
+    slaves: [
+      { device: 'board2', gmPort: 8, slavePort: 8, enabled: true },   // Board1 P8 -> Board2 P8
+      { device: 'board3', gmPort: 10, slavePort: 8, enabled: true }   // Board1 P10 -> Board3 P8
+    ],
+    autoSlave: false
+  })
+  const [showAutoSetup, setShowAutoSetup] = useState(false)
 
-    if (!gmDevice || !slaveDevice) {
+  const updateSlaveConfig = (index, updates) => {
+    setAutoSetupConfig(prev => ({
+      ...prev,
+      slaves: prev.slaves.map((s, i) => i === index ? { ...s, ...updates } : s)
+    }))
+  }
+
+  const autoSetup = async () => {
+    const gmDevice = devices.find(d => d.id === autoSetupConfig.gmDevice)
+    const enabledSlaves = autoSetupConfig.slaves.filter(s => s.enabled && s.device)
+
+    if (!gmDevice) {
       setAutoSetupStatus('error')
-      setAutoSetupMessage('Both Board 1 (GM) and Board 2 (Slave) must be configured')
+      setAutoSetupMessage('GM device not found')
       return
     }
 
     setAutoSetupStatus('running')
-    setAutoSetupMessage('Applying GM profile to Board 1...')
+    setAutoSetupMessage(`Applying GM profile to ${gmDevice.name}...`)
 
     try {
-      // Step 1: Apply GM profile to Board 1
+      // Step 1: Apply GM profile with multiple master ports
+      const masterPorts = enabledSlaves.map(s => ({
+        'port-index': s.gmPort,
+        'external-port-config-port-ds': { 'desired-state': 'master' }
+      }))
+
       await axios.post('/api/patch', {
         patches: [
           {
@@ -596,7 +635,7 @@ function Dashboard() {
               'instance-index': 0,
               'default-ds': { 'external-port-config-enable': true },
               'mchp-velocitysp-ptp:automotive': { profile: 'gm' },
-              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'master' } }] },
+              ports: { port: masterPorts },
               'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
             }
           },
@@ -605,40 +644,50 @@ function Dashboard() {
             value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
           }
         ],
-        transport: gmDevice.transport || 'wifi',
+        transport: gmDevice.transport || 'serial',
         device: gmDevice.device,
         host: gmDevice.host,
         port: gmDevice.port || 5683
       }, { timeout: 30000 })
 
-      setAutoSetupMessage('Applying Bridge profile to Board 2...')
+      // Step 2: Apply Slave profiles
+      for (const slaveConfig of enabledSlaves) {
+        const slaveDevice = devices.find(d => d.id === slaveConfig.device)
+        if (!slaveDevice) continue
 
-      // Step 2: Apply Bridge/Slave profile to Board 2
-      await axios.post('/api/patch', {
-        patches: [
-          {
-            path: '/ieee1588-ptp:ptp/instances/instance',
-            value: {
-              'instance-index': 0,
-              'default-ds': { 'external-port-config-enable': true },
-              'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
-              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'slave' } }] },
-              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+        setAutoSetupMessage(`Applying Bridge profile to ${slaveDevice.name}...`)
+        await axios.post('/api/patch', {
+          patches: [
+            {
+              path: '/ieee1588-ptp:ptp/instances/instance',
+              value: {
+                'instance-index': 0,
+                'default-ds': { 'external-port-config-enable': !autoSetupConfig.autoSlave },
+                'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
+                ports: { port: [{ 'port-index': slaveConfig.slavePort, 'external-port-config-port-ds': { 'desired-state': 'slave' } }] },
+                'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+              }
+            },
+            {
+              path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+              value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
             }
-          },
-          {
-            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
-            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
-          }
-        ],
-        transport: slaveDevice.transport || 'wifi',
-        device: slaveDevice.device,
-        host: slaveDevice.host,
-        port: slaveDevice.port || 5683
-      }, { timeout: 30000 })
+          ],
+          transport: slaveDevice.transport || 'serial',
+          device: slaveDevice.device,
+          host: slaveDevice.host,
+          port: slaveDevice.port || 5683
+        }, { timeout: 30000 })
+      }
+
+      const connections = enabledSlaves.map(s => {
+        const d = devices.find(dev => dev.id === s.device)
+        return d ? `P${s.gmPort}→${d.name}(P${s.slavePort})` : null
+      }).filter(Boolean).join(', ')
 
       setAutoSetupStatus('success')
-      setAutoSetupMessage('PTP setup completed. Both boards configured and saved.')
+      setAutoSetupMessage(`PTP: ${gmDevice.name} [${connections}]`)
+      setShowAutoSetup(false)
 
       // Refresh status after setup
       setTimeout(() => {
@@ -656,12 +705,15 @@ function Dashboard() {
 
   const servoStateText = (state) => ({ 0: 'Init', 1: 'Tracking', 2: 'Locked', 3: 'Holdover' }[state] ?? '-')
 
-  // Support both serial and wifi devices
-  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')) || (d.transport === 'serial' && d.device?.includes('ACM0')))
-  const board2 = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')) || (d.transport === 'serial' && d.device?.includes('ACM1')))
+  // Support both serial and wifi devices - Board1 (ACM0) as GM, Board2 (ACM1) and Board3 (ACM2) as Slaves
+  const board1 = devices.find(d => d.name?.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
+  const board2 = devices.find(d => d.name?.includes('#2') || (d.transport === 'serial' && d.device?.includes('ACM1')))
+  const board3 = devices.find(d => d.name?.includes('#3') || (d.transport === 'serial' && d.device?.includes('ACM2')))
   const board1Status = board1 ? boardStatus[board1.id] : null
   const board2Status = board2 ? boardStatus[board2.id] : null
-  const isSynced = board1Status?.online && board2Status?.online && board1Status?.ptp?.isGM && board2Status?.ptp?.portState === 'slave' && board2Status?.ptp?.servoState >= 1
+  const board3Status = board3 ? boardStatus[board3.id] : null
+  const isSynced1 = board1Status?.online && board2Status?.online && board1Status?.ptp?.isGM && board2Status?.ptp?.portState === 'slave' && board2Status?.ptp?.servoState >= 1
+  const isSynced2 = board1Status?.online && board3Status?.online && board1Status?.ptp?.isGM && board3Status?.ptp?.portState === 'slave' && board3Status?.ptp?.servoState >= 1
 
   const getOffsetStats = () => {
     const offsets = offsetHistory.map(h => h[board2?.name]).filter(v => v !== undefined && v !== null)
@@ -716,68 +768,210 @@ function Dashboard() {
           <button className="btn btn-secondary" onClick={fetchAll} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
           <button
             className="btn btn-primary"
-            onClick={autoSetup}
-            disabled={autoSetupStatus === 'running' || devices.length < 2}
-            title="Apply GM to Board 1, Slave to Board 2, and save to startup-config"
+            onClick={() => setShowAutoSetup(true)}
+            disabled={autoSetupStatus === 'running' || devices.length < 1}
             style={{ fontSize: '0.8rem' }}
           >
-            {autoSetupStatus === 'running' ? 'Setting...' : 'Auto Setup'}
+            Auto Setup
           </button>
         </div>
       </div>
 
-      {/* Topology */}
-      <div className="card" style={{ marginBottom: '16px', padding: '24px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '48px' }}>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{
-              width: '140px', height: '80px', border: `2px solid ${board1Status?.online ? colors.accent : colors.border}`,
-              borderRadius: '8px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              background: '#fff'
-            }}>
-              <div style={{ fontWeight: '600', fontSize: '0.9rem', color: colors.text }}>Board 1</div>
-              <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>LAN9692</div>
-              {board1Status?.ptp?.isGM && (
-                <div style={{ fontSize: '0.65rem', background: colors.accent, color: '#fff', padding: '2px 8px', borderRadius: '4px', marginTop: '4px' }}>GM</div>
-              )}
+      {/* Auto Setup Dialog */}
+      {showAutoSetup && (
+        <div className="card" style={{ marginBottom: '16px', border: '2px solid #475569' }}>
+          <div className="card-header">
+            <h2 className="card-title">Auto Setup - PTP (1 GM + 2 Slaves)</h2>
+            <button className="btn btn-secondary" onClick={() => setShowAutoSetup(false)} style={{ padding: '4px 12px' }}>✕</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px' }}>
+            {/* GM Configuration */}
+            <div style={{ padding: '16px', background: '#f5f5f4', borderRadius: '8px' }}>
+              <div style={{ fontWeight: '600', marginBottom: '12px', color: '#57534e' }}>Grandmaster (GM)</div>
+              <div>
+                <label className="form-label">Device</label>
+                <select className="form-select" value={autoSetupConfig.gmDevice} onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, gmDevice: e.target.value }))}>
+                  {devices.map(d => <option key={d.id} value={d.id}>{d.name} ({d.device || d.host})</option>)}
+                </select>
+              </div>
+              <div style={{ marginTop: '12px', fontSize: '0.7rem', color: '#64748b' }}>
+                Master ports: {autoSetupConfig.slaves.filter(s => s.enabled).map(s => `P${s.gmPort}`).join(', ') || 'None'}
+              </div>
             </div>
-            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>
-              {board1?.transport === 'serial' ? board1.device : (board1?.host || '10.42.0.11')}
+            {/* Slave 1 Configuration */}
+            <div style={{ padding: '16px', background: autoSetupConfig.slaves[0]?.enabled ? '#f1f5f9' : '#fafafa', borderRadius: '8px', opacity: autoSetupConfig.slaves[0]?.enabled ? 1 : 0.6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ fontWeight: '600', color: '#475569' }}>Slave 1 (Board 2)</div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={autoSetupConfig.slaves[0]?.enabled} onChange={(e) => updateSlaveConfig(0, { enabled: e.target.checked })} />
+                  <span style={{ fontSize: '0.7rem' }}>Enable</span>
+                </label>
+              </div>
+              <div style={{ marginBottom: '8px' }}>
+                <label className="form-label">Device</label>
+                <select className="form-select" value={autoSetupConfig.slaves[0]?.device || ''} onChange={(e) => updateSlaveConfig(0, { device: e.target.value })} disabled={!autoSetupConfig.slaves[0]?.enabled}>
+                  <option value="">-- Select --</option>
+                  {devices.filter(d => d.id !== autoSetupConfig.gmDevice).map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label className="form-label">GM Port</label>
+                  <select className="form-select" value={autoSetupConfig.slaves[0]?.gmPort || 8} onChange={(e) => updateSlaveConfig(0, { gmPort: parseInt(e.target.value) })} disabled={!autoSetupConfig.slaves[0]?.enabled}>
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => <option key={n} value={n}>P{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="form-label">Slave Port</label>
+                  <select className="form-select" value={autoSetupConfig.slaves[0]?.slavePort || 8} onChange={(e) => updateSlaveConfig(0, { slavePort: parseInt(e.target.value) })} disabled={!autoSetupConfig.slaves[0]?.enabled}>
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => <option key={n} value={n}>P{n}</option>)}
+                  </select>
+                </div>
+              </div>
+            </div>
+            {/* Slave 2 Configuration */}
+            <div style={{ padding: '16px', background: autoSetupConfig.slaves[1]?.enabled ? '#f1f5f9' : '#fafafa', borderRadius: '8px', opacity: autoSetupConfig.slaves[1]?.enabled ? 1 : 0.6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ fontWeight: '600', color: '#475569' }}>Slave 2 (Board 3)</div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={autoSetupConfig.slaves[1]?.enabled} onChange={(e) => updateSlaveConfig(1, { enabled: e.target.checked })} />
+                  <span style={{ fontSize: '0.7rem' }}>Enable</span>
+                </label>
+              </div>
+              <div style={{ marginBottom: '8px' }}>
+                <label className="form-label">Device</label>
+                <select className="form-select" value={autoSetupConfig.slaves[1]?.device || ''} onChange={(e) => updateSlaveConfig(1, { device: e.target.value })} disabled={!autoSetupConfig.slaves[1]?.enabled}>
+                  <option value="">-- Select --</option>
+                  {devices.filter(d => d.id !== autoSetupConfig.gmDevice && d.id !== autoSetupConfig.slaves[0]?.device).map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label className="form-label">GM Port</label>
+                  <select className="form-select" value={autoSetupConfig.slaves[1]?.gmPort || 10} onChange={(e) => updateSlaveConfig(1, { gmPort: parseInt(e.target.value) })} disabled={!autoSetupConfig.slaves[1]?.enabled}>
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => <option key={n} value={n}>P{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="form-label">Slave Port</label>
+                  <select className="form-select" value={autoSetupConfig.slaves[1]?.slavePort || 8} onChange={(e) => updateSlaveConfig(1, { slavePort: parseInt(e.target.value) })} disabled={!autoSetupConfig.slaves[1]?.enabled}>
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => <option key={n} value={n}>P{n}</option>)}
+                  </select>
+                </div>
+              </div>
             </div>
           </div>
+          {/* Options */}
+          <div style={{ marginTop: '16px', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <input type="checkbox" checked={autoSetupConfig.autoSlave} onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, autoSlave: e.target.checked }))} />
+              <span style={{ fontSize: '0.85rem' }}>BMCA Auto (external-port-config disabled for slaves)</span>
+            </label>
+          </div>
+          {/* Connection Summary */}
+          <div style={{ marginTop: '12px', padding: '12px', background: '#f0fdf4', borderRadius: '8px', fontSize: '0.85rem', border: '1px solid #bbf7d0' }}>
+            <strong>Topology:</strong> {devices.find(d => d.id === autoSetupConfig.gmDevice)?.name || '-'}
+            {autoSetupConfig.slaves.filter(s => s.enabled && s.device).map((s, i) => {
+              const d = devices.find(dev => dev.id === s.device)
+              return d ? ` | P${s.gmPort} → ${d.name}(P${s.slavePort})` : ''
+            }).join('')}
+          </div>
+          <div style={{ marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <button className="btn btn-secondary" onClick={() => setShowAutoSetup(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={autoSetup} disabled={autoSetupStatus === 'running'}>{autoSetupStatus === 'running' ? 'Applying...' : 'Apply Setup'}</button>
+          </div>
+        </div>
+      )}
 
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-            <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>Port 8 - Port 8</div>
-            <div style={{ width: '80px', height: '2px', background: isSynced ? colors.success : colors.border, borderRadius: '1px' }} />
-            <div style={{ fontSize: '0.75rem', color: isSynced ? colors.success : colors.textLight, fontWeight: '500' }}>
-              {isSynced ? 'SYNCED' : 'NOT SYNCED'}
+      {/* Topology - 3 Boards (Compact) */}
+      <div className="card" style={{ marginBottom: '16px', padding: '20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+          {/* Board 2 (Slave 1) */}
+          <div style={{ textAlign: 'center', minWidth: '100px' }}>
+            <div style={{
+              padding: '12px 16px',
+              border: `2px solid ${board2Status?.online ? colors.slave1 : colors.border}`,
+              borderRadius: '8px',
+              background: board2Status?.ptp?.portState === 'slave' ? '#eff6ff' : '#fff'
+            }}>
+              <div style={{ fontWeight: '600', fontSize: '0.85rem', color: colors.text }}>Board 2</div>
+              <div style={{ fontSize: '0.6rem', color: colors.textMuted, fontFamily: 'monospace' }}>ACM1</div>
+              {board2Status?.ptp?.portState === 'slave' ? (
+                <div style={{ fontSize: '0.6rem', color: colors.slave1, fontWeight: '600', marginTop: '4px' }}>SLAVE</div>
+              ) : (
+                <div style={{ fontSize: '0.6rem', color: colors.textLight, marginTop: '4px' }}>-</div>
+              )}
             </div>
-            {isSynced && board2Status?.ptp?.offset !== null && (
-              <div style={{ fontSize: '0.7rem', color: colors.text, fontFamily: 'monospace' }}>{board2Status.ptp.offset} ns</div>
+            {board2Status?.ptp?.offset != null && (
+              <div style={{ fontSize: '0.7rem', color: colors.slave1, fontFamily: 'monospace', marginTop: '4px', fontWeight: '600' }}>{board2Status.ptp.offset}ns</div>
             )}
           </div>
 
-          <div style={{ textAlign: 'center' }}>
+          {/* Connection 1 */}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ fontSize: '0.6rem', color: colors.textMuted }}>P8↔P8</div>
+            <div style={{ width: '40px', height: '2px', background: isSynced1 ? colors.success : colors.border }} />
+          </div>
+
+          {/* Board 1 (GM) - Center */}
+          <div style={{ textAlign: 'center', minWidth: '120px' }}>
             <div style={{
-              width: '140px', height: '80px', border: `2px solid ${board2Status?.online ? colors.accent : colors.border}`,
-              borderRadius: '8px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              background: '#fff'
+              padding: '16px 20px',
+              border: `2px solid ${board1Status?.online ? '#57534e' : colors.border}`,
+              borderRadius: '8px',
+              background: board1Status?.ptp?.isGM ? '#f5f5f4' : '#fff'
             }}>
-              <div style={{ fontWeight: '600', fontSize: '0.9rem', color: colors.text }}>Board 2</div>
-              <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>LAN9692</div>
-              {board2Status?.ptp?.portState === 'slave' && (
-                <div style={{ fontSize: '0.65rem', background: colors.accent, color: '#fff', padding: '2px 8px', borderRadius: '4px', marginTop: '4px' }}>SLAVE</div>
+              <div style={{ fontWeight: '700', fontSize: '0.95rem', color: colors.text }}>Board 1</div>
+              <div style={{ fontSize: '0.6rem', color: colors.textMuted, fontFamily: 'monospace' }}>ACM0</div>
+              {board1Status?.ptp?.isGM ? (
+                <div style={{ fontSize: '0.65rem', background: '#57534e', color: '#fff', padding: '2px 8px', borderRadius: '4px', marginTop: '6px', fontWeight: '600', display: 'inline-block' }}>GM</div>
+              ) : (
+                <div style={{ fontSize: '0.6rem', color: colors.textLight, marginTop: '6px' }}>-</div>
               )}
             </div>
-            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>
-              {board2?.transport === 'serial' ? board2.device : (board2?.host || '10.42.0.12')}
-            </div>
           </div>
+
+          {/* Connection 2 */}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ fontSize: '0.6rem', color: colors.textMuted }}>P10↔P8</div>
+            <div style={{ width: '40px', height: '2px', background: isSynced2 ? colors.success : colors.border }} />
+          </div>
+
+          {/* Board 3 (Slave 2) */}
+          <div style={{ textAlign: 'center', minWidth: '100px' }}>
+            <div style={{
+              padding: '12px 16px',
+              border: `2px solid ${board3Status?.online ? colors.slave2 : colors.border}`,
+              borderRadius: '8px',
+              background: board3Status?.ptp?.portState === 'slave' ? '#f5f3ff' : '#fff'
+            }}>
+              <div style={{ fontWeight: '600', fontSize: '0.85rem', color: colors.text }}>Board 3</div>
+              <div style={{ fontSize: '0.6rem', color: colors.textMuted, fontFamily: 'monospace' }}>ACM2</div>
+              {board3Status?.ptp?.portState === 'slave' ? (
+                <div style={{ fontSize: '0.6rem', color: colors.slave2, fontWeight: '600', marginTop: '4px' }}>SLAVE</div>
+              ) : (
+                <div style={{ fontSize: '0.6rem', color: colors.textLight, marginTop: '4px' }}>-</div>
+              )}
+            </div>
+            {board3Status?.ptp?.offset != null && (
+              <div style={{ fontSize: '0.7rem', color: colors.slave2, fontFamily: 'monospace', marginTop: '4px', fontWeight: '600' }}>{board3Status.ptp.offset}ns</div>
+            )}
+          </div>
+        </div>
+
+        {/* Sync Status Summary */}
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '24px', marginTop: '12px', fontSize: '0.7rem' }}>
+          <span style={{ color: isSynced1 ? colors.success : colors.textLight }}>
+            {isSynced1 ? '● Board2 Synced' : '○ Board2 -'}
+          </span>
+          <span style={{ color: isSynced2 ? colors.success : colors.textLight }}>
+            {isSynced2 ? '● Board3 Synced' : '○ Board3 -'}
+          </span>
         </div>
       </div>
 
       {/* Board Status Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '16px' }}>
         {devices.map((device) => {
           const status = boardStatus[device.id]
           const ptp = status?.ptp
@@ -819,7 +1013,17 @@ function Dashboard() {
         <div className="card-header">
           <h2 className="card-title">Offset History</h2>
           <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            {offsetStats && <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>Avg: <b>{offsetStats.avg}ns</b> | Max: <b>±{offsetStats.max}ns</b></div>}
+            {/* Legend */}
+            <div style={{ display: 'flex', gap: '12px', fontSize: '0.7rem' }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ width: '12px', height: '3px', background: colors.slave1, borderRadius: '2px' }}></span>
+                Board 2
+              </span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ width: '12px', height: '3px', background: colors.slave2, borderRadius: '2px' }}></span>
+                Board 3
+              </span>
+            </div>
             <button className="btn btn-secondary" onClick={() => setOffsetHistory([])} style={{ fontSize: '0.7rem', padding: '4px 8px' }}>Clear</button>
           </div>
         </div>
@@ -830,11 +1034,10 @@ function Dashboard() {
                 <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
                 <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke={colors.textLight} interval="preserveStartEnd" />
                 <YAxis tick={{ fontSize: 10 }} stroke={colors.textLight} domain={['auto', 'auto']} label={{ value: 'ns', angle: -90, position: 'insideLeft', fontSize: 10 }} />
-                <Tooltip contentStyle={{ fontSize: '0.75rem', background: '#fff', border: `1px solid ${colors.border}` }} formatter={(value) => [`${value} ns`, 'Offset']} />
+                <Tooltip contentStyle={{ fontSize: '0.75rem', background: '#fff', border: `1px solid ${colors.border}` }} formatter={(value, name) => [`${value} ns`, name]} />
                 <ReferenceLine y={0} stroke={colors.textLight} strokeDasharray="3 3" />
-                {devices.map((device) => (
-                  <Line key={device.id} type="monotone" dataKey={device.name} stroke={colors.accent} strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />
-                ))}
+                {board2 && <Line type="monotone" dataKey={board2.name} stroke={colors.slave1} strokeWidth={2} dot={false} isAnimationActive={false} connectNulls />}
+                {board3 && <Line type="monotone" dataKey={board3.name} stroke={colors.slave2} strokeWidth={2} dot={false} isAnimationActive={false} connectNulls />}
               </LineChart>
             </ResponsiveContainer>
           ) : (

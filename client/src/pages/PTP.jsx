@@ -274,20 +274,31 @@ function PTP() {
     return '#f8fafc'
   }
 
-  // Quick setup - configure Board1 as GM, Board2 as Slave
+  // Auto Setup state
+  const [autoSetupConfig, setAutoSetupConfig] = useState({
+    gmDevice: 'board1',
+    gmPort: 10,
+    slaveDevice: 'board3',
+    slavePort: 8,
+    autoSlave: true  // Use BMCA for automatic slave selection
+  })
+  const [showAutoSetup, setShowAutoSetup] = useState(false)
+
+  // Quick setup - configure GM and Slave with configurable ports
   const quickSetup = async () => {
-    if (devices.length < 2) {
-      setError('Need at least 2 devices for Quick Setup')
+    const gmBoard = devices.find(d => d.id === autoSetupConfig.gmDevice)
+    const slaveBoard = devices.find(d => d.id === autoSetupConfig.slaveDevice)
+
+    if (!gmBoard) {
+      setError('GM device not found')
       return
     }
+
     setLoading(true)
     setError(null)
 
-    const board1 = devices[0]
-    const board2 = devices[1]
-
     try {
-      // Configure Board 1 as GM on port 8
+      // Configure GM board
       await axios.post('/api/patch', {
         patches: [
           {
@@ -296,7 +307,7 @@ function PTP() {
               'instance-index': 0,
               'default-ds': { 'external-port-config-enable': true },
               'mchp-velocitysp-ptp:automotive': { profile: 'gm' },
-              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'master' } }] },
+              ports: { port: [{ 'port-index': autoSetupConfig.gmPort, 'external-port-config-port-ds': { 'desired-state': 'master' } }] },
               'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
             }
           },
@@ -305,37 +316,45 @@ function PTP() {
             value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
           }
         ],
-        transport: board1.transport,
-        device: board1.device,
-        host: board1.host,
-        port: board1.port || 5683
+        transport: gmBoard.transport,
+        device: gmBoard.device,
+        host: gmBoard.host,
+        port: gmBoard.port || 5683
       })
 
-      // Configure Board 2 as Slave on port 8
-      await axios.post('/api/patch', {
-        patches: [
-          {
-            path: '/ieee1588-ptp:ptp/instances/instance',
-            value: {
-              'instance-index': 0,
-              'default-ds': { 'external-port-config-enable': true },
-              'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
-              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'slave' } }] },
-              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+      // Configure Slave board if selected
+      if (slaveBoard) {
+        const slaveDesiredState = autoSetupConfig.autoSlave ? 'slave' : 'slave'
+        await axios.post('/api/patch', {
+          patches: [
+            {
+              path: '/ieee1588-ptp:ptp/instances/instance',
+              value: {
+                'instance-index': 0,
+                'default-ds': { 'external-port-config-enable': !autoSetupConfig.autoSlave },
+                'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
+                ports: { port: [{ 'port-index': autoSetupConfig.slavePort, 'external-port-config-port-ds': { 'desired-state': slaveDesiredState } }] },
+                'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+              }
+            },
+            {
+              path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+              value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
             }
-          },
-          {
-            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
-            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
-          }
-        ],
-        transport: board2.transport,
-        device: board2.device,
-        host: board2.host,
-        port: board2.port || 5683
-      })
+          ],
+          transport: slaveBoard.transport,
+          device: slaveBoard.device,
+          host: slaveBoard.host,
+          port: slaveBoard.port || 5683
+        })
+      }
 
-      setLastResult({ quickSetup: true, board1: board1.name, board2: board2.name })
+      setLastResult({
+        quickSetup: true,
+        gm: `${gmBoard.name} (P${autoSetupConfig.gmPort})`,
+        slave: slaveBoard ? `${slaveBoard.name} (P${autoSetupConfig.slavePort})` : 'None'
+      })
+      setShowAutoSetup(false)
       setTimeout(() => fetchAllStatuses(true), 500)
     } catch (err) {
       setError(err.response?.data?.error || err.message)
@@ -356,11 +375,111 @@ function PTP() {
           <button className="btn btn-secondary" onClick={() => fetchAllStatuses(false)} disabled={loading}>
             Refresh
           </button>
-          <button className="btn btn-primary" onClick={quickSetup} disabled={loading || devices.length < 2}>
-            Quick Setup
+          <button className="btn btn-primary" onClick={() => setShowAutoSetup(true)} disabled={loading || devices.length < 1}>
+            Auto Setup
           </button>
         </div>
       </div>
+
+      {/* Auto Setup Dialog */}
+      {showAutoSetup && (
+        <div className="card" style={{ marginBottom: '16px', border: '2px solid #475569' }}>
+          <div className="card-header">
+            <h2 className="card-title">Auto Setup - PTP Configuration</h2>
+            <button className="btn btn-secondary" onClick={() => setShowAutoSetup(false)} style={{ padding: '4px 12px' }}>
+              ✕
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+            {/* GM Configuration */}
+            <div style={{ padding: '16px', background: '#f5f5f4', borderRadius: '8px' }}>
+              <div style={{ fontWeight: '600', marginBottom: '12px', color: '#57534e' }}>Grandmaster (GM)</div>
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label">Device</label>
+                <select
+                  className="form-select"
+                  value={autoSetupConfig.gmDevice}
+                  onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, gmDevice: e.target.value }))}
+                >
+                  {devices.map(d => (
+                    <option key={d.id} value={d.id}>{d.name} ({d.device || d.host})</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="form-label">Master Port</label>
+                <select
+                  className="form-select"
+                  value={autoSetupConfig.gmPort}
+                  onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, gmPort: parseInt(e.target.value) }))}
+                >
+                  {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => (
+                    <option key={n} value={n}>Port {n}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Slave Configuration */}
+            <div style={{ padding: '16px', background: '#f1f5f9', borderRadius: '8px' }}>
+              <div style={{ fontWeight: '600', marginBottom: '12px', color: '#475569' }}>Slave</div>
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label">Device</label>
+                <select
+                  className="form-select"
+                  value={autoSetupConfig.slaveDevice}
+                  onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, slaveDevice: e.target.value }))}
+                >
+                  <option value="">-- None --</option>
+                  {devices.filter(d => d.id !== autoSetupConfig.gmDevice).map(d => (
+                    <option key={d.id} value={d.id}>{d.name} ({d.device || d.host})</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ marginBottom: '12px' }}>
+                <label className="form-label">Slave Port</label>
+                <select
+                  className="form-select"
+                  value={autoSetupConfig.slavePort}
+                  onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, slavePort: parseInt(e.target.value) }))}
+                >
+                  {[1,2,3,4,5,6,7,8,9,10,11,12].map(n => (
+                    <option key={n} value={n}>Port {n}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={autoSetupConfig.autoSlave}
+                    onChange={(e) => setAutoSetupConfig(prev => ({ ...prev, autoSlave: e.target.checked }))}
+                  />
+                  <span style={{ fontSize: '0.85rem' }}>BMCA Auto (external-port-config disabled)</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* Connection Info */}
+          <div style={{ marginTop: '16px', padding: '12px', background: '#f8fafc', borderRadius: '8px', fontSize: '0.85rem' }}>
+            <strong>Connection:</strong>{' '}
+            {devices.find(d => d.id === autoSetupConfig.gmDevice)?.name || '-'} (P{autoSetupConfig.gmPort})
+            {' → '}
+            {autoSetupConfig.slaveDevice ? `${devices.find(d => d.id === autoSetupConfig.slaveDevice)?.name || '-'} (P${autoSetupConfig.slavePort})` : 'None'}
+          </div>
+
+          {/* Actions */}
+          <div style={{ marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <button className="btn btn-secondary" onClick={() => setShowAutoSetup(false)}>
+              Cancel
+            </button>
+            <button className="btn btn-primary" onClick={quickSetup} disabled={loading}>
+              {loading ? 'Applying...' : 'Apply Setup'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Device Status Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(devices.length, 3)}, 1fr)`, gap: '12px', marginBottom: '16px' }}>
@@ -540,7 +659,7 @@ function PTP() {
             <div style={{ color: '#16a34a' }}>Configuration reset</div>
           ) : lastResult.quickSetup ? (
             <div style={{ color: '#16a34a' }}>
-              Quick Setup complete: {lastResult.board1} (GM) + {lastResult.board2} (Slave)
+              Auto Setup complete: GM={lastResult.gm} → Slave={lastResult.slave}
             </div>
           ) : (
             <div>

@@ -1,63 +1,64 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
 
 const TAP_INTERFACE = 'enxc84d44231cc2'
-const TRAFFIC_INTERFACE_PREFIX = 'enx00e'
+const TRAFFIC_INTERFACE = 'enx00e04c681336'
 const BOARD2_PORT8_MAC = 'FA:AE:C9:26:A4:08'
-const TX_SOURCE_MAC = '00:e0:4c:68:13:36'
 const TRAFFIC_API = 'http://localhost:3001'
+const PACKET_SIZE = 64 * 8  // bits
+const LINK_SPEED = 1000000  // kbps (1Gbps)
 
 const colors = {
-  text: '#1e293b',
-  textMuted: '#64748b',
-  textLight: '#94a3b8',
-  bg: '#f8fafc',
-  bgAlt: '#f1f5f9',
-  border: '#e2e8f0',
-  accent: '#475569',
+  text: '#1f2937',
+  textMuted: '#6b7280',
+  textLight: '#9ca3af',
+  bg: '#f9fafb',
+  bgAlt: '#f3f4f6',
+  border: '#e5e7eb',
   success: '#059669',
   warning: '#d97706',
   error: '#dc2626',
+  tx: '#3b82f6',
+  rx: '#10b981',
 }
 
-const tcColors = {
-  0: '#94a3b8', 1: '#f97316', 2: '#eab308', 3: '#22c55e',
-  4: '#06b6d4', 5: '#3b82f6', 6: '#8b5cf6', 7: '#ec4899',
-}
-
-const tcNames = ['BE(BG)', 'BE', 'EE', 'CA', 'Video', 'Voice', 'IC', 'NC']
+// Blue/Gray 톤다운 색상 (TC0-7)
+const tcColors = [
+  '#94a3b8', '#64748b', '#475569', '#334155',
+  '#1e3a5f', '#1e40af', '#3730a3', '#4c1d95'
+]
 
 function CBSDashboard() {
   const { devices } = useDevices()
-
   const [cbsData, setCbsData] = useState({})
   const [loading, setLoading] = useState(false)
-  const [autoSetupStatus, setAutoSetupStatus] = useState(null)
-  const [autoSetupMessage, setAutoSetupMessage] = useState('')
+  const [status, setStatus] = useState(null)
+  const [idleSlope, setIdleSlope] = useState({
+    0: LINK_SPEED, 1: 10000, 2: 20000, 3: 30000,
+    4: 40000, 5: 50000, 6: 60000, 7: 100000
+  })
 
   const [trafficInterface, setTrafficInterface] = useState(null)
   const [trafficRunning, setTrafficRunning] = useState(false)
-  const [selectedTCs, setSelectedTCs] = useState([1, 2, 3, 4, 5, 6, 7])  // TC0 excluded - no CBS config
+  const [selectedTCs, setSelectedTCs] = useState([1, 2, 3, 4, 5, 6, 7])
   const [vlanId, setVlanId] = useState(100)
-  const [packetsPerSecond, setPacketsPerSecond] = useState(1000)
-  const [duration, setDuration] = useState(3)
+  const [packetsPerSecond, setPacketsPerSecond] = useState(2000)
+  const [duration, setDuration] = useState(5)
 
-  const [capturing, setCapturing] = useState(false)
   const [tapConnected, setTapConnected] = useState(false)
-  const [capturedPackets, setCapturedPackets] = useState([])
+  const [captureStats, setCaptureStats] = useState(null)
   const wsRef = useRef(null)
-  const startTimeRef = useRef(null)
 
   const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
   const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
   const CBS_PORT = 8
-  const cbsBoard = board1 || board2  // Board 1 우선 (Port 9 UP인 보드)
+  const cbsBoard = board1 || board2
 
   const getQosPath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/mchp-velocitysp-port:eth-qos/config`
 
-  // Fetch CBS status
-  const fetchCBSStatus = async () => {
+  // CBS 상태 가져오기
+  const fetchCBS = async () => {
     if (!cbsBoard) return
     setLoading(true)
     try {
@@ -71,126 +72,89 @@ function CBSDashboard() {
 
       const shapers = []
       if (res.data?.result) {
-        const lines = res.data.result.split('\n')
         let current = null
-        for (const line of lines) {
+        for (const line of res.data.result.split('\n')) {
           if (line.includes('traffic-class:')) {
             if (current) shapers.push(current)
-            current = { tc: parseInt(line.split(':')[1].trim()), idleSlope: 0 }
+            current = { tc: parseInt(line.split(':')[1]), idleSlope: 0 }
           } else if (line.includes('idle-slope:') && current) {
-            current.idleSlope = parseInt(line.split(':')[1].trim())
+            current.idleSlope = parseInt(line.split(':')[1])
           }
         }
         if (current) shapers.push(current)
       }
-      setCbsData({ online: true, shapers, raw: res.data?.result })
+
+      // Update local state with board values
+      const newSlope = { ...idleSlope }
+      shapers.forEach(s => { if (s.idleSlope > 0) newSlope[s.tc] = s.idleSlope })
+      setIdleSlope(newSlope)
+      setCbsData({ online: true, shapers })
     } catch {
-      setCbsData({ online: false, shapers: [], error: 'Connection failed' })
+      setCbsData({ online: false })
     }
     setLoading(false)
   }
 
-  // Auto Setup CBS - Configure idle-slope for each TC (low values for test traffic ~50kbps)
-  const autoSetupCBS = async () => {
+  // CBS 적용
+  const applyCBS = async () => {
     if (!cbsBoard) return
-    setAutoSetupStatus('running')
-    setAutoSetupMessage('Configuring CBS...')
+    setStatus({ type: 'info', msg: 'Applying...' })
     try {
       const patches = []
-      // TC1~7에 낮은 idle-slope 설정 (테스트 트래픽 ~50kbps에 맞춤)
-      // TC0은 Best Effort로 CBS 없이
-      const cbsConfigs = [
-        { tc: 0, idleSlope: 100 },   // 100 kbps - TC0 포함
-        { tc: 1, idleSlope: 100 },   // 100 kbps
-        { tc: 2, idleSlope: 100 },   // 100 kbps
-        { tc: 3, idleSlope: 100 },   // 100 kbps
-        { tc: 4, idleSlope: 100 },   // 100 kbps
-        { tc: 5, idleSlope: 100 },   // 100 kbps
-        { tc: 6, idleSlope: 100 },   // 100 kbps
-        { tc: 7, idleSlope: 100 },   // 100 kbps
-      ]
-
-      for (const cfg of cbsConfigs) {
+      for (let tc = 0; tc < 8; tc++) {
         patches.push({
           path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
-          value: {
-            'traffic-class': cfg.tc,
-            'credit-based': { 'idle-slope': cfg.idleSlope }
-          }
+          value: { 'traffic-class': tc, 'credit-based': { 'idle-slope': idleSlope[tc] || LINK_SPEED } }
         })
       }
-
-      await axios.post('/api/patch', {
-        patches,
-        transport: cbsBoard.transport,
-        device: cbsBoard.device,
-        host: cbsBoard.host
-      }, { timeout: 30000 })
-
-      setAutoSetupStatus('success')
-      setAutoSetupMessage('CBS configured!')
-      setTimeout(() => { fetchCBSStatus(); setAutoSetupStatus(null) }, 1500)
+      await axios.post('/api/patch', { patches, transport: cbsBoard.transport, device: cbsBoard.device, host: cbsBoard.host }, { timeout: 30000 })
+      setStatus({ type: 'success', msg: 'CBS Applied' })
+      setTimeout(() => { fetchCBS(); setStatus(null) }, 1500)
     } catch (err) {
-      setAutoSetupStatus('error')
-      setAutoSetupMessage(`Failed: ${err.message}`)
+      setStatus({ type: 'error', msg: err.message })
     }
   }
 
   const resetCBS = async () => {
     if (!cbsBoard) return
-    setAutoSetupStatus('running')
+    setStatus({ type: 'info', msg: 'Resetting...' })
     try {
-      // Reset by setting idle-slope to 0
       const patches = []
       for (let tc = 0; tc < 8; tc++) {
         patches.push({
           path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
-          value: {
-            'traffic-class': tc,
-            'credit-based': { 'idle-slope': 0 }
-          }
+          value: { 'traffic-class': tc, 'credit-based': { 'idle-slope': LINK_SPEED } }
         })
       }
-      await axios.post('/api/patch', {
-        patches,
-        transport: cbsBoard.transport,
-        device: cbsBoard.device,
-        host: cbsBoard.host
-      }, { timeout: 30000 })
-      setAutoSetupStatus('success')
-      setAutoSetupMessage('CBS reset')
-      setTimeout(() => { fetchCBSStatus(); setAutoSetupStatus(null) }, 1500)
+      await axios.post('/api/patch', { patches, transport: cbsBoard.transport, device: cbsBoard.device, host: cbsBoard.host }, { timeout: 30000 })
+      const resetSlope = {}
+      for (let tc = 0; tc < 8; tc++) resetSlope[tc] = LINK_SPEED
+      setIdleSlope(resetSlope)
+      setStatus({ type: 'success', msg: 'CBS Reset' })
+      setTimeout(() => { fetchCBS(); setStatus(null) }, 1500)
     } catch (err) {
-      setAutoSetupStatus('error')
-      setAutoSetupMessage(`Failed: ${err.message}`)
+      setStatus({ type: 'error', msg: err.message })
     }
   }
 
-  // Auto-fetch CBS status when board is available
-  useEffect(() => {
-    if (cbsBoard) fetchCBSStatus()
-  }, [cbsBoard])
+  useEffect(() => { if (cbsBoard) fetchCBS() }, [cbsBoard])
 
-  // Fetch interfaces
   useEffect(() => {
-    axios.get(`${TRAFFIC_API}/api/traffic/interfaces`).then(res => {
-      const iface = res.data.find(i => i.name.startsWith(TRAFFIC_INTERFACE_PREFIX))
-      if (iface) setTrafficInterface(iface.name)
-    }).catch(() => {})
+    setTrafficInterface(TRAFFIC_INTERFACE)
   }, [])
 
-  // WebSocket for capture
   useEffect(() => {
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/capture`
     const connect = () => {
-      const ws = new WebSocket(wsUrl)
+      const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/capture`)
       ws.onopen = () => setTapConnected(true)
       ws.onclose = () => { setTapConnected(false); setTimeout(connect, 3000) }
-      ws.onmessage = (event) => {
+      ws.onmessage = (e) => {
         try {
-          const msg = JSON.parse(event.data)
-          if (msg.type === 'packet') handlePacket(msg.data)
-          else if (msg.type === 'stopped') setCapturing(false)
+          const msg = JSON.parse(e.data)
+          if (msg.type === 'c-capture-stats') setCaptureStats(msg.data)
+          else if (msg.type === 'c-capture-stopped' && msg.stats?.analysis) {
+            setCaptureStats(prev => ({ ...prev, final: true, analysis: msg.stats.analysis }))
+          }
         } catch {}
       }
       wsRef.current = ws
@@ -199,612 +163,276 @@ function CBSDashboard() {
     return () => wsRef.current?.close()
   }, [])
 
-  const handlePacket = useCallback((packet) => {
-    if (packet.protocol === 'PTP') return
-    if (packet.length < 56 || packet.length > 1600) return
-
-    const pcp = packet.vlan?.pcp ?? 0
-    const hasVlan = !!packet.vlan
-    const vid = packet.vlan?.vid || 0
-    const srcMac = (packet.srcMac || packet.source || '').toLowerCase().replace(/[:-]/g, '')
-    const isTx = packet.interface?.startsWith(TRAFFIC_INTERFACE_PREFIX)
-    const isRx = packet.interface === TAP_INTERFACE
-
-    // RX: only count packets from our TX source MAC with our VLAN ID
-    if (isRx) {
-      if (vid !== vlanId) return
-      if (srcMac !== TX_SOURCE_MAC.replace(/[:-]/g, '')) return
-    }
-
-    if (isTx || isRx) {
-      setCapturedPackets(prev => [...prev, {
-        time: Date.now(),
-        pcp,
-        length: packet.length,
-        vid,
-        hasVlan,
-        src: packet.srcMac || packet.source,
-        dst: packet.dstMac || packet.destination,
-        direction: isTx ? 'TX' : 'RX'
-      }].slice(-1000))
-    }
-  }, [vlanId])
-
   const startTest = async () => {
     if (!trafficInterface || selectedTCs.length === 0) return
-    setCapturedPackets([])
-    startTimeRef.current = Date.now()
-
+    setCaptureStats(null)
     try {
-      await axios.post('/api/capture/start', {
-        interfaces: [trafficInterface, TAP_INTERFACE],
-        captureMode: 'all'
-      })
-      setCapturing(true)
-    } catch {}
-
-    setTrafficRunning(true)
-    try {
-      // Use precision C sender for accurate timing
+      await axios.post('/api/capture/start-c', { interface: TAP_INTERFACE, duration: duration + 1, vlanId })
+      await new Promise(r => setTimeout(r, 300))
+      setTrafficRunning(true)
       await axios.post(`${TRAFFIC_API}/api/traffic/start-precision`, {
-        interface: trafficInterface,
-        dstMac: BOARD2_PORT8_MAC,
-        vlanId,
-        tcList: selectedTCs,
-        packetsPerSecond,
-        duration
+        interface: trafficInterface, dstMac: BOARD2_PORT8_MAC, vlanId, tcList: selectedTCs, packetsPerSecond, duration
       })
+      setTimeout(stopTest, (duration + 2) * 1000)
     } catch (err) {
-      console.error('Failed to start precision traffic:', err)
+      console.error(err)
       setTrafficRunning(false)
     }
-
-    setTimeout(stopTest, (duration + 2) * 1000)
   }
 
   const stopTest = async () => {
     setTrafficRunning(false)
     try { await axios.post(`${TRAFFIC_API}/api/traffic/stop-precision`, {}) } catch {}
-    try { await axios.post('/api/capture/stop', {}); setCapturing(false) } catch {}
+    try { await axios.post('/api/capture/stop-c', {}) } catch {}
   }
 
-  const toggleTC = (tc) => setSelectedTCs(prev => prev.includes(tc) ? prev.filter(t => t !== tc) : [...prev, tc].sort())
+  // 크레딧 기반 예상값 계산
+  const estimates = useMemo(() => {
+    const tcCount = selectedTCs.length || 1
+    const ppsPerTc = packetsPerSecond / tcCount
+    const trafficKbps = (ppsPerTc * PACKET_SIZE) / 1000
 
-  // Stats
-  const txPackets = capturedPackets.filter(p => p.direction === 'TX')
-  const rxPackets = capturedPackets.filter(p => p.direction === 'RX')
-  const txByTc = {}
-  const rxByTc = {}
-  txPackets.forEach(p => { if (p.hasVlan) txByTc[p.pcp] = (txByTc[p.pcp] || 0) + 1 })
-  rxPackets.forEach(p => { if (p.hasVlan) rxByTc[p.pcp] = (rxByTc[p.pcp] || 0) + 1 })
-
-  const cellStyle = { padding: '6px 10px', borderBottom: `1px solid ${colors.border}`, fontSize: '0.75rem' }
-  const headerStyle = { ...cellStyle, fontWeight: '600', background: colors.bgAlt }
-
-  // Build TC bandwidth matrix from cbsData
-  const shaperByTc = {}
-  cbsData.shapers?.forEach(s => { shaperByTc[s.tc] = s.idleSlope })
-
-  // CBS Credit Analysis - estimate credit state from packet timing
-  const cbsAnalysis = useMemo(() => {
-    if (rxPackets.length < 10) return null
-
-    const LINK_SPEED_KBPS = 1000000  // 1 Gbps
-    const PACKET_SIZE_BITS = 60 * 8  // 60 bytes * 8 bits
-
-    const tcStats = {}
+    const result = {}
     for (let tc = 0; tc < 8; tc++) {
-      const tcPackets = rxPackets.filter(p => p.hasVlan && p.pcp === tc).sort((a, b) => a.time - b.time)
-      if (tcPackets.length < 2) continue
+      const slope = idleSlope[tc] || LINK_SPEED
+      const isLimited = slope < LINK_SPEED
+      const willShape = isLimited && trafficKbps > slope
 
-      const idleSlope = shaperByTc[tc] || 0
-      const sendSlope = idleSlope > 0 ? (idleSlope - LINK_SPEED_KBPS) : 0
+      // Credit calculation
+      const sendSlope = slope - LINK_SPEED  // negative
+      const txTime = PACKET_SIZE / (LINK_SPEED * 1000)  // seconds per packet
+      const creditPerPkt = sendSlope * 1000 * txTime  // bits consumed (negative)
+      const interPktTime = ppsPerTc > 0 ? 1 / ppsPerTc : 0
+      const creditRecovery = slope * 1000 * interPktTime  // bits recovered
+      const netCredit = creditRecovery + creditPerPkt
 
-      // Calculate inter-arrival times and throughput
-      const intervals = []
-      for (let i = 1; i < tcPackets.length; i++) {
-        intervals.push(tcPackets[i].time - tcPackets[i-1].time)
-      }
-
-      const totalTime = (tcPackets[tcPackets.length-1].time - tcPackets[0].time) / 1000  // seconds
-      const totalBits = tcPackets.length * PACKET_SIZE_BITS
-      const actualThroughput = totalTime > 0 ? (totalBits / totalTime / 1000) : 0  // kbps
-
-      // Simulate credit changes
-      const creditHistory = []
-      let credit = 0
-      let lastTime = tcPackets[0]?.time || 0
-
-      tcPackets.forEach((p, i) => {
-        const dt = (p.time - lastTime) / 1000  // seconds
-        if (idleSlope > 0 && dt > 0) {
-          // Credit increases during idle time
-          credit += idleSlope * dt
-          credit = Math.min(credit, idleSlope * 0.01)  // hi-credit limit
-        }
-        // Credit decreases when sending
-        if (sendSlope < 0) {
-          const sendTime = PACKET_SIZE_BITS / LINK_SPEED_KBPS  // seconds
-          credit += sendSlope * sendTime
-          credit = Math.max(credit, sendSlope * 0.01)  // lo-credit limit
-        }
-        creditHistory.push({ time: p.time, credit })
-        lastTime = p.time
-      })
-
-      tcStats[tc] = {
-        count: tcPackets.length,
-        avgInterval: intervals.length > 0 ? intervals.reduce((a,b) => a+b, 0) / intervals.length : 0,
-        throughput: actualThroughput,
-        idleSlope,
-        utilization: idleSlope > 0 ? (actualThroughput / idleSlope * 100) : 0,
-        creditHistory
+      result[tc] = {
+        slope,
+        isLimited,
+        trafficKbps,
+        willShape,
+        expectedKbps: willShape ? slope : trafficKbps,
+        creditPerPkt: Math.round(creditPerPkt),
+        creditRecovery: Math.round(creditRecovery),
+        netCredit: Math.round(netCredit)
       }
     }
+    return result
+  }, [idleSlope, packetsPerSecond, selectedTCs])
 
-    return tcStats
-  }, [rxPackets, shaperByTc])
+  const formatBw = (kbps) => {
+    if (kbps >= 1000000) return `${(kbps / 1000000).toFixed(0)}G`
+    if (kbps >= 1000) return `${(kbps / 1000).toFixed(0)}M`
+    return `${Math.round(kbps)}k`
+  }
+
+  // Styles
+  const card = { background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '6px', marginBottom: '16px' }
+  const cardHeader = { padding: '12px 16px', borderBottom: `1px solid ${colors.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+  const cardBody = { padding: '16px' }
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">CBS Dashboard</h1>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          {autoSetupStatus && (
-            <span style={{ fontSize: '0.7rem', padding: '4px 8px', borderRadius: '4px', background: autoSetupStatus === 'success' ? '#dcfce7' : autoSetupStatus === 'error' ? '#fef2f2' : colors.bgAlt }}>
-              {autoSetupMessage}
-            </span>
-          )}
-          <button className="btn btn-secondary" onClick={fetchCBSStatus} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
-          <button className="btn btn-primary" onClick={autoSetupCBS} disabled={!cbsBoard}>Auto Setup</button>
+          {status && <span style={{ fontSize: '0.8rem', padding: '6px 12px', borderRadius: '4px', background: status.type === 'success' ? '#dcfce7' : status.type === 'error' ? '#fef2f2' : colors.bgAlt, color: status.type === 'success' ? colors.success : status.type === 'error' ? colors.error : colors.textMuted }}>{status.msg}</span>}
+          <button className="btn btn-secondary" onClick={fetchCBS} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
+          <button className="btn btn-primary" onClick={applyCBS} disabled={!cbsBoard}>Apply</button>
           <button className="btn btn-secondary" onClick={resetCBS} disabled={!cbsBoard}>Reset</button>
         </div>
       </div>
 
-      {/* CBS Config + Test Controls */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
-        {/* CBS Configuration - 8 TC Matrix */}
-        <div className="card">
-          <div className="card-header">
-            <h2 className="card-title">CBS Configuration</h2>
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <span style={{ fontSize: '0.65rem', padding: '2px 6px', background: colors.bgAlt, borderRadius: '4px', color: colors.text, fontWeight: '600' }}>
-                {cbsBoard?.name || '-'} ({cbsBoard?.device || '-'}) Port {CBS_PORT}
-              </span>
-              <span style={{ fontSize: '0.65rem', color: cbsData.shapers?.length > 0 ? colors.success : colors.textLight, fontWeight: '600' }}>
-                {cbsData.shapers?.length > 0 ? `● ${cbsData.shapers.length} TC` : '○ OFF'}
-              </span>
+      {/* Connection Info */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '16px' }}>
+        {[
+          { label: 'Board', value: cbsBoard?.name || 'Not Connected', sub: `${cbsBoard?.device || '-'} / Port ${CBS_PORT}` },
+          { label: 'TX Interface', value: trafficInterface || 'Not Found', ok: !!trafficInterface },
+          { label: 'RX Interface', value: TAP_INTERFACE, ok: tapConnected, sub: tapConnected ? 'Ready' : 'Disconnected' }
+        ].map((item, i) => (
+          <div key={i} style={{ ...card, marginBottom: 0 }}>
+            <div style={cardBody}>
+              <div style={{ fontSize: '0.75rem', color: colors.textMuted, fontWeight: '500', marginBottom: '4px' }}>{item.label}</div>
+              <div style={{ fontSize: '0.875rem', fontFamily: 'monospace', color: item.ok === false ? colors.error : colors.text }}>{item.value}</div>
+              {item.sub && <div style={{ fontSize: '0.75rem', color: item.ok === false ? colors.error : item.ok ? colors.success : colors.textMuted, marginTop: '4px' }}>{item.sub}</div>}
             </div>
           </div>
+        ))}
+      </div>
 
-          {/* Credit-Based Shaper Matrix */}
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
-              <thead>
-                <tr>
-                  {[0,1,2,3,4,5,6,7].map(tc => (
-                    <th key={tc} style={{ ...headerStyle, width: '12.5%', textAlign: 'center', background: tcColors[tc], color: '#fff' }}>
-                      TC{tc}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  {[0,1,2,3,4,5,6,7].map(tc => {
-                    const slope = shaperByTc[tc]
-                    const hasSlope = slope && slope > 0
-                    return (
-                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', background: hasSlope ? '#dcfce7' : '#fef2f2', fontWeight: '600' }}>
-                        {hasSlope ? (slope >= 1000 ? `${(slope / 1000).toFixed(0)}M` : `${slope}k`) : '-'}
-                      </td>
-                    )
-                  })}
-                </tr>
-                <tr>
-                  {[0,1,2,3,4,5,6,7].map(tc => {
-                    const slope = shaperByTc[tc]
-                    const hasSlope = slope && slope > 0
-                    return (
-                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', fontSize: '0.6rem', color: colors.textMuted }}>
-                        {hasSlope ? (slope >= 1000 ? `${(slope/1000).toFixed(1)} Mbps` : `${slope} kbps`) : '-'}
-                      </td>
-                    )
-                  })}
-                </tr>
-              </tbody>
-            </table>
+      {/* Idle Slope Configuration */}
+      <div style={card}>
+        <div style={cardHeader}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ fontWeight: '600' }}>Idle Slope Configuration</span>
+            <span style={{ fontSize: '0.75rem', padding: '4px 10px', borderRadius: '4px', background: cbsData.online ? '#dcfce7' : colors.bgAlt, color: cbsData.online ? colors.success : colors.textMuted }}>
+              {cbsData.online ? 'CONNECTED' : 'DISCONNECTED'}
+            </span>
           </div>
-
-          {/* Total Bandwidth */}
-          <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted }}>
-            {(() => {
-              const total = cbsData.shapers?.reduce((s, x) => s + (x.idleSlope || 0), 0) || 0
-              return <span>Total: {total >= 1000 ? `${(total / 1000).toFixed(1)} Mbps` : `${total} kbps`}</span>
-            })()}
-            <span>Shapers: {cbsData.shapers?.filter(s => s.idleSlope > 0).length || 0}</span>
-          </div>
-
-          {/* Shaper Details */}
-          {cbsData.shapers?.filter(s => s.idleSlope > 0).length > 0 && (
-            <div style={{ marginTop: '8px', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.7rem' }}>
-              <div style={{ fontWeight: '600', marginBottom: '4px' }}>Active Shapers:</div>
-              {cbsData.shapers.filter(s => s.idleSlope > 0).map((s, idx) => (
-                <div key={idx} style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
-                  <span style={{ padding: '1px 6px', borderRadius: '3px', background: tcColors[s.tc], color: '#fff', fontWeight: '600' }}>TC{s.tc}</span>
-                  <span>Idle Slope: {s.idleSlope >= 1000 ? `${(s.idleSlope/1000).toFixed(1)} Mbps` : `${s.idleSlope} kbps`}</span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
-
-        {/* Test Controls */}
-        <div className="card">
-          <div className="card-header">
-            <h2 className="card-title">Traffic Test</h2>
-          </div>
-          <div style={{ display: 'flex', gap: '8px', marginBottom: '10px', fontSize: '0.7rem' }}>
-            <div style={{ flex: 1, padding: '6px', background: trafficInterface ? '#ecfdf5' : '#fef2f2', borderRadius: '4px' }}>
-              TX: {trafficInterface || 'N/A'}
-            </div>
-            <div style={{ flex: 1, padding: '6px', background: tapConnected ? '#ecfdf5' : '#fef2f2', borderRadius: '4px' }}>
-              RX: {TAP_INTERFACE}
-            </div>
-          </div>
-
-          <div style={{ marginBottom: '10px' }}>
-            <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>Traffic Classes:</div>
-            <div style={{ display: 'flex', gap: '4px' }}>
-              {[0,1,2,3,4,5,6,7].map(tc => (
-                <button key={tc} onClick={() => !trafficRunning && toggleTC(tc)} disabled={trafficRunning}
-                  style={{ padding: '4px 8px', borderRadius: '4px', border: 'none', background: selectedTCs.includes(tc) ? tcColors[tc] : colors.bgAlt, color: selectedTCs.includes(tc) ? '#fff' : colors.textMuted, fontSize: '0.7rem', fontWeight: '600', cursor: trafficRunning ? 'not-allowed' : 'pointer' }}>
-                  TC{tc}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '10px', fontSize: '0.7rem' }}>
-            <div>
-              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>VLAN</div>
-              <input type="number" value={vlanId} onChange={e => setVlanId(parseInt(e.target.value) || 0)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
-            </div>
-            <div>
-              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>PPS</div>
-              <input type="number" value={packetsPerSecond} onChange={e => setPacketsPerSecond(parseInt(e.target.value) || 1)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
-            </div>
-            <div>
-              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>Duration</div>
-              <input type="number" value={duration} onChange={e => setDuration(parseInt(e.target.value) || 10)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', gap: '8px' }}>
-            {!trafficRunning ? (
-              <button className="btn btn-primary" onClick={startTest} disabled={!trafficInterface || !tapConnected} style={{ flex: 1 }}>Start Test</button>
-            ) : (
-              <button className="btn" onClick={stopTest} style={{ flex: 1, background: '#fef2f2', color: colors.error }}>Stop</button>
-            )}
-            <button className="btn btn-secondary" onClick={() => setCapturedPackets([])}>Clear</button>
-          </div>
-
-          {/* Stats - Per TC */}
-          <div style={{ marginTop: '10px' }}>
-            <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>TX / RX per TC:</div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: '4px', fontSize: '0.65rem' }}>
+        <div style={cardBody}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+            <thead>
+              <tr style={{ background: colors.bgAlt }}>
+                <th style={{ padding: '8px', textAlign: 'left' }}>TC</th>
+                <th style={{ padding: '8px', width: '140px' }}>Idle Slope (kbps)</th>
+                <th style={{ padding: '8px', textAlign: 'center' }}>Bandwidth</th>
+                <th style={{ padding: '8px', textAlign: 'center' }}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
               {[0,1,2,3,4,5,6,7].map(tc => {
-                const tx = txByTc[tc] || 0
-                const rx = rxByTc[tc] || 0
-                const pass = tx > 0 ? ((rx / tx) * 100).toFixed(0) : '-'
+                const est = estimates[tc]
                 return (
-                  <div key={tc} style={{ padding: '4px', background: colors.bgAlt, borderRadius: '4px', textAlign: 'center', borderTop: `3px solid ${tcColors[tc]}` }}>
-                    <div style={{ fontWeight: '700', color: tcColors[tc] }}>TC{tc}</div>
-                    <div style={{ color: '#3b82f6' }}>{tx}</div>
-                    <div style={{ color: '#22c55e' }}>{rx}</div>
-                    <div style={{ color: tx > 0 && rx === 0 ? colors.error : (pass === '100' ? colors.success : colors.warning), fontWeight: '600' }}>
-                      {tx > 0 ? `${pass}%` : '-'}
-                    </div>
-                  </div>
+                  <tr key={tc} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                    <td style={{ padding: '8px', color: tcColors[tc], fontWeight: '600' }}>TC{tc}</td>
+                    <td style={{ padding: '8px' }}>
+                      <input type="number" value={idleSlope[tc] || ''} onChange={e => setIdleSlope(prev => ({ ...prev, [tc]: parseInt(e.target.value) || 0 }))}
+                        style={{ width: '100%', padding: '6px 8px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontFamily: 'monospace', textAlign: 'right' }} />
+                    </td>
+                    <td style={{ padding: '8px', textAlign: 'center', fontFamily: 'monospace' }}>{formatBw(est.slope)}bps</td>
+                    <td style={{ padding: '8px', textAlign: 'center' }}>
+                      <span style={{ padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: '500', background: est.isLimited ? '#fef3c7' : '#dcfce7', color: est.isLimited ? colors.warning : colors.success }}>
+                        {est.isLimited ? 'LIMITED' : 'UNLIMITED'}
+                      </span>
+                    </td>
+                  </tr>
                 )
               })}
-            </div>
-            <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '0.65rem', color: colors.textMuted }}>
-              <span>Total TX: <b style={{ color: '#3b82f6' }}>{txPackets.length}</b></span>
-              <span>Total RX: <b style={{ color: '#22c55e' }}>{rxPackets.length}</b></span>
-              <span>Pass: <b style={{ color: txPackets.length > 0 ? (rxPackets.length / txPackets.length > 0.9 ? colors.success : colors.warning) : colors.textMuted }}>
-                {txPackets.length > 0 ? `${((rxPackets.length / txPackets.length) * 100).toFixed(0)}%` : '-'}
-              </b></span>
-            </div>
-          </div>
+            </tbody>
+          </table>
         </div>
       </div>
 
-      {/* Packet Timeline */}
-      {capturedPackets.length > 0 && (
-        <div className="card" style={{ marginBottom: '16px' }}>
-          <div className="card-header">
-            <h2 className="card-title">Packet Timeline</h2>
-            <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>TX: {txPackets.length} | RX: {rxPackets.length}</span>
-          </div>
-
-          {/* Timeline Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-            {/* TX Timeline */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ background: '#3b82f6', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>TX</span>
-                송신
-              </div>
-              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
-                <div style={{ display: 'flex' }}>
-                  <div style={{ width: '30px' }}>
-                    {[7,6,5,4,3,2,1,0].map(tc => (
-                      <div key={tc} style={{ height: '14px', fontSize: '0.5rem', color: tcColors[tc], fontWeight: '600', textAlign: 'right', paddingRight: '4px' }}>TC{tc}</div>
-                    ))}
-                  </div>
-                  <div style={{ flex: 1, position: 'relative', height: '112px', background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '4px', overflow: 'hidden' }}>
-                    {(() => {
-                      const pkts = txPackets.filter(p => p.hasVlan).slice(-400)
-                      if (pkts.length === 0) return <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight, fontSize: '0.7rem' }}>No TX</div>
-                      const minT = pkts[0]?.time || 0
-                      const maxT = pkts[pkts.length - 1]?.time || 1
-                      const range = Math.max(maxT - minT, 1)
-                      return pkts.map((p, i) => (
-                        <div key={i} style={{ position: 'absolute', left: `${((p.time - minT) / range) * 100}%`, top: `${(7 - p.pcp) * 14}px`, width: '2px', height: '12px', background: tcColors[p.pcp], opacity: 0.8 }} />
-                      ))
-                    })()}
-                  </div>
-                </div>
-                {/* Time axis */}
-                {txPackets.length > 0 && (() => {
-                  const pkts = txPackets.filter(p => p.hasVlan)
-                  if (pkts.length === 0) return null
-                  const dur = ((pkts[pkts.length - 1]?.time || 0) - (pkts[0]?.time || 0)) / 1000
-                  return (
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginLeft: '30px', marginTop: '4px', fontSize: '0.55rem', color: colors.textMuted }}>
-                      <span>0s</span><span>{(dur/2).toFixed(1)}s</span><span>{dur.toFixed(1)}s</span>
-                    </div>
-                  )
-                })()}
-              </div>
-            </div>
-
-            {/* RX Timeline */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ background: '#22c55e', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>RX</span>
-                수신
-              </div>
-              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
-                <div style={{ display: 'flex' }}>
-                  <div style={{ width: '30px' }}>
-                    {[7,6,5,4,3,2,1,0].map(tc => (
-                      <div key={tc} style={{ height: '14px', fontSize: '0.5rem', color: tcColors[tc], fontWeight: '600', textAlign: 'right', paddingRight: '4px' }}>TC{tc}</div>
-                    ))}
-                  </div>
-                  <div style={{ flex: 1, position: 'relative', height: '112px', background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '4px', overflow: 'hidden' }}>
-                    {(() => {
-                      const pkts = rxPackets.filter(p => p.hasVlan).slice(-400)
-                      if (pkts.length === 0) return <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight, fontSize: '0.7rem' }}>No RX</div>
-                      const minT = pkts[0]?.time || 0
-                      const maxT = pkts[pkts.length - 1]?.time || 1
-                      const range = Math.max(maxT - minT, 1)
-                      return pkts.map((p, i) => (
-                        <div key={i} style={{ position: 'absolute', left: `${((p.time - minT) / range) * 100}%`, top: `${(7 - p.pcp) * 14}px`, width: '2px', height: '12px', background: tcColors[p.pcp], opacity: 0.8 }} />
-                      ))
-                    })()}
-                  </div>
-                </div>
-                {/* Time axis */}
-                {rxPackets.length > 0 && (() => {
-                  const pkts = rxPackets.filter(p => p.hasVlan)
-                  if (pkts.length === 0) return null
-                  const dur = ((pkts[pkts.length - 1]?.time || 0) - (pkts[0]?.time || 0)) / 1000
-                  return (
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginLeft: '30px', marginTop: '4px', fontSize: '0.55rem', color: colors.textMuted }}>
-                      <span>0s</span><span>{(dur/2).toFixed(1)}s</span><span>{dur.toFixed(1)}s</span>
-                    </div>
-                  )
-                })()}
-              </div>
-            </div>
+      {/* Traffic Test */}
+      <div style={card}>
+        <div style={cardHeader}>
+          <span style={{ fontWeight: '600' }}>Traffic Test</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {!trafficRunning ? (
+              <button className="btn btn-primary" onClick={startTest} disabled={!trafficInterface || !tapConnected || selectedTCs.length === 0}>Start</button>
+            ) : (
+              <button className="btn" onClick={stopTest} style={{ background: '#fef2f2', color: colors.error, border: '1px solid #fecaca' }}>Stop</button>
+            )}
+            <button className="btn btn-secondary" onClick={() => setCaptureStats(null)}>Clear</button>
           </div>
         </div>
-      )}
+        <div style={cardBody}>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px' }}>
+            {[0,1,2,3,4,5,6,7].map(tc => (
+              <button key={tc} onClick={() => !trafficRunning && setSelectedTCs(prev => prev.includes(tc) ? prev.filter(t => t !== tc) : [...prev, tc].sort())} disabled={trafficRunning}
+                style={{ padding: '8px 16px', borderRadius: '4px', border: `2px solid ${selectedTCs.includes(tc) ? tcColors[tc] : colors.border}`, background: selectedTCs.includes(tc) ? `${tcColors[tc]}15` : '#fff', color: selectedTCs.includes(tc) ? tcColors[tc] : colors.textMuted, fontWeight: '600', cursor: trafficRunning ? 'not-allowed' : 'pointer', opacity: trafficRunning ? 0.6 : 1 }}>
+                TC{tc}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
+            {[['VLAN', vlanId, setVlanId], ['PPS', packetsPerSecond, setPacketsPerSecond], ['Duration', duration, setDuration]].map(([label, val, setter]) => (
+              <div key={label}>
+                <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginBottom: '4px' }}>{label}</div>
+                <input type="number" value={val} onChange={e => setter(parseInt(e.target.value) || 0)} disabled={trafficRunning}
+                  style={{ width: '100%', padding: '8px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontFamily: 'monospace' }} />
+              </div>
+            ))}
+          </div>
 
-      {/* CBS Credit Analysis */}
-      {cbsAnalysis && Object.keys(cbsAnalysis).length > 0 && (
-        <div className="card" style={{ marginBottom: '16px' }}>
-          <div className="card-header">
-            <h2 className="card-title">CBS Analysis (Estimated)</h2>
-            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
-              Credit-Based Shaper 분석 | {rxPackets.length} RX packets
+          {/* Estimation Summary */}
+          {selectedTCs.length > 0 && (
+            <div style={{ marginTop: '16px', padding: '12px', background: colors.bgAlt, borderRadius: '4px' }}>
+              <div style={{ fontSize: '0.8rem', color: colors.textMuted, fontFamily: 'monospace', marginBottom: '8px' }}>
+                {packetsPerSecond} pps ÷ {selectedTCs.length} TC = {Math.round(packetsPerSecond / selectedTCs.length)} pps/TC = {formatBw(estimates[selectedTCs[0]]?.trafficKbps || 0)}bps/TC
+              </div>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {selectedTCs.map(tc => {
+                  const est = estimates[tc]
+                  return (
+                    <span key={tc} style={{ padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: '600', background: est.willShape ? '#fef2f2' : '#dcfce7', color: est.willShape ? colors.error : colors.success }}>
+                      TC{tc}: {est.willShape ? `→${formatBw(est.slope)}` : 'OK'}
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Results */}
+      {captureStats && (
+        <div style={card}>
+          <div style={cardHeader}>
+            <span style={{ fontWeight: '600' }}>Packet Monitor & Credit Estimation</span>
+            <span style={{ fontSize: '0.8rem', padding: '4px 12px', borderRadius: '4px', background: captureStats.final ? '#dcfce7' : '#fef3c7', color: captureStats.final ? colors.success : colors.warning }}>
+              {captureStats.final ? 'Complete' : `${(captureStats.elapsed_ms / 1000).toFixed(1)}s`}
             </span>
           </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-            {/* Throughput Analysis */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
-                TC별 Throughput (설정 vs 실측)
-              </div>
-              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
-                {[0,1,2,3,4,5,6,7].map(tc => {
-                  const stats = cbsAnalysis[tc]
-                  if (!stats) return null
-                  const idleSlope = shaperByTc[tc] || 0
-                  const barWidth = idleSlope > 0 ? Math.min(100, stats.utilization) : (stats.throughput > 0 ? 100 : 0)
+          <div style={cardBody}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+              <thead>
+                <tr style={{ background: colors.bgAlt }}>
+                  <th style={{ padding: '10px', textAlign: 'left' }}>TC</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Packets</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Throughput</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Idle Slope</th>
+                  <th style={{ padding: '10px', textAlign: 'right' }}>Expected</th>
+                  <th style={{ padding: '10px', textAlign: 'center' }}>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {selectedTCs.map(tc => {
+                  const stats = captureStats.tc?.[tc] || captureStats.analysis?.[tc]
+                  const est = estimates[tc]
+                  const actualKbps = stats?.kbps || 0
+                  const wasShaped = actualKbps > 0 && actualKbps < est.trafficKbps * 0.7
 
                   return (
-                    <div key={tc} style={{ marginBottom: '6px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' }}>
-                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', fontSize: '0.55rem', minWidth: '28px', textAlign: 'center' }}>
-                          TC{tc}
-                        </span>
-                        <span style={{ fontSize: '0.55rem', color: colors.textMuted }}>
-                          {idleSlope > 0 ? (idleSlope >= 1000 ? `${(idleSlope/1000).toFixed(0)}M` : `${idleSlope}k`) + ' 설정' : 'CBS 없음'}
-                        </span>
-                        <span style={{ fontSize: '0.55rem', fontWeight: '600' }}>
-                          → {stats.throughput >= 1000 ? `${(stats.throughput/1000).toFixed(1)} Mbps` : `${stats.throughput.toFixed(0)} kbps`}
-                        </span>
-                        {idleSlope > 0 && (
-                          <span style={{ fontSize: '0.55rem', color: stats.utilization > 100 ? colors.error : colors.success }}>
-                            ({stats.utilization.toFixed(0)}%)
+                    <tr key={tc} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                      <td style={{ padding: '10px', color: tcColors[tc], fontWeight: '600' }}>TC{tc}</td>
+                      <td style={{ padding: '10px', textAlign: 'right', fontFamily: 'monospace', fontWeight: stats?.count ? '600' : '400' }}>{stats?.count || '-'}</td>
+                      <td style={{ padding: '10px', textAlign: 'right', fontFamily: 'monospace' }}>{actualKbps ? `${formatBw(actualKbps)}bps` : '-'}</td>
+                      <td style={{ padding: '10px', textAlign: 'right', fontFamily: 'monospace', color: colors.textMuted }}>{formatBw(est.slope)}bps</td>
+                      <td style={{ padding: '10px', textAlign: 'right', fontFamily: 'monospace', color: colors.textMuted }}>
+                        {est.willShape ? `≤${formatBw(est.slope)}` : `${formatBw(est.trafficKbps)}`}
+                      </td>
+                      <td style={{ padding: '10px', textAlign: 'center' }}>
+                        {stats?.count ? (
+                          <span style={{ padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: '600', background: wasShaped ? '#fef2f2' : '#dcfce7', color: wasShaped ? colors.error : colors.success }}>
+                            {wasShaped ? 'SHAPED' : 'OK'}
                           </span>
-                        )}
-                      </div>
-                      <div style={{ height: '4px', background: '#e2e8f0', borderRadius: '2px', overflow: 'hidden' }}>
-                        <div style={{
-                          width: `${barWidth}%`,
-                          height: '100%',
-                          background: idleSlope > 0
-                            ? (stats.utilization > 100 ? colors.error : colors.success)
-                            : tcColors[tc],
-                          transition: 'width 0.3s'
-                        }} />
-                      </div>
-                    </div>
+                        ) : '-'}
+                      </td>
+                    </tr>
                   )
                 })}
-              </div>
-            </div>
+              </tbody>
+            </table>
 
-            {/* Credit Simulation */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>
-                Credit 상태 (시뮬레이션)
-              </div>
-              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
-                {[0,1,2,3,4,5,6,7].map(tc => {
-                  const stats = cbsAnalysis[tc]
-                  if (!stats || !shaperByTc[tc]) return null
+            {/* Credit Detail */}
+            {captureStats.final && (
+              <div style={{ marginTop: '16px' }}>
+                <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginBottom: '8px', fontWeight: '600' }}>Credit Analysis</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' }}>
+                  {selectedTCs.filter(tc => estimates[tc].isLimited).map(tc => {
+                    const est = estimates[tc]
+                    const stats = captureStats.tc?.[tc] || captureStats.analysis?.[tc]
+                    const actualKbps = stats?.kbps || 0
+                    const ratio = est.trafficKbps > 0 ? Math.round(actualKbps / est.trafficKbps * 100) : 100
 
-                  const history = stats.creditHistory || []
-                  const lastCredit = history[history.length - 1]?.credit || 0
-                  const maxCredit = shaperByTc[tc] * 0.01
-                  const minCredit = (shaperByTc[tc] - 1000000) * 0.01
-                  const creditRange = maxCredit - minCredit
-                  const creditPercent = creditRange > 0 ? ((lastCredit - minCredit) / creditRange * 100) : 50
-
-                  return (
-                    <div key={tc} style={{ marginBottom: '6px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' }}>
-                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[tc], color: '#fff', fontWeight: '600', fontSize: '0.55rem', minWidth: '28px', textAlign: 'center' }}>
-                          TC{tc}
-                        </span>
-                        <span style={{ fontSize: '0.55rem', color: colors.textMuted }}>
-                          Credit:
-                        </span>
-                        <span style={{ fontSize: '0.55rem', fontWeight: '600', color: lastCredit >= 0 ? colors.success : colors.error }}>
-                          {lastCredit >= 0 ? '+' : ''}{lastCredit.toFixed(2)}
-                        </span>
-                        <span style={{ fontSize: '0.5rem', color: colors.textMuted }}>
-                          ({stats.count} pkts, {stats.avgInterval.toFixed(1)}ms avg)
-                        </span>
+                    return (
+                      <div key={tc} style={{ padding: '10px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.75rem', fontFamily: 'monospace' }}>
+                        <div style={{ color: tcColors[tc], fontWeight: '700', marginBottom: '6px' }}>TC{tc}</div>
+                        <div>Credit/Pkt: <span style={{ color: colors.error }}>{est.creditPerPkt}</span> bits</div>
+                        <div>Recovery: <span style={{ color: colors.success }}>+{est.creditRecovery}</span> bits</div>
+                        <div>Net: <span style={{ color: est.netCredit < 0 ? colors.error : colors.success }}>{est.netCredit > 0 ? '+' : ''}{est.netCredit}</span> bits/pkt</div>
+                        <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: `1px solid ${colors.border}` }}>
+                          Result: {ratio}% ({actualKbps ? `${formatBw(actualKbps)}bps` : '-'})
+                        </div>
                       </div>
-                      <div style={{ height: '8px', background: '#fef2f2', borderRadius: '4px', overflow: 'hidden', position: 'relative' }}>
-                        <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: '1px', background: '#666' }} />
-                        <div style={{
-                          position: 'absolute',
-                          left: lastCredit >= 0 ? '50%' : `${creditPercent}%`,
-                          width: lastCredit >= 0 ? `${Math.min(50, creditPercent - 50)}%` : `${50 - creditPercent}%`,
-                          height: '100%',
-                          background: lastCredit >= 0 ? colors.success : colors.error,
-                          transition: 'all 0.3s'
-                        }} />
-                      </div>
-                    </div>
-                  )
-                })}
-                {Object.keys(cbsAnalysis).filter(tc => shaperByTc[tc]).length === 0 && (
-                  <div style={{ fontSize: '0.6rem', color: colors.textMuted, textAlign: 'center', padding: '10px' }}>
-                    CBS가 설정된 TC가 없습니다. Auto Setup으로 설정하세요.
-                  </div>
-                )}
+                    )
+                  })}
+                </div>
               </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Packet Capture Log - TX/RX Split */}
-      {capturedPackets.length > 0 && (
-        <div className="card">
-          <div className="card-header">
-            <h2 className="card-title">Packet Capture</h2>
-            <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-            {/* TX Packets */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ background: '#3b82f6', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>TX</span>
-                송신 ({txPackets.length})
-              </div>
-              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
-                  <thead>
-                    <tr style={{ background: '#dbeafe', position: 'sticky', top: 0 }}>
-                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
-                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
-                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {txPackets.slice(-30).reverse().map((pkt, idx) => {
-                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
-                      return (
-                        <tr key={idx} style={{ background: '#eff6ff' }}>
-                          <td style={cellStyle}>{time}s</td>
-                          <td style={cellStyle}>
-                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
-                              {pkt.pcp}
-                            </span>
-                          </td>
-                          <td style={cellStyle}>{pkt.length}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* RX Packets */}
-            <div>
-              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ background: '#22c55e', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>RX</span>
-                수신 ({rxPackets.length})
-              </div>
-              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
-                  <thead>
-                    <tr style={{ background: '#dcfce7', position: 'sticky', top: 0 }}>
-                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
-                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
-                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rxPackets.slice(-30).reverse().map((pkt, idx) => {
-                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
-                      return (
-                        <tr key={idx} style={{ background: '#f0fdf4' }}>
-                          <td style={cellStyle}>{time}s</td>
-                          <td style={cellStyle}>
-                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
-                              {pkt.pcp}
-                            </span>
-                          </td>
-                          <td style={cellStyle}>{pkt.length}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            )}
           </div>
         </div>
       )}
