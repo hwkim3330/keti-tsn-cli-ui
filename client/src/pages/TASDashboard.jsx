@@ -82,7 +82,7 @@ function TASDashboard() {
   const startTimeRef = useRef(null)
 
   // Board1: Serial connection via ttyACM0
-  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || d.transport === 'serial')
+  const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1') || (d.transport === 'serial' && d.device?.includes('ACM0')))
 
   // TAS on Port 9 (PC → Board1 ingress port)
   const TAS_PORT = 9
@@ -128,6 +128,7 @@ function TASDashboard() {
         axios.post('/api/fetch', {
           paths: [`${basePath}/${field}`],
           transport: board1.transport || 'wifi',
+          device: board1.device,
           host: board1.host,
           port: board1.port || 5683
         }, { timeout: 10000 }).catch(() => null)
@@ -199,10 +200,10 @@ function TASDashboard() {
         { path: `${basePath}/admin-base-time/nanoseconds`, value: 0 },
       ]
 
-      await axios.post('/api/patch', { patches, transport: board1.transport, host: board1.host, port: board1.port || 5683 }, { timeout: 30000 })
+      await axios.post('/api/patch', { patches, transport: board1.transport, device: board1.device, host: board1.host, port: board1.port || 5683 }, { timeout: 30000 })
       await axios.post('/api/patch', {
         patches: [{ path: `${basePath}/config-change`, value: true }],
-        transport: board1.transport, host: board1.host, port: board1.port || 5683
+        transport: board1.transport, device: board1.device, host: board1.host, port: board1.port || 5683
       }, { timeout: 10000 })
 
       setAutoSetupStatus('success')
@@ -225,7 +226,7 @@ function TASDashboard() {
       const basePath = getBasePath(TAS_PORT)
       await axios.post('/api/patch', {
         patches: [{ path: `${basePath}/gate-enabled`, value: false }],
-        transport: board1.transport, host: board1.host, port: board1.port || 5683
+        transport: board1.transport, device: board1.device, host: board1.host, port: board1.port || 5683
       }, { timeout: 15000 })
 
       setAutoSetupStatus('success')

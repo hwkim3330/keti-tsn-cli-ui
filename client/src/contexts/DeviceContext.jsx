@@ -4,7 +4,7 @@ const DeviceContext = createContext()
 
 const STORAGE_KEY = 'tsn-devices'
 const STORAGE_VERSION_KEY = 'tsn-devices-version'
-const DEVICES_VERSION = 8  // Bump version to reset to serial
+const DEVICES_VERSION = 9  // Force reset to correct serial devices
 
 const defaultDevices = [
   { id: 'board1', name: 'LAN9692 #1', transport: 'serial', device: '/dev/ttyACM0' },

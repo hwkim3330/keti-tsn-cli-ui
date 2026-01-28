@@ -50,6 +50,57 @@ function mae(actual, predicted) {
   return sum / actual.length
 }
 
+// Parse PTP YAML response
+function parsePtpYaml(yaml) {
+  const result = {
+    profile: null,
+    clockId: null,
+    gmId: null,
+    isGM: false,
+    portState: null,
+    asCapable: false,
+    servoState: null,
+    offset: null,
+    meanLinkDelay: null
+  }
+
+  if (!yaml) return result
+
+  const profileMatch = yaml.match(/profile:\s*(\w+)/)
+  if (profileMatch) result.profile = profileMatch[1]
+
+  const clockMatch = yaml.match(/clock-identity:\s*([\w-]+)/)
+  if (clockMatch) result.clockId = clockMatch[1]
+
+  const gmMatch = yaml.match(/grandmaster-identity:\s*([\w-]+)/)
+  if (gmMatch) result.gmId = gmMatch[1]
+
+  // Check for GM: parent clock is null (00-00-00-00-00-00-00-00)
+  const parentMatch = yaml.match(/parent-port-identity:[\s\S]*?clock-identity:\s*([\w-]+)/)
+  if (parentMatch) {
+    const parentClock = parentMatch[1]
+    result.isGM = parentClock === '00-00-00-00-00-00-00-00' || parentClock === result.clockId
+  } else {
+    result.isGM = result.clockId && result.gmId && result.clockId === result.gmId
+  }
+
+  const portStateMatch = yaml.match(/port-state:\s*(\w+)/)
+  if (portStateMatch) result.portState = portStateMatch[1]
+
+  result.asCapable = yaml.includes('as-capable: true')
+
+  const servoStateMatch = yaml.match(/servo:[\s\S]*?state:\s*(\d+)/)
+  if (servoStateMatch) result.servoState = parseInt(servoStateMatch[1])
+
+  const offsetMatch = yaml.match(/offset:\s*(-?\d+)/)
+  if (offsetMatch) result.offset = parseInt(offsetMatch[1])
+
+  const delayMatch = yaml.match(/mean-link-delay:\s*(\d+)/)
+  if (delayMatch) result.meanLinkDelay = parseInt(delayMatch[1])
+
+  return result
+}
+
 // Professional muted color palette
 const colors = {
   text: '#1e293b',
@@ -99,13 +150,13 @@ function Dashboard() {
   const [boardStatus, setBoardStatus] = useState({})
   const [loading, setLoading] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
-  const [refreshInterval, setRefreshInterval] = useState(5000)
+  const [refreshInterval, setRefreshInterval] = useState(500)
   const [autoSetupStatus, setAutoSetupStatus] = useState(null) // null, 'running', 'success', 'error'
   const [autoSetupMessage, setAutoSetupMessage] = useState('')
   const intervalRef = useRef(null)
   const [offsetHistory, setOffsetHistory] = useState([])
   const [connectionStats, setConnectionStats] = useState({})
-  const MAX_HISTORY = 120
+  const MAX_HISTORY = 300  // 0.5s interval = 2.5분 기록
 
   const [tapCapturing, setTapCapturing] = useState(false)
   const [tapConnected, setTapConnected] = useState(false)
@@ -131,7 +182,7 @@ function Dashboard() {
     maeHistory: []
   })
   const [offsetEstimates, setOffsetEstimates] = useState([])
-  const FEATURE_WINDOW = 32
+  const FEATURE_WINDOW = 64  // 더 많은 샘플로 정밀한 추정
 
   const [ptpStructure, setPtpStructure] = useState({
     domainNumber: null,
@@ -173,12 +224,24 @@ function Dashboard() {
 
   const fetchGmHealth = useCallback(async (device) => {
     try {
-      const res = await axios.get(`/api/ptp/health/${device.host}`, { timeout: 25000 })
+      const startTime = Date.now()
+      const res = await axios.post('/api/fetch', {
+        paths: ['/ieee1588-ptp:ptp'],
+        transport: device.transport || 'wifi',
+        device: device.device,
+        host: device.host,
+        port: device.port || 5683
+      }, { timeout: 25000 })
+
+      const latency = Date.now() - startTime
+      const yaml = res.data.result || ''
+      const ptp = parsePtpYaml(yaml)
+
       setConnectionStats(prev => ({
         ...prev,
-        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency: res.data.latency }
+        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency }
       }))
-      return { online: res.data.online, ptp: res.data.ptp, latency: res.data.latency, cached: res.data.cached }
+      return { online: true, ptp, latency }
     } catch (err) {
       setConnectionStats(prev => ({ ...prev, [device.id]: { ...prev[device.id], failCount: (prev[device.id]?.failCount || 0) + 1 } }))
       return { online: false, error: err.message }
@@ -187,23 +250,24 @@ function Dashboard() {
 
   const fetchSlaveOffset = useCallback(async (device) => {
     try {
-      const res = await axios.get(`/api/ptp/offset/${device.host}`, { timeout: 20000 })
+      const startTime = Date.now()
+      const res = await axios.post('/api/fetch', {
+        paths: ['/ieee1588-ptp:ptp'],
+        transport: device.transport || 'wifi',
+        device: device.device,
+        host: device.host,
+        port: device.port || 5683
+      }, { timeout: 20000 })
+
+      const latency = Date.now() - startTime
+      const yaml = res.data.result || ''
+      const ptp = parsePtpYaml(yaml)
+
       setConnectionStats(prev => ({
         ...prev,
-        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency: res.data.latency }
+        [device.id]: { ...prev[device.id], successCount: (prev[device.id]?.successCount || 0) + 1, latency }
       }))
-      return {
-        online: res.data.online,
-        ptp: {
-          offset: res.data.offset,
-          servoState: res.data.servoState,
-          portState: res.data.portState,
-          profile: res.data.profile,
-          asCapable: res.data.asCapable,
-          meanLinkDelay: res.data.meanLinkDelay
-        },
-        latency: res.data.latency
-      }
+      return { online: true, ptp, latency }
     } catch (err) {
       setConnectionStats(prev => ({ ...prev, [device.id]: { ...prev[device.id], failCount: (prev[device.id]?.failCount || 0) + 1 } }))
       return { online: false, error: err.message }
@@ -213,7 +277,9 @@ function Dashboard() {
   const fetchAll = useCallback(async () => {
     if (devices.length === 0) return
     setLoading(true)
-    const timestamp = new Date().toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    const now = new Date()
+    const ms = String(now.getMilliseconds()).padStart(3, '0').slice(0, 2)
+    const timestamp = `${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}.${ms}`
     const historyEntry = { time: timestamp }
     const newStatus = { ...boardStatus }
 
@@ -522,19 +588,54 @@ function Dashboard() {
 
     try {
       // Step 1: Apply GM profile to Board 1
-      await axios.post(`/api/ptp/apply/${gmDevice.host}`, { profile: 'gm', portIndex: 8 }, { timeout: 30000 })
-      setAutoSetupMessage('Saving Board 1 config...')
+      await axios.post('/api/patch', {
+        patches: [
+          {
+            path: '/ieee1588-ptp:ptp/instances/instance',
+            value: {
+              'instance-index': 0,
+              'default-ds': { 'external-port-config-enable': true },
+              'mchp-velocitysp-ptp:automotive': { profile: 'gm' },
+              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'master' } }] },
+              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+            }
+          },
+          {
+            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
+          }
+        ],
+        transport: gmDevice.transport || 'wifi',
+        device: gmDevice.device,
+        host: gmDevice.host,
+        port: gmDevice.port || 5683
+      }, { timeout: 30000 })
 
-      // Step 2: Save Board 1 config
-      await axios.post(`/api/ptp/save/${gmDevice.host}`, {}, { timeout: 30000 })
       setAutoSetupMessage('Applying Bridge profile to Board 2...')
 
-      // Step 3: Apply Bridge/Slave profile to Board 2
-      await axios.post(`/api/ptp/apply/${slaveDevice.host}`, { profile: 'bridge', portIndex: 8 }, { timeout: 30000 })
-      setAutoSetupMessage('Saving Board 2 config...')
-
-      // Step 4: Save Board 2 config
-      await axios.post(`/api/ptp/save/${slaveDevice.host}`, {}, { timeout: 30000 })
+      // Step 2: Apply Bridge/Slave profile to Board 2
+      await axios.post('/api/patch', {
+        patches: [
+          {
+            path: '/ieee1588-ptp:ptp/instances/instance',
+            value: {
+              'instance-index': 0,
+              'default-ds': { 'external-port-config-enable': true },
+              'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
+              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'slave' } }] },
+              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+            }
+          },
+          {
+            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
+          }
+        ],
+        transport: slaveDevice.transport || 'wifi',
+        device: slaveDevice.device,
+        host: slaveDevice.host,
+        port: slaveDevice.port || 5683
+      }, { timeout: 30000 })
 
       setAutoSetupStatus('success')
       setAutoSetupMessage('PTP setup completed. Both boards configured and saved.')
@@ -603,9 +704,10 @@ function Dashboard() {
           )}
           <select value={refreshInterval} onChange={(e) => setRefreshInterval(parseInt(e.target.value))}
             style={{ padding: '6px 10px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontSize: '0.8rem', background: '#fff' }}>
-            <option value={3000}>3s</option>
-            <option value={5000}>5s</option>
-            <option value={10000}>10s</option>
+            <option value={250}>250ms</option>
+            <option value={500}>500ms</option>
+            <option value={1000}>1s</option>
+            <option value={2000}>2s</option>
           </select>
           <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', cursor: 'pointer', color: colors.textMuted }}>
             <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
@@ -639,7 +741,9 @@ function Dashboard() {
                 <div style={{ fontSize: '0.65rem', background: colors.accent, color: '#fff', padding: '2px 8px', borderRadius: '4px', marginTop: '4px' }}>GM</div>
               )}
             </div>
-            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>{board1?.host || '10.42.0.11'}</div>
+            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>
+              {board1?.transport === 'serial' ? board1.device : (board1?.host || '10.42.0.11')}
+            </div>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
@@ -665,7 +769,9 @@ function Dashboard() {
                 <div style={{ fontSize: '0.65rem', background: colors.accent, color: '#fff', padding: '2px 8px', borderRadius: '4px', marginTop: '4px' }}>SLAVE</div>
               )}
             </div>
-            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>{board2?.host || '10.42.0.12'}</div>
+            <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>
+              {board2?.transport === 'serial' ? board2.device : (board2?.host || '10.42.0.12')}
+            </div>
           </div>
         </div>
       </div>
@@ -691,7 +797,7 @@ function Dashboard() {
               {status?.online && ptp ? (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
                   <div style={statBox}><div style={statLabel}>Profile</div><div style={statValue}>{ptp.profile || '-'}</div></div>
-                  <div style={statBox}><div style={statLabel}>AS-Capable</div><div style={{ ...statValue, color: ptp.asCapable ? colors.success : colors.textLight }}>{ptp.asCapable ? 'Yes' : 'No'}</div></div>
+                  <div style={statBox}><div style={statLabel}>802.1AS</div><div style={{ ...statValue, color: ptp.asCapable ? colors.success : colors.textLight }}>{ptp.asCapable ? '✓' : '✗'}</div></div>
                   <div style={statBox}><div style={statLabel}>Servo</div><div style={statValue}>{servoStateText(ptp.servoState)}</div></div>
                   <div style={{ ...statBox, gridColumn: '1 / -1', background: colors.bgAlt }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -816,14 +922,11 @@ function Dashboard() {
               title="Pdelay Analysis"
               description="Peer Delay 메시지가 정상적으로 교환되고 있는지 확인"
               badge={pdelayDetails?.spikes > 0 ? `${pdelayDetails.spikes} spikes` : null}
-              note="Turnaround(t3-t2)은 PCAP에서 참고용으로만 표시됨. 클럭 기준이 달라 물리적 의미 없음. 정확한 Link Delay는 Board 값 사용"
-              noteType="warning"
+              note="Pdelay 교환 횟수와 RTT를 모니터링. 정확한 Link Delay는 Board에서 직접 읽은 값 사용"
             >
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
-                <div style={statBox}><div style={statLabel}>t2 (Req Receipt)</div><div style={{ ...statValue, fontSize: '0.75rem' }}>{pdelayInfo?.t2_sec != null ? `${pdelayInfo.t2_sec}.${String(pdelayInfo.t2_ns || 0).padStart(9, '0').slice(0, 6)}` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>t3 (Resp Origin)</div><div style={{ ...statValue, fontSize: '0.75rem' }}>{pdelayInfo?.t3_sec != null ? `${pdelayInfo.t3_sec}.${String(pdelayInfo.t3_ns || 0).padStart(9, '0').slice(0, 6)}` : '-'}</div></div>
-                <div style={{ ...statBox, background: colors.bgWarm, borderColor: '#fde68a' }}><div style={statLabel}>Turnaround (ref only)</div><div style={{ ...statValue, fontSize: '0.8rem', color: '#92400e' }}>{pdelayInfo?.turnaround != null ? (Math.abs(pdelayInfo.turnaround) < 1e9 ? `${(pdelayInfo.turnaround / 1000).toFixed(1)} μs` : 'N/A') : '-'}</div></div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' }}>
                 <div style={statBox}><div style={statLabel}>Exchanges</div><div style={statValue}>{pdelayInfo?.count || 0}</div></div>
+                <div style={statBox}><div style={statLabel}>Capture RTT</div><div style={statValue}>{pdelayInfo?.lastRtt ? `${pdelayInfo.lastRtt}ms` : '-'}</div></div>
               </div>
             </Section>
 

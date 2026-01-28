@@ -54,9 +54,7 @@ function PTP() {
       const gmIdMatch = yamlStr.match(/grandmaster-identity:\s*([\w-]+)/)
       if (gmIdMatch) status.grandmasterIdentity = gmIdMatch[1]
 
-      if (status.clockIdentity && status.grandmasterIdentity) {
-        status.isGrandmaster = status.clockIdentity === status.grandmasterIdentity
-      }
+      // Note: isGrandmaster is set later based on parent-port-identity
 
       const parentSection = yamlStr.match(/parent-port-identity:[\s\S]*?clock-identity:\s*([\w-]+)[\s\S]*?port-number:\s*(\d+)/)
       if (parentSection) {
@@ -64,20 +62,36 @@ function PTP() {
         status.parentPortNumber = parseInt(parentSection[2])
       }
 
-      const portBlocks = yamlStr.split(/(?=port-ds:)/).slice(1)
-      for (const block of portBlocks) {
-        const portIndexMatch = block.match(/port-index:\s*(\d+)/)
-        const portStateMatch = block.match(/port-state:\s*(\w+)/)
-        const meanLinkDelayMatch = block.match(/mean-link-delay:\s*(\d+)/)
-        const asCapableMatch = block.match(/as-capable:\s*(\w+)/)
+      // Determine GM status: true if parent clock is 00-00-00-00-00-00-00-00 or same as self
+      if (status.parentClockIdentity) {
+        const isParentNull = status.parentClockIdentity === '00-00-00-00-00-00-00-00'
+        const isParentSelf = status.parentClockIdentity === status.clockIdentity
+        status.isGrandmaster = isParentNull || isParentSelf
+      }
 
-        if (portIndexMatch && portStateMatch) {
-          status.ports.push({
-            index: parseInt(portIndexMatch[1]),
-            state: portStateMatch[1],
-            meanLinkDelay: meanLinkDelayMatch ? parseInt(meanLinkDelayMatch[1]) : null,
-            asCapable: asCapableMatch ? asCapableMatch[1] === 'true' : null
-          })
+      // Parse port entries - look for port-index followed by port info
+      const portRegex = /port-index:\s*(\d+)[\s\S]*?port-state:\s*(\w+)[\s\S]*?(?:mean-link-delay:\s*(\d+))?[\s\S]*?(?:as-capable:\s*(\w+))?/g
+      let portMatch
+      while ((portMatch = portRegex.exec(yamlStr)) !== null) {
+        status.ports.push({
+          index: parseInt(portMatch[1]),
+          state: portMatch[2],
+          meanLinkDelay: portMatch[3] ? parseInt(portMatch[3]) : null,
+          asCapable: portMatch[4] ? portMatch[4] === 'true' : null
+        })
+      }
+
+      // If regex didn't work, try simpler approach
+      if (status.ports.length === 0) {
+        const simplePortMatch = yamlStr.match(/port-index:\s*(\d+)[\s\S]*?port-state:\s*(\w+)/g)
+        if (simplePortMatch) {
+          for (const match of simplePortMatch) {
+            const idx = match.match(/port-index:\s*(\d+)/)
+            const st = match.match(/port-state:\s*(\w+)/)
+            if (idx && st) {
+              status.ports.push({ index: parseInt(idx[1]), state: st[1] })
+            }
+          }
         }
       }
 
@@ -260,6 +274,76 @@ function PTP() {
     return '#f8fafc'
   }
 
+  // Quick setup - configure Board1 as GM, Board2 as Slave
+  const quickSetup = async () => {
+    if (devices.length < 2) {
+      setError('Need at least 2 devices for Quick Setup')
+      return
+    }
+    setLoading(true)
+    setError(null)
+
+    const board1 = devices[0]
+    const board2 = devices[1]
+
+    try {
+      // Configure Board 1 as GM on port 8
+      await axios.post('/api/patch', {
+        patches: [
+          {
+            path: '/ieee1588-ptp:ptp/instances/instance',
+            value: {
+              'instance-index': 0,
+              'default-ds': { 'external-port-config-enable': true },
+              'mchp-velocitysp-ptp:automotive': { profile: 'gm' },
+              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'master' } }] },
+              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+            }
+          },
+          {
+            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
+          }
+        ],
+        transport: board1.transport,
+        device: board1.device,
+        host: board1.host,
+        port: board1.port || 5683
+      })
+
+      // Configure Board 2 as Slave on port 8
+      await axios.post('/api/patch', {
+        patches: [
+          {
+            path: '/ieee1588-ptp:ptp/instances/instance',
+            value: {
+              'instance-index': 0,
+              'default-ds': { 'external-port-config-enable': true },
+              'mchp-velocitysp-ptp:automotive': { profile: 'bridge' },
+              ports: { port: [{ 'port-index': 8, 'external-port-config-port-ds': { 'desired-state': 'slave' } }] },
+              'mchp-velocitysp-ptp:servos': { servo: [{ 'servo-index': 0, 'servo-type': 'pi', 'ltc-index': 0 }] }
+            }
+          },
+          {
+            path: '/ieee1588-ptp:ptp/mchp-velocitysp-ptp:ltcs/ltc',
+            value: { 'ltc-index': 0, 'ptp-pins': { 'ptp-pin': [{ index: 4, function: '1pps-out' }] } }
+          }
+        ],
+        transport: board2.transport,
+        device: board2.device,
+        host: board2.host,
+        port: board2.port || 5683
+      })
+
+      setLastResult({ quickSetup: true, board1: board1.name, board2: board2.name })
+      setTimeout(() => fetchAllStatuses(true), 500)
+    } catch (err) {
+      setError(err.response?.data?.error || err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div>
       <div className="page-header">
@@ -271,6 +355,9 @@ function PTP() {
           </label>
           <button className="btn btn-secondary" onClick={() => fetchAllStatuses(false)} disabled={loading}>
             Refresh
+          </button>
+          <button className="btn btn-primary" onClick={quickSetup} disabled={loading || devices.length < 2}>
+            Quick Setup
           </button>
         </div>
       </div>
@@ -451,6 +538,10 @@ function PTP() {
           </div>
           {lastResult.reset ? (
             <div style={{ color: '#16a34a' }}>Configuration reset</div>
+          ) : lastResult.quickSetup ? (
+            <div style={{ color: '#16a34a' }}>
+              Quick Setup complete: {lastResult.board1} (GM) + {lastResult.board2} (Slave)
+            </div>
           ) : (
             <div>
               {lastResult.results?.map((r, i) => (
