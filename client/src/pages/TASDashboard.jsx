@@ -173,13 +173,14 @@ function TASDashboard() {
 
     try {
       const basePath = getBasePath(8)
+      // TC1-7 only (TC0 always open - Best Effort background)
       const gclEntries = []
-      for (let i = 0; i < 8; i++) {
+      for (let i = 1; i <= 7; i++) {
         gclEntries.push({
-          index: i,
+          index: i - 1,
           'operation-name': 'ieee802-dot1q-sched:set-gate-states',
           'time-interval-value': 125000,
-          'gate-states-value': 1 << i
+          'gate-states-value': (1 << i) | 1  // TC[i] + TC0 always open
         })
       }
 
@@ -187,7 +188,7 @@ function TASDashboard() {
         { path: `${basePath}/gate-enabled`, value: true },
         { path: `${basePath}/admin-gate-states`, value: 255 },
         { path: `${basePath}/admin-control-list/gate-control-entry`, value: gclEntries },
-        { path: `${basePath}/admin-cycle-time/numerator`, value: 1000000 },
+        { path: `${basePath}/admin-cycle-time/numerator`, value: 875000 },  // 7 slots × 125μs
         { path: `${basePath}/admin-cycle-time/denominator`, value: 1 },
         { path: `${basePath}/admin-cycle-time-extension`, value: 0 },
         { path: `${basePath}/admin-base-time/seconds`, value: '0' },
@@ -201,7 +202,7 @@ function TASDashboard() {
       }, { timeout: 10000 })
 
       setAutoSetupStatus('success')
-      setAutoSetupMessage('TAS: 8 slots × 125μs = 1ms cycle')
+      setAutoSetupMessage('TAS: 7 slots × 125μs (TC1-7, TC0 always open)')
       setTimeout(() => { fetchTASStatus(); setTimeout(() => { setAutoSetupStatus(null) }, 2000) }, 1000)
     } catch (err) {
       setAutoSetupStatus('error')
@@ -708,53 +709,32 @@ function TASDashboard() {
         </div>
       )}
 
-      {/* Recent Captured Packets */}
+      {/* Recent Captured Packets - Simple View */}
       {capturedPackets.length > 0 && (
         <div className="card" style={{ marginBottom: '16px' }}>
           <div className="card-header">
-            <h2 className="card-title">Recent Captured Packets</h2>
-            <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
+            <h2 className="card-title">Captured Packets</h2>
+            <span style={{ fontSize: '0.7rem', color: colors.textMuted, fontFamily: 'monospace' }}>
+              Total: {capturedPackets.length}
+            </span>
           </div>
-          <div style={{ maxHeight: '200px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead style={{ position: 'sticky', top: 0, background: colors.bg }}>
-                <tr style={{ borderBottom: `1px solid ${colors.border}` }}>
-                  <th style={{ padding: '4px 8px', textAlign: 'left', width: '80px' }}>Time</th>
-                  <th style={{ padding: '4px 8px', textAlign: 'center', width: '50px' }}>PCP</th>
-                  <th style={{ padding: '4px 8px', textAlign: 'center', width: '60px' }}>VID</th>
-                  <th style={{ padding: '4px 8px', textAlign: 'right', width: '60px' }}>Length</th>
-                  <th style={{ padding: '4px 8px', textAlign: 'left' }}>Source</th>
-                  <th style={{ padding: '4px 8px', textAlign: 'left' }}>Destination</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capturedPackets.slice(-50).reverse().map((pkt, idx) => (
-                  <tr key={idx} style={{ borderBottom: `1px solid ${colors.border}` }}>
-                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>
-                      {new Date(pkt.time).toLocaleTimeString()}
-                    </td>
-                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                      <span style={{
-                        display: 'inline-block',
-                        padding: '2px 6px',
-                        borderRadius: '3px',
-                        background: tcColors[pkt.pcp] || colors.bgAlt,
-                        color: pkt.pcp > 0 ? '#fff' : colors.text,
-                        fontWeight: '600'
-                      }}>
-                        {pkt.pcp}
-                      </span>
-                    </td>
-                    <td style={{ padding: '4px 8px', textAlign: 'center', color: pkt.vid ? colors.text : colors.textLight }}>
-                      {pkt.vid || '-'}
-                    </td>
-                    <td style={{ padding: '4px 8px', textAlign: 'right' }}>{pkt.length}</td>
-                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>{pkt.src || '-'}</td>
-                    <td style={{ padding: '4px 8px', color: colors.textMuted }}>{pkt.dst || '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div style={{ maxHeight: '150px', overflow: 'auto', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.7rem', fontFamily: 'monospace' }}>
+            {capturedPackets.slice(-30).reverse().map((pkt, idx) => (
+              <div key={idx} style={{ display: 'flex', gap: '8px', padding: '2px 0', borderBottom: `1px solid ${colors.border}` }}>
+                <span style={{ color: colors.textLight, width: '70px' }}>{new Date(pkt.time).toLocaleTimeString()}</span>
+                <span style={{
+                  padding: '0 6px',
+                  borderRadius: '3px',
+                  background: tcColors[pkt.pcp],
+                  color: '#fff',
+                  fontWeight: '600',
+                  minWidth: '35px',
+                  textAlign: 'center'
+                }}>TC{pkt.pcp}</span>
+                <span style={{ color: colors.textMuted }}>{pkt.length}B</span>
+                <span style={{ color: colors.textLight }}>{pkt.vid ? `VID:${pkt.vid}` : 'untagged'}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}
