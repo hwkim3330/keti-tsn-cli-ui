@@ -116,7 +116,8 @@ router.post('/start', (req, res) => {
     dstMac,
     srcMac,
     vlanId = 0,
-    pcp = 0,
+    pcp = 0,  // Can be single number or array
+    pcpList,  // Alternative: array of PCPs to send
     packetSize = 100,
     packetsPerSecond = 100,
     duration = 0, // 0 = unlimited
@@ -131,8 +132,12 @@ router.post('/start', (req, res) => {
     return res.status(400).json({ error: 'Destination MAC required' });
   }
 
-  if (generators.has(ifaceName)) {
-    return res.status(400).json({ error: `Generator already running on ${ifaceName}` });
+  // Use interface+pcp as key to allow multiple TCs on same interface
+  const pcpValue = parseInt(pcp) || 0;
+  const generatorKey = `${ifaceName}:${pcpValue}`;
+
+  if (generators.has(generatorKey)) {
+    return res.status(400).json({ error: `Generator already running for ${generatorKey}` });
   }
 
   try {
@@ -153,7 +158,7 @@ router.post('/start', (req, res) => {
       dstMac,
       srcMac: sourceMac,
       vlanId: parseInt(vlanId) || 0,
-      pcp: parseInt(pcp) || 0,
+      pcp: pcpValue,
       payloadSize: Math.max(46, parseInt(packetSize) - 18) // Min payload for 64 byte frame
     });
 
@@ -176,12 +181,12 @@ router.post('/start', (req, res) => {
 
       // Check limits
       if (maxPackets > 0 && stats.sent >= maxPackets) {
-        stopGenerator(ifaceName);
+        stopGenerator(generatorKey);
         return;
       }
 
       if (maxDuration > 0 && (Date.now() - stats.startTime) >= maxDuration) {
-        stopGenerator(ifaceName);
+        stopGenerator(generatorKey);
         return;
       }
 
@@ -196,22 +201,24 @@ router.post('/start', (req, res) => {
     // Use setInterval for rate control
     const timer = setInterval(sendPacket, interval);
 
-    generators.set(ifaceName, {
+    generators.set(generatorKey, {
       cap,
       timer,
       stats,
-      config: { dstMac, srcMac: sourceMac, vlanId, pcp, packetSize, packetsPerSecond: pps }
+      ifaceName,
+      config: { dstMac, srcMac: sourceMac, vlanId, pcp: pcpValue, packetSize, packetsPerSecond: pps }
     });
 
     res.json({
       success: true,
-      message: `Traffic generator started on ${ifaceName}`,
+      message: `Traffic generator started: ${generatorKey}`,
+      generatorKey,
       config: {
         interface: ifaceName,
         dstMac,
         srcMac: sourceMac,
         vlanId,
-        pcp,
+        pcp: pcpValue,
         packetSize: frame.length,
         packetsPerSecond: pps,
         duration: duration || 'unlimited',
@@ -224,15 +231,15 @@ router.post('/start', (req, res) => {
 });
 
 // Stop generator helper
-function stopGenerator(ifaceName) {
-  const gen = generators.get(ifaceName);
+function stopGenerator(generatorKey) {
+  const gen = generators.get(generatorKey);
   if (gen) {
     gen.stats.running = false;
     clearInterval(gen.timer);
     try {
       gen.cap.close();
     } catch (e) {}
-    generators.delete(ifaceName);
+    generators.delete(generatorKey);
     return gen.stats;
   }
   return null;
@@ -240,30 +247,46 @@ function stopGenerator(ifaceName) {
 
 // Stop traffic generation
 router.post('/stop', (req, res) => {
-  const { interface: ifaceName } = req.body;
+  const { interface: ifaceName, pcp, generatorKey } = req.body;
 
-  if (ifaceName) {
-    const stats = stopGenerator(ifaceName);
+  if (generatorKey) {
+    // Stop specific generator by key
+    const stats = stopGenerator(generatorKey);
     if (stats) {
       res.json({
         success: true,
-        message: `Traffic generator stopped on ${ifaceName}`,
-        stats: {
+        message: `Traffic generator stopped: ${generatorKey}`,
+        stats: { sent: stats.sent, errors: stats.errors, duration: Date.now() - stats.startTime }
+      });
+    } else {
+      res.status(404).json({ error: `No generator: ${generatorKey}` });
+    }
+  } else if (ifaceName) {
+    // Stop all generators for this interface (any PCP)
+    const results = [];
+    for (const [key, gen] of generators) {
+      if (key.startsWith(ifaceName + ':')) {
+        const stats = stopGenerator(key);
+        results.push({
+          generatorKey: key,
           sent: stats.sent,
           errors: stats.errors,
           duration: Date.now() - stats.startTime
-        }
-      });
+        });
+      }
+    }
+    if (results.length > 0) {
+      res.json({ success: true, message: `Stopped ${results.length} generator(s) on ${ifaceName}`, stopped: results });
     } else {
-      res.status(404).json({ error: `No generator running on ${ifaceName}` });
+      res.status(404).json({ error: `No generators running on ${ifaceName}` });
     }
   } else {
     // Stop all
     const results = [];
-    for (const [name, gen] of generators) {
-      const stats = stopGenerator(name);
+    for (const [key, gen] of generators) {
+      const stats = stopGenerator(key);
       results.push({
-        interface: name,
+        generatorKey: key,
         sent: stats.sent,
         errors: stats.errors,
         duration: Date.now() - stats.startTime

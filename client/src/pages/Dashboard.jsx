@@ -5,7 +5,6 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 
 const TAP_INTERFACE = 'enxc84d44231cc2'
 const SYNC_PERIOD_NS = 125_000_000
-const SYNC_PERIOD_MS = 125
 
 function logPeriodToMs(log) {
   return Math.pow(2, log) * 1000
@@ -51,18 +50,48 @@ function mae(actual, predicted) {
   return sum / actual.length
 }
 
-// Muted color palette
+// Professional muted color palette
 const colors = {
-  text: '#334155',
+  text: '#1e293b',
   textMuted: '#64748b',
   textLight: '#94a3b8',
   bg: '#f8fafc',
   bgAlt: '#f1f5f9',
+  bgWarm: '#fffbeb',
   border: '#e2e8f0',
+  borderLight: '#f1f5f9',
   accent: '#475569',
   success: '#059669',
   warning: '#d97706',
   error: '#dc2626',
+  info: '#0284c7',
+}
+
+// Section component with description
+function Section({ title, description, note, noteType = 'info', badge, children }) {
+  const noteColors = {
+    info: { bg: colors.bgAlt, border: colors.border, text: colors.textMuted },
+    warning: { bg: colors.bgWarm, border: '#fde68a', text: '#92400e' },
+  }
+  const noteStyle = noteColors[noteType] || noteColors.info
+
+  return (
+    <div style={{ marginBottom: '20px' }}>
+      <div style={{ marginBottom: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+          <h3 style={{ fontSize: '0.85rem', fontWeight: '600', color: colors.text, margin: 0 }}>{title}</h3>
+          {badge && <span style={{ fontSize: '0.6rem', padding: '2px 6px', borderRadius: '3px', background: colors.bgAlt, color: colors.textMuted }}>{badge}</span>}
+        </div>
+        {description && <p style={{ fontSize: '0.7rem', color: colors.textMuted, margin: 0, lineHeight: 1.4 }}>{description}</p>}
+      </div>
+      {children}
+      {note && (
+        <div style={{ marginTop: '8px', padding: '8px 10px', background: noteStyle.bg, border: `1px solid ${noteStyle.border}`, borderRadius: '4px', fontSize: '0.65rem', color: noteStyle.text, lineHeight: 1.4 }}>
+          {note}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function Dashboard() {
@@ -71,6 +100,8 @@ function Dashboard() {
   const [loading, setLoading] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [refreshInterval, setRefreshInterval] = useState(5000)
+  const [autoSetupStatus, setAutoSetupStatus] = useState(null) // null, 'running', 'success', 'error'
+  const [autoSetupMessage, setAutoSetupMessage] = useState('')
   const intervalRef = useRef(null)
   const [offsetHistory, setOffsetHistory] = useState([])
   const [connectionStats, setConnectionStats] = useState({})
@@ -353,7 +384,7 @@ function Dashboard() {
         if (dtCapture > 0) {
           const rateRatio = Number(dtPtp) / dtCapture
           const ppm = (rateRatio - 1) * 1_000_000
-          const driftDirection = ppm > 0 ? 'fast' : ppm < 0 ? 'slow' : 'stable'
+          const driftDirection = ppm > 0.01 ? 'fast' : ppm < -0.01 ? 'slow' : 'stable'
           return { t1History: newHistory, rateRatio: rateRatio.toFixed(9), ppm: ppm.toFixed(3), driftDirection }
         }
         return { ...prev, t1History: newHistory }
@@ -476,6 +507,52 @@ function Dashboard() {
     ptpStateRef.current = { lastSync: null, lastPdelayReq: null, lastPdelayResp: null }
   }
 
+  const autoSetup = async () => {
+    const gmDevice = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
+    const slaveDevice = devices.find(d => d.host === '10.42.0.12' || d.name.includes('#2'))
+
+    if (!gmDevice || !slaveDevice) {
+      setAutoSetupStatus('error')
+      setAutoSetupMessage('Both Board 1 (GM) and Board 2 (Slave) must be configured')
+      return
+    }
+
+    setAutoSetupStatus('running')
+    setAutoSetupMessage('Applying GM profile to Board 1...')
+
+    try {
+      // Step 1: Apply GM profile to Board 1
+      await axios.post(`/api/ptp/apply/${gmDevice.host}`, { profile: 'gm', portIndex: 8 }, { timeout: 30000 })
+      setAutoSetupMessage('Saving Board 1 config...')
+
+      // Step 2: Save Board 1 config
+      await axios.post(`/api/ptp/save/${gmDevice.host}`, {}, { timeout: 30000 })
+      setAutoSetupMessage('Applying Bridge profile to Board 2...')
+
+      // Step 3: Apply Bridge/Slave profile to Board 2
+      await axios.post(`/api/ptp/apply/${slaveDevice.host}`, { profile: 'bridge', portIndex: 8 }, { timeout: 30000 })
+      setAutoSetupMessage('Saving Board 2 config...')
+
+      // Step 4: Save Board 2 config
+      await axios.post(`/api/ptp/save/${slaveDevice.host}`, {}, { timeout: 30000 })
+
+      setAutoSetupStatus('success')
+      setAutoSetupMessage('PTP setup completed. Both boards configured and saved.')
+
+      // Refresh status after setup
+      setTimeout(() => {
+        fetchAll()
+        setTimeout(() => {
+          setAutoSetupStatus(null)
+          setAutoSetupMessage('')
+        }, 3000)
+      }, 1000)
+    } catch (err) {
+      setAutoSetupStatus('error')
+      setAutoSetupMessage(`Setup failed: ${err.response?.data?.error || err.message}`)
+    }
+  }
+
   const servoStateText = (state) => ({ 0: 'Init', 1: 'Tracking', 2: 'Locked', 3: 'Holdover' }[state] ?? '-')
 
   const board1 = devices.find(d => d.host === '10.42.0.11' || d.name.includes('#1'))
@@ -495,16 +572,34 @@ function Dashboard() {
   const offsetStats = getOffsetStats()
 
   // Styles
-  const statBox = { padding: '12px', background: colors.bg, borderRadius: '6px', border: `1px solid ${colors.border}` }
-  const statLabel = { fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }
-  const statValue = { fontWeight: '600', fontSize: '0.9rem', fontFamily: 'monospace', color: colors.text }
-  const sectionTitle = { fontSize: '0.8rem', fontWeight: '600', color: colors.text, marginBottom: '12px', paddingBottom: '8px', borderBottom: `1px solid ${colors.border}` }
+  const statBox = { padding: '10px 12px', background: colors.bg, borderRadius: '4px', border: `1px solid ${colors.border}` }
+  const statLabel = { fontSize: '0.6rem', color: colors.textMuted, marginBottom: '2px', textTransform: 'uppercase', letterSpacing: '0.02em' }
+  const statValue = { fontWeight: '600', fontSize: '0.85rem', fontFamily: 'ui-monospace, monospace', color: colors.text }
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">PTP Dashboard</h1>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          {autoSetupStatus && (
+            <div style={{
+              padding: '4px 10px',
+              borderRadius: '4px',
+              fontSize: '0.75rem',
+              background: autoSetupStatus === 'running' ? colors.bgAlt : autoSetupStatus === 'success' ? '#dcfce7' : '#fef2f2',
+              color: autoSetupStatus === 'running' ? colors.textMuted : autoSetupStatus === 'success' ? '#166534' : colors.error,
+              border: `1px solid ${autoSetupStatus === 'running' ? colors.border : autoSetupStatus === 'success' ? '#bbf7d0' : '#fecaca'}`,
+              maxWidth: '300px',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}>
+              {autoSetupStatus === 'running' && <span style={{ marginRight: '6px' }}>⏳</span>}
+              {autoSetupStatus === 'success' && <span style={{ marginRight: '6px' }}>✓</span>}
+              {autoSetupStatus === 'error' && <span style={{ marginRight: '6px' }}>✕</span>}
+              {autoSetupMessage}
+            </div>
+          )}
           <select value={refreshInterval} onChange={(e) => setRefreshInterval(parseInt(e.target.value))}
             style={{ padding: '6px 10px', borderRadius: '4px', border: `1px solid ${colors.border}`, fontSize: '0.8rem', background: '#fff' }}>
             <option value={3000}>3s</option>
@@ -516,13 +611,21 @@ function Dashboard() {
             Auto
           </label>
           <button className="btn btn-secondary" onClick={fetchAll} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
+          <button
+            className="btn btn-primary"
+            onClick={autoSetup}
+            disabled={autoSetupStatus === 'running' || devices.length < 2}
+            title="Apply GM to Board 1, Slave to Board 2, and save to startup-config"
+            style={{ fontSize: '0.8rem' }}
+          >
+            {autoSetupStatus === 'running' ? 'Setting...' : 'Auto Setup'}
+          </button>
         </div>
       </div>
 
       {/* Topology */}
       <div className="card" style={{ marginBottom: '16px', padding: '24px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '48px' }}>
-          {/* Board 1 */}
           <div style={{ textAlign: 'center' }}>
             <div style={{
               width: '140px', height: '80px', border: `2px solid ${board1Status?.online ? colors.accent : colors.border}`,
@@ -538,7 +641,6 @@ function Dashboard() {
             <div style={{ fontSize: '0.7rem', color: colors.textMuted, marginTop: '6px' }}>{board1?.host || '10.42.0.11'}</div>
           </div>
 
-          {/* Connection */}
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
             <div style={{ fontSize: '0.7rem', color: colors.textMuted }}>Port 8 - Port 8</div>
             <div style={{ width: '80px', height: '2px', background: isSynced ? colors.success : colors.border, borderRadius: '1px' }} />
@@ -550,7 +652,6 @@ function Dashboard() {
             )}
           </div>
 
-          {/* Board 2 */}
           <div style={{ textAlign: 'center' }}>
             <div style={{
               width: '140px', height: '80px', border: `2px solid ${board2Status?.online ? colors.accent : colors.border}`,
@@ -624,7 +725,7 @@ function Dashboard() {
                 <YAxis tick={{ fontSize: 10 }} stroke={colors.textLight} domain={['auto', 'auto']} label={{ value: 'ns', angle: -90, position: 'insideLeft', fontSize: 10 }} />
                 <Tooltip contentStyle={{ fontSize: '0.75rem', background: '#fff', border: `1px solid ${colors.border}` }} formatter={(value) => [`${value} ns`, 'Offset']} />
                 <ReferenceLine y={0} stroke={colors.textLight} strokeDasharray="3 3" />
-                {devices.map((device, idx) => (
+                {devices.map((device) => (
                   <Line key={device.id} type="monotone" dataKey={device.name} stroke={colors.accent} strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />
                 ))}
               </LineChart>
@@ -657,20 +758,21 @@ function Dashboard() {
 
         {tapCapturing ? (
           <div>
-            {/* Summary Row */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', marginBottom: '16px' }}>
-              <div style={statBox}><div style={statLabel}>Board Offset</div><div style={statValue}>{board2Status?.ptp?.offset ?? '-'} ns</div></div>
-              <div style={statBox}><div style={statLabel}>Link Delay</div><div style={statValue}>{board2Status?.ptp?.meanLinkDelay ? (board2Status.ptp.meanLinkDelay / 65536).toFixed(0) : '-'} ns</div></div>
-              <div style={statBox}><div style={statLabel}>Correction (C)</div><div style={statValue}>{syncPairs[syncPairs.length - 1]?.totalCorr ?? 0} ns</div></div>
-              <div style={statBox}><div style={statLabel}>Pdelay Count</div><div style={statValue}>{pdelayInfo?.count || 0}</div></div>
+            {/* Board Reference Values */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px', marginBottom: '20px', padding: '12px', background: colors.bgAlt, borderRadius: '6px' }}>
+              <div><div style={statLabel}>Board Offset</div><div style={{ ...statValue, fontSize: '1rem' }}>{board2Status?.ptp?.offset ?? '-'} ns</div></div>
+              <div><div style={statLabel}>Link Delay (Board)</div><div style={statValue}>{board2Status?.ptp?.meanLinkDelay ? (board2Status.ptp.meanLinkDelay / 65536).toFixed(0) : '-'} ns</div></div>
+              <div><div style={statLabel}>Correction (C)</div><div style={statValue}>{syncPairs[syncPairs.length - 1]?.totalCorr ?? 0} ns</div></div>
+              <div><div style={statLabel}>Servo State</div><div style={statValue}>{servoStateText(board2Status?.ptp?.servoState)}</div></div>
             </div>
 
-            {/* PTP Structure */}
-            <div style={{ marginBottom: '16px' }}>
-              <div style={sectionTitle}>
-                PTP Structure
-                {ptpStructure?.seqGaps?.length > 0 && <span style={{ marginLeft: '8px', fontSize: '0.65rem', color: colors.warning }}>{ptpStructure.seqGaps.length} gaps</span>}
-              </div>
+            {/* Section 1: PTP Structure */}
+            <Section
+              title="PTP Structure"
+              description="gPTP(IEEE 802.1AS) 프로토콜이 형식적으로 정상 동작하는지 검증"
+              badge={ptpStructure?.seqGaps?.length > 0 ? `${ptpStructure.seqGaps.length} gaps` : null}
+              note="Sequence Gap은 네트워크 오류가 아닌 PCAP 캡처 손실(USB NIC, OS 스케줄링)일 가능성이 높음"
+            >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '8px' }}>
                 <div style={statBox}><div style={statLabel}>Domain</div><div style={statValue}>{ptpStructure?.domainNumber ?? '-'}</div></div>
                 <div style={statBox}><div style={statLabel}>2-Step</div><div style={statValue}>{ptpStructure?.twoStepFlag === true ? 'Yes' : ptpStructure?.twoStepFlag === false ? 'No' : '-'}</div></div>
@@ -679,64 +781,72 @@ function Dashboard() {
                 <div style={statBox}><div style={statLabel}>Messages</div><div style={statValue}>{ptpStructure?.totalMessages || 0}</div></div>
                 <div style={statBox}><div style={statLabel}>Seq Gaps</div><div style={{ ...statValue, color: ptpStructure?.seqGaps?.length > 0 ? colors.warning : colors.text }}>{ptpStructure?.seqGaps?.length || 0}</div></div>
               </div>
-            </div>
+            </Section>
 
-            {/* Sync Period & Jitter */}
-            <div style={{ marginBottom: '16px' }}>
-              <div style={sectionTitle}>Sync Period & Jitter</div>
+            {/* Section 2: Sync Period & Jitter */}
+            <Section
+              title="Sync Period & Jitter"
+              description="Grandmaster(GM)가 Sync를 얼마나 정확하고 안정적으로 송신하는지 측정"
+              note="μs 단위 지터는 하드웨어 GM + 캡처 환경에서 정상 범위. GM 타이밍 생성 안정성을 나타냄"
+            >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
                 <div style={statBox}><div style={statLabel}>Period (mean)</div><div style={statValue}>{syncStats?.periodMean ? `${(syncStats.periodMean / 1_000_000).toFixed(3)} ms` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>Period (std)</div><div style={statValue}>{syncStats?.periodStd ? `${(syncStats.periodStd / 1000).toFixed(1)} us` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>Jitter (mean)</div><div style={statValue}>{syncStats?.jitterMean != null ? `${(syncStats.jitterMean / 1000).toFixed(1)} us` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>Jitter (max)</div><div style={statValue}>{syncStats?.jitterMax ? `${(syncStats.jitterMax / 1000).toFixed(1)} us` : '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Period (std)</div><div style={statValue}>{syncStats?.periodStd ? `${(syncStats.periodStd / 1000).toFixed(1)} μs` : '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Jitter (mean)</div><div style={statValue}>{syncStats?.jitterMean != null ? `${(syncStats.jitterMean / 1000).toFixed(1)} μs` : '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Jitter (max)</div><div style={statValue}>{syncStats?.jitterMax ? `±${(syncStats.jitterMax / 1000).toFixed(1)} μs` : '-'}</div></div>
               </div>
-            </div>
+            </Section>
 
-            {/* Rate Ratio & Drift */}
-            <div style={{ marginBottom: '16px' }}>
-              <div style={sectionTitle}>Rate Ratio & Drift</div>
+            {/* Section 3: Rate Ratio & Drift */}
+            <Section
+              title="Rate Ratio & Drift"
+              description="GM과 Slave 클럭의 속도(주파수) 차이 분석"
+              note={driftStats?.driftDirection === 'stable' ? 'Stable: 주파수 차이가 사실상 없음. 서보가 완전히 수렴된 상태' : driftStats?.driftDirection === 'fast' ? 'Fast: GM 클럭이 더 빠름' : driftStats?.driftDirection === 'slow' ? 'Slow: Slave 클럭이 더 빠름' : '클럭 간 주파수 비율을 측정 중...'}
+            >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
                 <div style={statBox}><div style={statLabel}>Rate Ratio</div><div style={statValue}>{driftStats?.rateRatio ?? '-'}</div></div>
                 <div style={statBox}><div style={statLabel}>PPM Drift</div><div style={statValue}>{driftStats?.ppm ? `${driftStats.ppm} ppm` : '-'}</div></div>
-                <div style={statBox}><div style={statLabel}>Direction</div><div style={statValue}>{driftStats?.driftDirection === 'fast' ? 'Fast' : driftStats?.driftDirection === 'slow' ? 'Slow' : driftStats?.driftDirection === 'stable' ? 'Stable' : '-'}</div></div>
+                <div style={statBox}><div style={statLabel}>Direction</div><div style={{ ...statValue, color: driftStats?.driftDirection === 'stable' ? colors.success : colors.text }}>{driftStats?.driftDirection === 'fast' ? 'Fast' : driftStats?.driftDirection === 'slow' ? 'Slow' : driftStats?.driftDirection === 'stable' ? 'Stable' : '-'}</div></div>
               </div>
-            </div>
+            </Section>
 
-            {/* Pdelay Details */}
-            <div style={{ marginBottom: '16px' }}>
-              <div style={sectionTitle}>
-                Pdelay Analysis
-                {pdelayDetails?.spikes > 0 && <span style={{ marginLeft: '8px', fontSize: '0.65rem', color: colors.warning }}>{pdelayDetails.spikes} spikes</span>}
-              </div>
+            {/* Section 4: Pdelay Analysis */}
+            <Section
+              title="Pdelay Analysis"
+              description="Peer Delay 메시지가 정상적으로 교환되고 있는지 확인"
+              badge={pdelayDetails?.spikes > 0 ? `${pdelayDetails.spikes} spikes` : null}
+              note="Turnaround(t3-t2)은 PCAP에서 참고용으로만 표시됨. 클럭 기준이 달라 물리적 의미 없음. 정확한 Link Delay는 Board 값 사용"
+              noteType="warning"
+            >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
                 <div style={statBox}><div style={statLabel}>t2 (Req Receipt)</div><div style={{ ...statValue, fontSize: '0.75rem' }}>{pdelayInfo?.t2_sec != null ? `${pdelayInfo.t2_sec}.${String(pdelayInfo.t2_ns || 0).padStart(9, '0').slice(0, 6)}` : '-'}</div></div>
                 <div style={statBox}><div style={statLabel}>t3 (Resp Origin)</div><div style={{ ...statValue, fontSize: '0.75rem' }}>{pdelayInfo?.t3_sec != null ? `${pdelayInfo.t3_sec}.${String(pdelayInfo.t3_ns || 0).padStart(9, '0').slice(0, 6)}` : '-'}</div></div>
-                <div style={{ ...statBox, background: '#fffbeb' }}><div style={statLabel}>Turnaround (ref)</div><div style={{ ...statValue, fontSize: '0.8rem' }}>{pdelayInfo?.turnaround != null ? (Math.abs(pdelayInfo.turnaround) < 1e9 ? `${(pdelayInfo.turnaround / 1000).toFixed(1)} us` : 'N/A') : '-'}</div></div>
+                <div style={{ ...statBox, background: colors.bgWarm, borderColor: '#fde68a' }}><div style={statLabel}>Turnaround (ref only)</div><div style={{ ...statValue, fontSize: '0.8rem', color: '#92400e' }}>{pdelayInfo?.turnaround != null ? (Math.abs(pdelayInfo.turnaround) < 1e9 ? `${(pdelayInfo.turnaround / 1000).toFixed(1)} μs` : 'N/A') : '-'}</div></div>
                 <div style={statBox}><div style={statLabel}>Exchanges</div><div style={statValue}>{pdelayInfo?.count || 0}</div></div>
               </div>
-              <div style={{ marginTop: '8px', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.65rem', color: colors.textMuted }}>
-                Note: Turnaround from PCAP is reference only. Use board-reported link delay for accuracy.
-              </div>
-            </div>
+            </Section>
 
-            {/* Feature & Model */}
-            <div style={{ marginBottom: '16px' }}>
-              <div style={sectionTitle}>
-                Feature Extraction
-                <span style={{ marginLeft: '8px', fontSize: '0.65rem', color: colors.textMuted }}>{offsetModel.samples} updates</span>
-              </div>
+            {/* Section 5: Feature Extraction */}
+            <Section
+              title="Feature Extraction"
+              description="PCAP으로부터 추출한 분석용 Feature. Offset 추정 보조용"
+              badge={`${offsetModel.samples} samples`}
+              note="이 영역은 Offset 복원 계산이 아닌 설명/보조 분석용. 안정 상태에서는 Baseline만으로 충분"
+            >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
-                <div style={statBox}><div style={statLabel}>Baseline</div><div style={statValue}>{offsetModel.baseline} ns</div></div>
-                <div style={statBox}><div style={statLabel}>Jitter (std)</div><div style={statValue}>{ptpFeatures.delta_t1_jitter.length > 2 ? (std(removeOutliers(ptpFeatures.delta_t1_jitter, 5_000_000)) / 1000).toFixed(1) : '-'} us</div></div>
-                <div style={statBox}><div style={statLabel}>Pdelay Gap (std)</div><div style={statValue}>{ptpFeatures.pdelay_gap_history.length > 2 ? (std(ptpFeatures.pdelay_gap_history) / 1000).toFixed(1) : '-'} us</div></div>
+                <div style={statBox}><div style={statLabel}>Baseline (Board)</div><div style={statValue}>{offsetModel.baseline} ns</div></div>
+                <div style={statBox}><div style={statLabel}>Jitter (std)</div><div style={statValue}>{ptpFeatures.delta_t1_jitter.length > 2 ? (std(removeOutliers(ptpFeatures.delta_t1_jitter, 5_000_000)) / 1000).toFixed(1) : '-'} μs</div></div>
+                <div style={statBox}><div style={statLabel}>Pdelay Gap (std)</div><div style={statValue}>{ptpFeatures.pdelay_gap_history.length > 2 ? (std(ptpFeatures.pdelay_gap_history) / 1000).toFixed(1) : '-'} μs</div></div>
                 <div style={statBox}><div style={statLabel}>MAE</div><div style={statValue}>{offsetModel.maeHistory.length > 0 ? `${offsetModel.maeHistory[offsetModel.maeHistory.length - 1].mae} ns` : '-'}</div></div>
               </div>
-            </div>
+            </Section>
 
             {/* Offset Estimation Graph */}
             {offsetEstimates.length > 2 && (
-              <div>
-                <div style={sectionTitle}>Offset Estimation</div>
+              <Section
+                title="Offset Estimation"
+                description="Board에서 보고된 Baseline을 기준으로 한 Offset 추이"
+              >
                 <div style={{ height: '150px' }}>
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={offsetEstimates.slice(-60)} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
@@ -750,62 +860,72 @@ function Dashboard() {
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
-              </div>
+              </Section>
             )}
 
-            {/* Message Tables */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '16px' }}>
-              <div>
-                <div style={sectionTitle}>Recent Messages ({ptpPackets.length})</div>
-                <div style={{ height: '160px', overflow: 'auto', fontSize: '0.7rem', fontFamily: 'monospace', background: colors.bg, borderRadius: '6px', padding: '8px' }}>
-                  {ptpPackets.length === 0 ? (
-                    <div style={{ color: colors.textLight, textAlign: 'center', padding: '40px' }}>Waiting...</div>
-                  ) : (
-                    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                      <thead><tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.textMuted }}><th style={{ textAlign: 'left', padding: '4px' }}>Type</th><th style={{ textAlign: 'left', padding: '4px' }}>Seq</th><th style={{ textAlign: 'right', padding: '4px' }}>Timestamp</th></tr></thead>
-                      <tbody>
-                        {ptpPackets.slice(-15).reverse().map((pkt, i) => (
-                          <tr key={i} style={{ borderBottom: `1px solid ${colors.bgAlt}` }}>
-                            <td style={{ padding: '3px 4px', color: colors.text }}>{pkt.ptp?.msgType}</td>
-                            <td style={{ padding: '3px 4px', color: colors.textMuted }}>{pkt.ptp?.sequenceId}</td>
-                            <td style={{ padding: '3px 4px', textAlign: 'right', color: colors.textMuted }}>{pkt.ptp?.timestamp?.nanoseconds?.toLocaleString() || '-'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
+            {/* Raw Evidence Tables */}
+            <Section
+              title="Raw Evidence"
+              description="실제 캡처된 메시지를 그대로 보여주는 증거. t1(GM 송신 시각)은 패킷에서 확보 가능하나, t2(Slave 수신)는 내부 값으로 PCAP에서 확인 불가"
+            >
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                <div>
+                  <div style={{ fontSize: '0.7rem', fontWeight: '600', color: colors.textMuted, marginBottom: '6px' }}>Recent Messages ({ptpPackets.length})</div>
+                  <div style={{ height: '140px', overflow: 'auto', fontSize: '0.65rem', fontFamily: 'ui-monospace, monospace', background: colors.bg, borderRadius: '4px', padding: '8px', border: `1px solid ${colors.border}` }}>
+                    {ptpPackets.length === 0 ? (
+                      <div style={{ color: colors.textLight, textAlign: 'center', padding: '40px' }}>Waiting...</div>
+                    ) : (
+                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                        <thead><tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.textMuted }}><th style={{ textAlign: 'left', padding: '3px' }}>Type</th><th style={{ textAlign: 'left', padding: '3px' }}>Seq</th><th style={{ textAlign: 'right', padding: '3px' }}>Timestamp</th></tr></thead>
+                        <tbody>
+                          {ptpPackets.slice(-12).reverse().map((pkt, i) => (
+                            <tr key={i} style={{ borderBottom: `1px solid ${colors.borderLight}` }}>
+                              <td style={{ padding: '2px 3px', color: colors.text }}>{pkt.ptp?.msgType}</td>
+                              <td style={{ padding: '2px 3px', color: colors.textMuted }}>{pkt.ptp?.sequenceId}</td>
+                              <td style={{ padding: '2px 3px', textAlign: 'right', color: colors.textMuted }}>{pkt.ptp?.timestamp?.nanoseconds?.toLocaleString() || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '0.7rem', fontWeight: '600', color: colors.textMuted, marginBottom: '6px' }}>Sync Pairs ({syncPairs.length})</div>
+                  <div style={{ height: '140px', overflow: 'auto', fontSize: '0.6rem', fontFamily: 'ui-monospace, monospace', background: colors.bg, borderRadius: '4px', padding: '8px', border: `1px solid ${colors.border}` }}>
+                    {syncPairs.length === 0 ? (
+                      <div style={{ color: colors.textLight, textAlign: 'center', padding: '40px' }}>Waiting...</div>
+                    ) : (
+                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                        <thead><tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.textMuted }}><th style={{ textAlign: 'left', padding: '2px' }}>Seq</th><th style={{ textAlign: 'right', padding: '2px' }}>t1 (ns)</th><th style={{ textAlign: 'right', padding: '2px' }}>C_total</th></tr></thead>
+                        <tbody>
+                          {syncPairs.slice(-10).reverse().map((pair, i) => (
+                            <tr key={i} style={{ borderBottom: `1px solid ${colors.borderLight}` }}>
+                              <td style={{ padding: '2px', color: colors.text }}>{pair.sequenceId}</td>
+                              <td style={{ padding: '2px', textAlign: 'right', color: colors.textMuted }}>{pair.t1_ns?.toLocaleString()}</td>
+                              <td style={{ padding: '2px', textAlign: 'right', color: colors.text }}>{pair.totalCorr || 0}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
                 </div>
               </div>
-              <div>
-                <div style={sectionTitle}>Sync Pairs ({syncPairs.length})</div>
-                <div style={{ height: '160px', overflow: 'auto', fontSize: '0.65rem', fontFamily: 'monospace', background: colors.bg, borderRadius: '6px', padding: '8px' }}>
-                  {syncPairs.length === 0 ? (
-                    <div style={{ color: colors.textLight, textAlign: 'center', padding: '40px' }}>Waiting...</div>
-                  ) : (
-                    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                      <thead><tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.textMuted }}><th style={{ textAlign: 'left', padding: '3px' }}>Seq</th><th style={{ textAlign: 'right', padding: '3px' }}>t1 (ns)</th><th style={{ textAlign: 'right', padding: '3px' }}>C_total</th></tr></thead>
-                      <tbody>
-                        {syncPairs.slice(-10).reverse().map((pair, i) => (
-                          <tr key={i} style={{ borderBottom: `1px solid ${colors.bgAlt}` }}>
-                            <td style={{ padding: '3px', color: colors.text }}>{pair.sequenceId}</td>
-                            <td style={{ padding: '3px', textAlign: 'right', color: colors.textMuted }}>{pair.t1_ns?.toLocaleString()}</td>
-                            <td style={{ padding: '3px', textAlign: 'right', color: colors.text }}>{pair.totalCorr || 0}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            </div>
+            </Section>
 
             {/* Formula Reference */}
-            <div style={{ marginTop: '16px', padding: '12px', background: colors.bgAlt, borderRadius: '6px', fontSize: '0.7rem', color: colors.textMuted }}>
-              <b>Formula:</b> offset = (t2 - t1) - d - C &nbsp;|&nbsp;
-              <b>t1:</b> GM Sync TX (from Follow_Up) &nbsp;|&nbsp;
-              <b>t2:</b> Slave Sync RX (internal) &nbsp;|&nbsp;
-              <b>d:</b> Link Delay &nbsp;|&nbsp;
-              <b>C:</b> Correction
+            <div style={{ padding: '12px 14px', background: colors.bgAlt, borderRadius: '6px', fontSize: '0.7rem', color: colors.textMuted, lineHeight: 1.6, border: `1px solid ${colors.border}` }}>
+              <div style={{ marginBottom: '6px' }}><b>PTP Offset Formula:</b> offset = (t2 - t1) - d - C</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', fontSize: '0.65rem' }}>
+                <div><b>t1:</b> GM Sync TX (Follow_Up)</div>
+                <div><b>t2:</b> Slave Sync RX (internal)</div>
+                <div><b>d:</b> Link Delay (Pdelay)</div>
+                <div><b>C:</b> Correction Field</div>
+              </div>
+              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: `1px solid ${colors.border}`, fontSize: '0.6rem', color: colors.textLight }}>
+                PCAP에서는 t1, C만 확인 가능. t2는 Slave 내부 HW 타임스탬프로 PCAP에서 관측 불가하므로 절대 Offset 계산에 PCAP을 사용할 수 없음
+              </div>
             </div>
           </div>
         ) : (

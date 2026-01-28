@@ -246,8 +246,8 @@ router.post('/start', (req, res) => {
       // Build filter based on capture mode
       let filter;
       if (mode === 'all') {
-        // Capture all IP packets (no filter)
-        filter = 'ip';
+        // Capture all packets
+        filter = '';
       } else if (mode === 'ptp') {
         // PTP/gPTP: EtherType 0x88F7 (Layer 2) OR UDP ports 319/320 (Layer 3)
         // gPTP uses multicast 01:80:c2:00:00:0e
@@ -288,14 +288,33 @@ router.post('/start', (req, res) => {
           let srcMac = '', dstMac = '';
           let source = '', destination = '';
 
+          // VLAN info
+          let vlanInfo = null;
+
           if (linkType === 'ETHERNET') {
             ethInfo = decoders.Ethernet(rawPacket);
             srcMac = ethInfo.info?.srcmac || '';
             dstMac = ethInfo.info?.dstmac || '';
 
+            let etherType = ethInfo.info?.type;
+            let payloadOffset = ethInfo.offset;
+
+            // Check for VLAN tag (802.1Q) - EtherType 0x8100
+            if (etherType === 0x8100 && rawPacket.length >= 18) {
+              // TCI is at offset 14-15: PCP(3) + DEI(1) + VID(12)
+              const tci = rawPacket.readUInt16BE(14);
+              const pcp = (tci >> 13) & 0x07;
+              const dei = (tci >> 12) & 0x01;
+              const vid = tci & 0x0FFF;
+              vlanInfo = { pcp, dei, vid };
+              // Real EtherType is at offset 16
+              etherType = rawPacket.readUInt16BE(16);
+              payloadOffset = 18;
+            }
+
             // Check for Layer 2 PTP (gPTP) - EtherType 0x88F7
-            if (ethInfo.info?.type === 0x88F7) {
-              const ptpPayload = rawPacket.slice(ethInfo.offset);
+            if (etherType === 0x88F7) {
+              const ptpPayload = rawPacket.slice(payloadOffset);
               ptp = parsePTP(ptpPayload);
               if (ptp) {
                 protocol = 'PTP';
@@ -347,8 +366,8 @@ router.post('/start', (req, res) => {
               return; // Done processing gPTP packet
             }
 
-            if (ethInfo.info?.type !== 0x0800) return; // IPv4 only after this
-            ipOffset = ethInfo.offset;
+            if (etherType !== 0x0800) return; // IPv4 only after this
+            ipOffset = payloadOffset;
           }
 
           ipInfo = decoders.IPV4(rawPacket, ipOffset);
@@ -436,6 +455,7 @@ router.post('/start', (req, res) => {
             dstPort,
             protocol,
             length: nbytes,
+            vlan: vlanInfo,
             coap: coap ? {
               type: coap.type,
               code: coap.code,
