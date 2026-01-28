@@ -307,14 +307,11 @@ function TASDashboard() {
     }
   }, [])
 
-  // Poll traffic status for real-time sent counts
+  // Poll traffic status (only for checking if still running)
   const pollTrafficStatus = useCallback(async () => {
     try {
       const res = await axios.get(`${TRAFFIC_API}/api/traffic/status`)
-      if (res.data.sent) {
-        setSentCounts(res.data.sent)
-        setTrafficStats(prev => ({ ...prev, total: res.data.total || 0 }))
-      }
+      // Only update running status - counts come from TX capture
       if (!res.data.running) {
         setTrafficRunning(false)
       }
