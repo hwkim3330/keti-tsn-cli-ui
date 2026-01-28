@@ -5,6 +5,7 @@ import { useDevices } from '../contexts/DeviceContext'
 const TAP_INTERFACE = 'enxc84d44231cc2'
 const TRAFFIC_INTERFACE_PREFIX = 'enx00e'
 const BOARD2_PORT8_MAC = 'FA:AE:C9:26:A4:08'
+const TX_SOURCE_MAC = '00:e0:4c:68:13:36'
 const TRAFFIC_API = 'http://localhost:3001'
 
 const colors = {
@@ -51,7 +52,7 @@ function CBSDashboard() {
   const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
   const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
   const CBS_PORT = 8
-  const cbsBoard = board2 || board1
+  const cbsBoard = board1 || board2  // Board 1 우선 (Port 9 UP인 보드)
 
   const getQosPath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/mchp-velocitysp-port:eth-qos/config`
 
@@ -158,6 +159,11 @@ function CBSDashboard() {
     }
   }
 
+  // Auto-fetch CBS status when board is available
+  useEffect(() => {
+    if (cbsBoard) fetchCBSStatus()
+  }, [cbsBoard])
+
   // Fetch interfaces
   useEffect(() => {
     axios.get(`${TRAFFIC_API}/api/traffic/interfaces`).then(res => {
@@ -188,26 +194,34 @@ function CBSDashboard() {
 
   const handlePacket = useCallback((packet) => {
     if (packet.protocol === 'PTP') return
-    if (packet.length < 60 || packet.length > 1600) return
+    if (packet.length < 56 || packet.length > 1600) return
 
     const pcp = packet.vlan?.pcp ?? 0
     const hasVlan = !!packet.vlan
+    const vid = packet.vlan?.vid || 0
+    const srcMac = (packet.srcMac || packet.source || '').toLowerCase().replace(/[:-]/g, '')
     const isTx = packet.interface?.startsWith(TRAFFIC_INTERFACE_PREFIX)
     const isRx = packet.interface === TAP_INTERFACE
+
+    // RX: only count packets from our TX source MAC with our VLAN ID
+    if (isRx) {
+      if (vid !== vlanId) return
+      if (srcMac !== TX_SOURCE_MAC.replace(/[:-]/g, '')) return
+    }
 
     if (isTx || isRx) {
       setCapturedPackets(prev => [...prev, {
         time: Date.now(),
         pcp,
         length: packet.length,
-        vid: packet.vlan?.vid || 0,
+        vid,
         hasVlan,
-        src: packet.source,
-        dst: packet.destination,
+        src: packet.srcMac || packet.source,
+        dst: packet.dstMac || packet.destination,
         direction: isTx ? 'TX' : 'RX'
       }].slice(-1000))
     }
-  }, [])
+  }, [vlanId])
 
   const startTest = async () => {
     if (!trafficInterface || selectedTCs.length === 0) return
@@ -286,8 +300,8 @@ function CBSDashboard() {
           <div className="card-header">
             <h2 className="card-title">CBS Configuration</h2>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
-                {cbsBoard?.name || '-'} Port {CBS_PORT}
+              <span style={{ fontSize: '0.65rem', padding: '2px 6px', background: colors.bgAlt, borderRadius: '4px', color: colors.text, fontWeight: '600' }}>
+                {cbsBoard?.name || '-'} ({cbsBoard?.device || '-'}) Port {CBS_PORT}
               </span>
               <span style={{ fontSize: '0.65rem', color: cbsData.shapers?.length > 0 ? colors.success : colors.textLight, fontWeight: '600' }}>
                 {cbsData.shapers?.length > 0 ? `● ${cbsData.shapers.length} TC` : '○ OFF'}
@@ -529,56 +543,83 @@ function CBSDashboard() {
         </div>
       )}
 
-      {/* Packet Capture Log (Wireshark style) */}
+      {/* Packet Capture Log - TX/RX Split */}
       {capturedPackets.length > 0 && (
         <div className="card">
           <div className="card-header">
             <h2 className="card-title">Packet Capture</h2>
             <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
           </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
-              <thead>
-                <tr style={{ background: colors.bgAlt }}>
-                  <th style={{ ...cellStyle, width: '50px' }}>No.</th>
-                  <th style={{ ...cellStyle, width: '80px' }}>Time</th>
-                  <th style={{ ...cellStyle, width: '50px' }}>Dir</th>
-                  <th style={{ ...cellStyle, width: '50px' }}>TC</th>
-                  <th style={{ ...cellStyle, width: '60px' }}>VID</th>
-                  <th style={{ ...cellStyle, width: '60px' }}>Len</th>
-                  <th style={cellStyle}>Source</th>
-                  <th style={cellStyle}>Destination</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capturedPackets.slice(-50).reverse().map((pkt, idx) => {
-                  const no = capturedPackets.length - idx
-                  const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
-                  return (
-                    <tr key={idx} style={{ background: pkt.direction === 'TX' ? '#eff6ff' : '#f0fdf4' }}>
-                      <td style={cellStyle}>{no}</td>
-                      <td style={cellStyle}>{time}s</td>
-                      <td style={cellStyle}>
-                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: pkt.direction === 'TX' ? '#3b82f6' : '#22c55e', color: '#fff', fontWeight: '600' }}>
-                          {pkt.direction}
-                        </span>
-                      </td>
-                      <td style={cellStyle}>
-                        {pkt.hasVlan ? (
-                          <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600' }}>
-                            TC{pkt.pcp}
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={cellStyle}>{pkt.hasVlan ? pkt.vid : '-'}</td>
-                      <td style={cellStyle}>{pkt.length}</td>
-                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.src || '-'}</td>
-                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.dst || '-'}</td>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* TX Packets */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#3b82f6', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>TX</span>
+                송신 ({txPackets.length})
+              </div>
+              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
+                  <thead>
+                    <tr style={{ background: '#dbeafe', position: 'sticky', top: 0 }}>
+                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
                     </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody>
+                    {txPackets.slice(-30).reverse().map((pkt, idx) => {
+                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
+                      return (
+                        <tr key={idx} style={{ background: '#eff6ff' }}>
+                          <td style={cellStyle}>{time}s</td>
+                          <td style={cellStyle}>
+                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
+                              {pkt.pcp}
+                            </span>
+                          </td>
+                          <td style={cellStyle}>{pkt.length}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* RX Packets */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#22c55e', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>RX</span>
+                수신 ({rxPackets.length})
+              </div>
+              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
+                  <thead>
+                    <tr style={{ background: '#dcfce7', position: 'sticky', top: 0 }}>
+                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rxPackets.slice(-30).reverse().map((pkt, idx) => {
+                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
+                      return (
+                        <tr key={idx} style={{ background: '#f0fdf4' }}>
+                          <td style={cellStyle}>{time}s</td>
+                          <td style={cellStyle}>
+                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
+                              {pkt.pcp}
+                            </span>
+                          </td>
+                          <td style={cellStyle}>{pkt.length}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
       )}

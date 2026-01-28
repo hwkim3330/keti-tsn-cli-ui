@@ -4,7 +4,9 @@ import { useDevices } from '../contexts/DeviceContext'
 
 const TAP_INTERFACE = 'enxc84d44231cc2'
 const TRAFFIC_INTERFACE_PREFIX = 'enx00e'
-const BOARD2_PORT8_MAC = 'FA:AE:C9:26:A4:08'
+const BOARD1_PORT8_MAC = 'E6:F4:41:C9:57:08'  // TAS 설정된 포트
+const BOARD2_PORT8_MAC = 'FA:AE:C9:26:A4:08'  // TAS 없는 포트
+const TX_SOURCE_MAC = '00:e0:4c:68:13:36'
 const TRAFFIC_API = 'http://localhost:3001'
 
 const colors = {
@@ -39,8 +41,8 @@ function TASDashboard() {
   const [trafficRunning, setTrafficRunning] = useState(false)
   const [selectedTCs, setSelectedTCs] = useState([0, 1, 2, 3, 4, 5, 6, 7])
   const [vlanId, setVlanId] = useState(100)
-  const [packetsPerSecond, setPacketsPerSecond] = useState(1000)
-  const [duration, setDuration] = useState(3)
+  const [packetsPerSecond, setPacketsPerSecond] = useState(100)
+  const [duration, setDuration] = useState(7)
 
   const [capturing, setCapturing] = useState(false)
   const [tapConnected, setTapConnected] = useState(false)
@@ -51,7 +53,7 @@ function TASDashboard() {
   const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
   const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
   const TAS_PORT = 8
-  const tasBoard = board2 || board1
+  const tasBoard = board1 || board2  // Board 1 우선 (Port 9 UP인 보드)
 
   const getBasePath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-sched-bridge:gate-parameter-table`
 
@@ -61,41 +63,36 @@ function TASDashboard() {
     setLoading(true)
     try {
       const basePath = getBasePath(TAS_PORT)
-      const fields = ['gate-enabled', 'admin-gate-states', 'admin-cycle-time', 'admin-control-list']
-      const results = await Promise.all(fields.map(field =>
-        axios.post('/api/fetch', {
-          paths: [`${basePath}/${field}`],
-          transport: tasBoard.transport || 'serial',
-          device: tasBoard.device,
-          host: tasBoard.host,
-          port: tasBoard.port || 5683
-        }, { timeout: 10000 }).catch(() => null)
-      ))
+      const res = await axios.post('/api/fetch', {
+        paths: [basePath],
+        transport: tasBoard.transport || 'serial',
+        device: tasBoard.device,
+        host: tasBoard.host,
+        port: tasBoard.port || 5683
+      }, { timeout: 15000 })
 
+      const yaml = res.data?.result || ''
       const status = { gateEnabled: false, adminGateStates: 255, cycleTimeNs: 0, adminControlList: [], online: true }
-      results.forEach((res, i) => {
-        if (!res?.data?.result) return
-        const yaml = res.data.result
-        if (fields[i] === 'gate-enabled') status.gateEnabled = yaml.includes('true')
-        if (fields[i] === 'admin-gate-states') {
-          const m = yaml.match(/admin-gate-states:\s*(\d+)/)
-          if (m) status.adminGateStates = parseInt(m[1])
+
+      status.gateEnabled = /gate-enabled:\s*true/.test(yaml)
+
+      const gsMatch = yaml.match(/admin-gate-states:\s*(\d+)/)
+      if (gsMatch) status.adminGateStates = parseInt(gsMatch[1])
+
+      const cycleMatch = yaml.match(/admin-cycle-time:[\s\S]*?numerator:\s*(\d+)/)
+      if (cycleMatch) status.cycleTimeNs = parseInt(cycleMatch[1])
+
+      const adminListMatch = yaml.match(/admin-control-list:[\s\S]*?gate-control-entry:([\s\S]*?)(?=oper-|$)/)
+      if (adminListMatch) {
+        const listContent = adminListMatch[1]
+        const entries = []
+        const entryMatches = listContent.matchAll(/gate-states-value:\s*(\d+)[\s\S]*?time-interval-value:\s*(\d+)/g)
+        for (const m of entryMatches) {
+          entries.push({ gateStates: parseInt(m[1]), timeInterval: parseInt(m[2]) })
         }
-        if (fields[i] === 'admin-cycle-time') {
-          const m = yaml.match(/numerator:\s*(\d+)/)
-          if (m) status.cycleTimeNs = parseInt(m[1])
-        }
-        if (fields[i] === 'admin-control-list') {
-          const entries = yaml.match(/gate-states-value:\s*(\d+)[\s\S]*?time-interval-value:\s*(\d+)/g)
-          if (entries) {
-            status.adminControlList = entries.map(e => {
-              const gs = e.match(/gate-states-value:\s*(\d+)/)?.[1]
-              const ti = e.match(/time-interval-value:\s*(\d+)/)?.[1]
-              return { gateStates: parseInt(gs) || 0, timeInterval: parseInt(ti) || 0 }
-            })
-          }
-        }
-      })
+        status.adminControlList = entries
+      }
+
       setTasData(status)
     } catch {
       setTasData({ online: false, error: 'Connection failed' })
@@ -110,20 +107,21 @@ function TASDashboard() {
     setAutoSetupMessage('Configuring TAS...')
     try {
       const basePath = getBasePath(TAS_PORT)
+      // TC0 항상 열림, TC1~7 순서대로 100ms씩
       const gclEntries = []
       for (let i = 1; i <= 7; i++) {
         gclEntries.push({
           index: i - 1,
           'operation-name': 'ieee802-dot1q-sched:set-gate-states',
-          'time-interval-value': 125000,
-          'gate-states-value': (1 << i) | 1
+          'time-interval-value': 100000000,  // 100ms
+          'gate-states-value': (1 << i) | 1  // TC0 + TCi
         })
       }
       const patches = [
         { path: `${basePath}/gate-enabled`, value: true },
         { path: `${basePath}/admin-gate-states`, value: 255 },
         { path: `${basePath}/admin-control-list/gate-control-entry`, value: gclEntries },
-        { path: `${basePath}/admin-cycle-time/numerator`, value: 875000 },
+        { path: `${basePath}/admin-cycle-time/numerator`, value: 700000000 },  // 700ms cycle
         { path: `${basePath}/admin-cycle-time/denominator`, value: 1 },
       ]
       await axios.post('/api/patch', { patches, transport: tasBoard.transport, device: tasBoard.device, host: tasBoard.host }, { timeout: 30000 })
@@ -153,6 +151,56 @@ function TASDashboard() {
       setAutoSetupMessage(`Failed: ${err.message}`)
     }
   }
+
+  // Auto-fetch TAS status when board is available
+  useEffect(() => {
+    if (!tasBoard) return
+    const loadStatus = async () => {
+      setLoading(true)
+      try {
+        const basePath = getBasePath(TAS_PORT)
+        const res = await axios.post('/api/fetch', {
+          paths: [basePath],
+          transport: tasBoard.transport || 'serial',
+          device: tasBoard.device,
+          host: tasBoard.host,
+          port: tasBoard.port || 5683
+        }, { timeout: 15000 })
+
+        const yaml = res.data?.result || ''
+        const status = { gateEnabled: false, adminGateStates: 255, cycleTimeNs: 0, adminControlList: [], online: true }
+
+        // Parse gate-enabled
+        status.gateEnabled = /gate-enabled:\s*true/.test(yaml)
+
+        // Parse admin-gate-states
+        const gsMatch = yaml.match(/admin-gate-states:\s*(\d+)/)
+        if (gsMatch) status.adminGateStates = parseInt(gsMatch[1])
+
+        // Parse admin-cycle-time numerator
+        const cycleMatch = yaml.match(/admin-cycle-time:[\s\S]*?numerator:\s*(\d+)/)
+        if (cycleMatch) status.cycleTimeNs = parseInt(cycleMatch[1])
+
+        // Parse admin-control-list entries
+        const adminListMatch = yaml.match(/admin-control-list:[\s\S]*?gate-control-entry:([\s\S]*?)(?=oper-|$)/)
+        if (adminListMatch) {
+          const listContent = adminListMatch[1]
+          const entries = []
+          const entryMatches = listContent.matchAll(/gate-states-value:\s*(\d+)[\s\S]*?time-interval-value:\s*(\d+)/g)
+          for (const m of entryMatches) {
+            entries.push({ gateStates: parseInt(m[1]), timeInterval: parseInt(m[2]) })
+          }
+          status.adminControlList = entries
+        }
+
+        setTasData(status)
+      } catch {
+        setTasData({ online: false, error: 'Connection failed' })
+      }
+      setLoading(false)
+    }
+    loadStatus()
+  }, [tasBoard])
 
   // Fetch interfaces
   useEffect(() => {
@@ -184,26 +232,31 @@ function TASDashboard() {
 
   const handlePacket = useCallback((packet) => {
     if (packet.protocol === 'PTP') return
-    if (packet.length < 60 || packet.length > 200) return
+    if (packet.length < 56 || packet.length > 200) return
 
     const pcp = packet.vlan?.pcp ?? 0
     const hasVlan = !!packet.vlan
+    const vid = packet.vlan?.vid || 0
+    const srcMac = (packet.srcMac || packet.source || '').toLowerCase().replace(/[:-]/g, '')
     const isTx = packet.interface?.startsWith(TRAFFIC_INTERFACE_PREFIX)
     const isRx = packet.interface === TAP_INTERFACE
+
+    // RX: only count VLAN packets (temporarily disabled strict filtering for debug)
+    if (isRx && !hasVlan) return
 
     if (isTx || isRx) {
       setCapturedPackets(prev => [...prev, {
         time: Date.now(),
         pcp,
         length: packet.length,
-        vid: packet.vlan?.vid || 0,
+        vid,
         hasVlan,
-        src: packet.source,
-        dst: packet.destination,
+        src: packet.srcMac || packet.source,
+        dst: packet.dstMac || packet.destination,
         direction: isTx ? 'TX' : 'RX'
       }].slice(-1000))
     }
-  }, [])
+  }, [vlanId])
 
   const startTest = async () => {
     if (!trafficInterface || selectedTCs.length === 0) return
@@ -222,7 +275,7 @@ function TASDashboard() {
     try {
       await axios.post(`${TRAFFIC_API}/api/traffic/start`, {
         interface: trafficInterface,
-        dstMac: BOARD2_PORT8_MAC,
+        dstMac: BOARD2_PORT8_MAC,  // Board 2로 전송 (Board 1 Port 8 egress에서 TAS 적용)
         vlanId,
         tcList: selectedTCs,
         packetSize: 100,
@@ -278,8 +331,8 @@ function TASDashboard() {
           <div className="card-header">
             <h2 className="card-title">TAS Configuration</h2>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
-                {tasBoard?.name || '-'} Port {TAS_PORT}
+              <span style={{ fontSize: '0.65rem', padding: '2px 6px', background: colors.bgAlt, borderRadius: '4px', color: colors.text, fontWeight: '600' }}>
+                {tasBoard?.name || '-'} ({tasBoard?.device || '-'}) Port {TAS_PORT}
               </span>
               <span style={{ fontSize: '0.65rem', color: tasData.gateEnabled ? colors.success : colors.textLight, fontWeight: '600' }}>
                 {tasData.gateEnabled ? '● ON' : '○ OFF'}
@@ -315,7 +368,9 @@ function TASDashboard() {
                         )
                       })}
                       <td style={{ ...cellStyle, textAlign: 'center', color: colors.textMuted }}>
-                        {(entry.timeInterval / 1000).toFixed(0)}μs
+                        {entry.timeInterval >= 1000000
+                          ? `${(entry.timeInterval / 1000000).toFixed(0)}ms`
+                          : `${(entry.timeInterval / 1000).toFixed(0)}μs`}
                       </td>
                     </tr>
                   ))
@@ -334,8 +389,13 @@ function TASDashboard() {
 
           {/* Cycle Info */}
           <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted }}>
-            <span>Cycle: {tasData.cycleTimeNs ? `${(tasData.cycleTimeNs / 1000).toFixed(0)}μs` : '-'}</span>
+            <span>Cycle: {tasData.cycleTimeNs
+              ? (tasData.cycleTimeNs >= 1000000
+                  ? `${(tasData.cycleTimeNs / 1000000).toFixed(0)}ms`
+                  : `${(tasData.cycleTimeNs / 1000).toFixed(0)}μs`)
+              : '-'}</span>
             <span>Entries: {tasData.adminControlList?.length || 0}</span>
+            <span>TC0: Always Open</span>
           </div>
         </div>
 
@@ -513,56 +573,83 @@ function TASDashboard() {
         </div>
       )}
 
-      {/* Packet Capture Log (Wireshark style) */}
+      {/* Packet Capture Log - TX/RX Split */}
       {capturedPackets.length > 0 && (
         <div className="card">
           <div className="card-header">
             <h2 className="card-title">Packet Capture</h2>
             <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
           </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
-              <thead>
-                <tr style={{ background: colors.bgAlt }}>
-                  <th style={{ ...cellStyle, width: '50px' }}>No.</th>
-                  <th style={{ ...cellStyle, width: '80px' }}>Time</th>
-                  <th style={{ ...cellStyle, width: '50px' }}>Dir</th>
-                  <th style={{ ...cellStyle, width: '50px' }}>TC</th>
-                  <th style={{ ...cellStyle, width: '60px' }}>VID</th>
-                  <th style={{ ...cellStyle, width: '60px' }}>Len</th>
-                  <th style={cellStyle}>Source</th>
-                  <th style={cellStyle}>Destination</th>
-                </tr>
-              </thead>
-              <tbody>
-                {capturedPackets.slice(-50).reverse().map((pkt, idx) => {
-                  const no = capturedPackets.length - idx
-                  const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
-                  return (
-                    <tr key={idx} style={{ background: pkt.direction === 'TX' ? '#eff6ff' : '#f0fdf4' }}>
-                      <td style={cellStyle}>{no}</td>
-                      <td style={cellStyle}>{time}s</td>
-                      <td style={cellStyle}>
-                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: pkt.direction === 'TX' ? '#3b82f6' : '#22c55e', color: '#fff', fontWeight: '600' }}>
-                          {pkt.direction}
-                        </span>
-                      </td>
-                      <td style={cellStyle}>
-                        {pkt.hasVlan ? (
-                          <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600' }}>
-                            TC{pkt.pcp}
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={cellStyle}>{pkt.hasVlan ? pkt.vid : '-'}</td>
-                      <td style={cellStyle}>{pkt.length}</td>
-                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.src || '-'}</td>
-                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.dst || '-'}</td>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* TX Packets */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#3b82f6', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>TX</span>
+                송신 ({txPackets.length})
+              </div>
+              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
+                  <thead>
+                    <tr style={{ background: '#dbeafe', position: 'sticky', top: 0 }}>
+                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
                     </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody>
+                    {txPackets.slice(-30).reverse().map((pkt, idx) => {
+                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
+                      return (
+                        <tr key={idx} style={{ background: '#eff6ff' }}>
+                          <td style={cellStyle}>{time}s</td>
+                          <td style={cellStyle}>
+                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
+                              {pkt.pcp}
+                            </span>
+                          </td>
+                          <td style={cellStyle}>{pkt.length}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* RX Packets */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#22c55e', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>RX</span>
+                수신 ({rxPackets.length})
+              </div>
+              <div style={{ maxHeight: '300px', overflowY: 'auto', background: colors.bgAlt, borderRadius: '4px' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.65rem', fontFamily: 'monospace' }}>
+                  <thead>
+                    <tr style={{ background: '#dcfce7', position: 'sticky', top: 0 }}>
+                      <th style={{ ...cellStyle, width: '60px' }}>Time</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>TC</th>
+                      <th style={{ ...cellStyle, width: '40px' }}>Len</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rxPackets.slice(-30).reverse().map((pkt, idx) => {
+                      const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
+                      return (
+                        <tr key={idx} style={{ background: '#f0fdf4' }}>
+                          <td style={cellStyle}>{time}s</td>
+                          <td style={cellStyle}>
+                            <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600', fontSize: '0.6rem' }}>
+                              {pkt.pcp}
+                            </span>
+                          </td>
+                          <td style={cellStyle}>{pkt.length}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
       )}

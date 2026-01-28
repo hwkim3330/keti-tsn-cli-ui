@@ -49,7 +49,7 @@ app.post('/api/traffic/start', (req, res) => {
 
   const sourceMac = srcMac || getInterfaceMac(ifaceName);
   const tcs = Array.isArray(tcList) ? tcList : [1,2,3,4,5,6,7];
-  const pps = Math.max(1, Math.min(5000, parseInt(packetsPerSecond) || 100));
+  const pps = Math.max(1, Math.min(10000, parseInt(packetsPerSecond) || 100));
   const dur = parseInt(duration) || 10;
 
   stats = { sent: {}, total: 0, startTime: Date.now(), running: true };
