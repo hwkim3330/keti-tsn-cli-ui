@@ -273,27 +273,38 @@ function TASDashboard() {
     return () => { if (wsRef.current) wsRef.current.close() }
   }, [])
 
-  // Handle captured packet
+  // Handle captured packet - distinguish TX vs RX
   const handleCapturedPacket = useCallback((packet) => {
     // Skip PTP packets
     if (packet.protocol === 'PTP') return
     // Skip non-test traffic (only count packets with our test characteristics)
-    // Test packets have specific length pattern: ~100 bytes
     if (packet.length < 60 || packet.length > 200) return
 
-    const pcp = packet.vlan?.pcp ?? 0  // Default to TC0 if no VLAN tag
+    const pcp = packet.vlan?.pcp ?? 0
     const vid = packet.vlan?.vid ?? 0
+    const isTx = packet.interface?.startsWith(TRAFFIC_INTERFACE_PREFIX)
+    const isRx = packet.interface === TAP_INTERFACE
 
+    // Add to packet log
     setCapturedPackets(prev => [...prev, {
       time: Date.now(),
       pcp,
       length: packet.length,
       vid,
       src: packet.source,
-      dst: packet.destination
+      dst: packet.destination,
+      iface: packet.interface,
+      direction: isTx ? 'TX' : (isRx ? 'RX' : '?')
     }].slice(-1000))
 
-    setCapturedCounts(prev => ({ ...prev, [pcp]: (prev[pcp] || 0) + 1 }))
+    // Count by direction
+    if (isTx) {
+      // TX packet - count as sent (has VLAN tag with PCP)
+      setSentCounts(prev => ({ ...prev, [pcp]: (prev[pcp] || 0) + 1 }))
+    } else if (isRx) {
+      // RX packet - count as captured
+      setCapturedCounts(prev => ({ ...prev, [pcp]: (prev[pcp] || 0) + 1 }))
+    }
   }, [])
 
   // Poll traffic status for real-time sent counts
@@ -310,7 +321,7 @@ function TASDashboard() {
     } catch {}
   }, [])
 
-  // Start test (traffic + capture)
+  // Start test (traffic + capture on both TX and RX)
   const startTest = async () => {
     if (!trafficInterface || selectedTCs.length === 0) return
 
@@ -322,9 +333,12 @@ function TASDashboard() {
     setTrafficStats({})
     startTimeRef.current = Date.now()
 
-    // Start capture first
+    // Start capture on BOTH TX and RX interfaces
     try {
-      await axios.post('/api/capture/start', { interfaces: [TAP_INTERFACE], captureMode: 'all' })
+      await axios.post('/api/capture/start', {
+        interfaces: [trafficInterface, TAP_INTERFACE],
+        captureMode: 'all'
+      })
       setCapturing(true)
     } catch (err) {
       console.error('Capture failed:', err)
@@ -363,9 +377,9 @@ function TASDashboard() {
       await axios.post(`${TRAFFIC_API}/api/traffic/stop`, { interface: trafficInterface })
     } catch {}
 
-    // Stop capture
+    // Stop capture on both interfaces
     try {
-      await axios.post('/api/capture/stop', { interfaces: [TAP_INTERFACE] })
+      await axios.post('/api/capture/stop', { interfaces: [trafficInterface, TAP_INTERFACE] })
       setCapturing(false)
     } catch {}
   }
@@ -713,15 +727,23 @@ function TASDashboard() {
       {capturedPackets.length > 0 && (
         <div className="card" style={{ marginBottom: '16px' }}>
           <div className="card-header">
-            <h2 className="card-title">Captured Packets</h2>
+            <h2 className="card-title">Packet Log</h2>
             <span style={{ fontSize: '0.7rem', color: colors.textMuted, fontFamily: 'monospace' }}>
-              Total: {capturedPackets.length}
+              TX: {capturedPackets.filter(p => p.direction === 'TX').length} | RX: {capturedPackets.filter(p => p.direction === 'RX').length}
             </span>
           </div>
           <div style={{ maxHeight: '150px', overflow: 'auto', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.7rem', fontFamily: 'monospace' }}>
             {capturedPackets.slice(-30).reverse().map((pkt, idx) => (
               <div key={idx} style={{ display: 'flex', gap: '8px', padding: '2px 0', borderBottom: `1px solid ${colors.border}` }}>
-                <span style={{ color: colors.textLight, width: '70px' }}>{new Date(pkt.time).toLocaleTimeString()}</span>
+                <span style={{
+                  padding: '0 4px',
+                  borderRadius: '3px',
+                  background: pkt.direction === 'TX' ? '#3b82f6' : '#22c55e',
+                  color: '#fff',
+                  fontWeight: '600',
+                  fontSize: '0.6rem'
+                }}>{pkt.direction}</span>
+                <span style={{ color: colors.textLight, width: '65px' }}>{new Date(pkt.time).toLocaleTimeString()}</span>
                 <span style={{
                   padding: '0 6px',
                   borderRadius: '3px',
@@ -732,7 +754,7 @@ function TASDashboard() {
                   textAlign: 'center'
                 }}>TC{pkt.pcp}</span>
                 <span style={{ color: colors.textMuted }}>{pkt.length}B</span>
-                <span style={{ color: colors.textLight }}>{pkt.vid ? `VID:${pkt.vid}` : 'untagged'}</span>
+                <span style={{ color: colors.textLight }}>{pkt.vid ? `VID:${pkt.vid}` : 'no-tag'}</span>
               </div>
             ))}
           </div>
