@@ -1,471 +1,586 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 import { useDevices } from '../contexts/DeviceContext'
 
-function CBSDashboard() {
-  const { devices, selectedDevice, selectDevice } = useDevices()
+const TAP_INTERFACE = 'enxc84d44231cc2'
+const TRAFFIC_INTERFACE_PREFIX = 'enx00e'
+const BOARD2_PORT8_MAC = 'FA:AE:C9:26:A4:08'
+const TRAFFIC_API = 'http://localhost:3001'
 
-  // CBS status per port per device: { deviceId: { port1: {...}, port2: {...} } }
+const colors = {
+  text: '#1e293b',
+  textMuted: '#64748b',
+  textLight: '#94a3b8',
+  bg: '#f8fafc',
+  bgAlt: '#f1f5f9',
+  border: '#e2e8f0',
+  accent: '#475569',
+  success: '#059669',
+  warning: '#d97706',
+  error: '#dc2626',
+}
+
+const tcColors = {
+  0: '#94a3b8', 1: '#f97316', 2: '#eab308', 3: '#22c55e',
+  4: '#06b6d4', 5: '#3b82f6', 6: '#8b5cf6', 7: '#ec4899',
+}
+
+const tcNames = ['BE(BG)', 'BE', 'EE', 'CA', 'Video', 'Voice', 'IC', 'NC']
+
+function CBSDashboard() {
+  const { devices } = useDevices()
+
   const [cbsData, setCbsData] = useState({})
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
+  const [autoSetupStatus, setAutoSetupStatus] = useState(null)
+  const [autoSetupMessage, setAutoSetupMessage] = useState('')
 
-  // Auto refresh
-  const [autoRefresh, setAutoRefresh] = useState(false)
-  const intervalRef = useRef(null)
-  const fetchingRef = useRef(false)
+  const [trafficInterface, setTrafficInterface] = useState(null)
+  const [trafficRunning, setTrafficRunning] = useState(false)
+  const [selectedTCs, setSelectedTCs] = useState([0, 1, 2, 3, 4, 5, 6, 7])
+  const [vlanId, setVlanId] = useState(100)
+  const [packetsPerSecond, setPacketsPerSecond] = useState(1000)
+  const [duration, setDuration] = useState(3)
 
-  // Ports to monitor (1-12)
-  const allPorts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  const [capturing, setCapturing] = useState(false)
+  const [tapConnected, setTapConnected] = useState(false)
+  const [capturedPackets, setCapturedPackets] = useState([])
+  const wsRef = useRef(null)
+  const startTimeRef = useRef(null)
 
-  // Traffic Class colors
-  const tcColors = {
-    0: '#94a3b8', // slate
-    1: '#f97316', // orange
-    2: '#eab308', // yellow
-    3: '#22c55e', // green
-    4: '#06b6d4', // cyan
-    5: '#3b82f6', // blue
-    6: '#8b5cf6', // purple
-    7: '#ec4899', // pink
-  }
+  const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
+  const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
+  const CBS_PORT = 8
+  const cbsBoard = board2 || board1
 
   const getQosPath = (port) => `/ietf-interfaces:interfaces/interface[name='${port}']/mchp-velocitysp-port:eth-qos/config`
 
-  // Parse CBS shapers from YAML response
-  const parseShapers = (yamlStr) => {
-    if (!yamlStr) return []
-    const shapers = []
-    try {
-      const lines = yamlStr.split('\n')
-      let current = null
-      for (const line of lines) {
-        if (line.includes('traffic-class:')) {
-          if (current) shapers.push(current)
-          current = { tc: parseInt(line.split(':')[1].trim()) }
-        } else if (line.includes('idle-slope:') && current) {
-          current.idleSlope = parseInt(line.split(':')[1].trim())
-        }
-      }
-      if (current) shapers.push(current)
-    } catch {}
-    return shapers
-  }
-
-  // Fetch CBS data for a single port on a device
-  const fetchPortCBS = async (device, portNum) => {
+  // Fetch CBS status
+  const fetchCBSStatus = async () => {
+    if (!cbsBoard) return
+    setLoading(true)
     try {
       const res = await axios.post('/api/fetch', {
-        paths: [`${getQosPath(portNum)}/traffic-class-shapers`],
-        transport: device.transport,
-        device: device.device,
-        host: device.host,
-        port: device.port || 5683
-      }, { timeout: 8000 })
+        paths: [`${getQosPath(CBS_PORT)}/traffic-class-shapers`],
+        transport: cbsBoard.transport || 'serial',
+        device: cbsBoard.device,
+        host: cbsBoard.host,
+        port: cbsBoard.port || 5683
+      }, { timeout: 10000 })
 
-      return {
-        online: true,
-        shapers: parseShapers(res.data.result),
-        raw: res.data.result
-      }
-    } catch (err) {
-      return { online: false, shapers: [], error: err.message }
-    }
-  }
-
-  // Fetch all ports for all devices
-  const fetchAllCBS = async (silent = false) => {
-    if (fetchingRef.current) return
-    fetchingRef.current = true
-    if (!silent) setLoading(true)
-
-    try {
-      const newData = {}
-
-      for (const device of devices) {
-        newData[device.id] = { online: false, ports: {} }
-
-        // Fetch each port
-        for (const portNum of allPorts) {
-          const portData = await fetchPortCBS(device, portNum)
-          newData[device.id].ports[portNum] = portData
-          if (portData.online) newData[device.id].online = true
-
-          // Update state progressively for better UX
-          setCbsData(prev => ({
-            ...prev,
-            [device.id]: {
-              ...prev[device.id],
-              online: newData[device.id].online,
-              ports: {
-                ...prev[device.id]?.ports,
-                [portNum]: portData
-              }
-            }
-          }))
-
-          // Small delay between requests
-          await new Promise(r => setTimeout(r, 100))
+      const shapers = []
+      if (res.data?.result) {
+        const lines = res.data.result.split('\n')
+        let current = null
+        for (const line of lines) {
+          if (line.includes('traffic-class:')) {
+            if (current) shapers.push(current)
+            current = { tc: parseInt(line.split(':')[1].trim()), idleSlope: 0 }
+          } else if (line.includes('idle-slope:') && current) {
+            current.idleSlope = parseInt(line.split(':')[1].trim())
+          }
         }
+        if (current) shapers.push(current)
+      }
+      setCbsData({ online: true, shapers, raw: res.data?.result })
+    } catch {
+      setCbsData({ online: false, shapers: [], error: 'Connection failed' })
+    }
+    setLoading(false)
+  }
+
+  // Auto Setup CBS - Configure idle-slope for each TC
+  const autoSetupCBS = async () => {
+    if (!cbsBoard) return
+    setAutoSetupStatus('running')
+    setAutoSetupMessage('Configuring CBS...')
+    try {
+      const patches = []
+      // Configure CBS for TC2 and TC3 (common for AVB)
+      const cbsConfigs = [
+        { tc: 2, idleSlope: 50000 },  // 50 Mbps
+        { tc: 3, idleSlope: 50000 },  // 50 Mbps
+      ]
+
+      for (const cfg of cbsConfigs) {
+        patches.push({
+          path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
+          value: {
+            'traffic-class': cfg.tc,
+            'credit-based': { 'idle-slope': cfg.idleSlope }
+          }
+        })
       }
 
-      if (!silent) setError(null)
+      await axios.post('/api/patch', {
+        patches,
+        transport: cbsBoard.transport,
+        device: cbsBoard.device,
+        host: cbsBoard.host
+      }, { timeout: 30000 })
+
+      setAutoSetupStatus('success')
+      setAutoSetupMessage('CBS configured!')
+      setTimeout(() => { fetchCBSStatus(); setAutoSetupStatus(null) }, 1500)
     } catch (err) {
-      if (!silent) setError(err.message)
-    } finally {
-      fetchingRef.current = false
-      if (!silent) setLoading(false)
+      setAutoSetupStatus('error')
+      setAutoSetupMessage(`Failed: ${err.message}`)
     }
   }
 
-  // Initial fetch
-  useEffect(() => {
-    if (devices.length > 0) {
-      fetchAllCBS(false)
+  const resetCBS = async () => {
+    if (!cbsBoard) return
+    setAutoSetupStatus('running')
+    try {
+      // Reset by setting idle-slope to 0
+      const patches = []
+      for (let tc = 0; tc < 8; tc++) {
+        patches.push({
+          path: `${getQosPath(CBS_PORT)}/traffic-class-shapers`,
+          value: {
+            'traffic-class': tc,
+            'credit-based': { 'idle-slope': 0 }
+          }
+        })
+      }
+      await axios.post('/api/patch', {
+        patches,
+        transport: cbsBoard.transport,
+        device: cbsBoard.device,
+        host: cbsBoard.host
+      }, { timeout: 30000 })
+      setAutoSetupStatus('success')
+      setAutoSetupMessage('CBS reset')
+      setTimeout(() => { fetchCBSStatus(); setAutoSetupStatus(null) }, 1500)
+    } catch (err) {
+      setAutoSetupStatus('error')
+      setAutoSetupMessage(`Failed: ${err.message}`)
     }
-  }, [devices])
+  }
 
-  // Auto refresh
+  // Fetch interfaces
   useEffect(() => {
-    if (autoRefresh && devices.length > 0) {
-      intervalRef.current = setInterval(() => fetchAllCBS(true), 10000)
-    } else {
-      if (intervalRef.current) clearInterval(intervalRef.current)
+    axios.get(`${TRAFFIC_API}/api/traffic/interfaces`).then(res => {
+      const iface = res.data.find(i => i.name.startsWith(TRAFFIC_INTERFACE_PREFIX))
+      if (iface) setTrafficInterface(iface.name)
+    }).catch(() => {})
+  }, [])
+
+  // WebSocket for capture
+  useEffect(() => {
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/capture`
+    const connect = () => {
+      const ws = new WebSocket(wsUrl)
+      ws.onopen = () => setTapConnected(true)
+      ws.onclose = () => { setTapConnected(false); setTimeout(connect, 3000) }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'packet') handlePacket(msg.data)
+          else if (msg.type === 'stopped') setCapturing(false)
+        } catch {}
+      }
+      wsRef.current = ws
     }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
-  }, [autoRefresh, devices])
+    connect()
+    return () => wsRef.current?.close()
+  }, [])
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current)
+  const handlePacket = useCallback((packet) => {
+    if (packet.protocol === 'PTP') return
+    if (packet.length < 60 || packet.length > 1600) return
+
+    const pcp = packet.vlan?.pcp ?? 0
+    const hasVlan = !!packet.vlan
+    const isTx = packet.interface?.startsWith(TRAFFIC_INTERFACE_PREFIX)
+    const isRx = packet.interface === TAP_INTERFACE
+
+    if (isTx || isRx) {
+      setCapturedPackets(prev => [...prev, {
+        time: Date.now(),
+        pcp,
+        length: packet.length,
+        vid: packet.vlan?.vid || 0,
+        hasVlan,
+        src: packet.source,
+        dst: packet.destination,
+        direction: isTx ? 'TX' : 'RX'
+      }].slice(-1000))
     }
   }, [])
 
-  // Calculate statistics
-  const getDeviceStats = (deviceId) => {
-    const deviceData = cbsData[deviceId]
-    if (!deviceData?.ports) return { totalShapers: 0, portsWithCBS: 0, totalBandwidth: 0, tcUsage: {} }
+  const startTest = async () => {
+    if (!trafficInterface || selectedTCs.length === 0) return
+    setCapturedPackets([])
+    startTimeRef.current = Date.now()
 
-    let totalShapers = 0
-    let portsWithCBS = 0
-    let totalBandwidth = 0
-    const tcUsage = {}
+    try {
+      await axios.post('/api/capture/start', {
+        interfaces: [trafficInterface, TAP_INTERFACE],
+        captureMode: 'all'
+      })
+      setCapturing(true)
+    } catch {}
 
-    for (const portNum of allPorts) {
-      const portData = deviceData.ports[portNum]
-      if (portData?.shapers?.length > 0) {
-        portsWithCBS++
-        totalShapers += portData.shapers.length
-        for (const shaper of portData.shapers) {
-          totalBandwidth += shaper.idleSlope || 0
-          tcUsage[shaper.tc] = (tcUsage[shaper.tc] || 0) + (shaper.idleSlope || 0)
-        }
-      }
+    setTrafficRunning(true)
+    try {
+      await axios.post(`${TRAFFIC_API}/api/traffic/start`, {
+        interface: trafficInterface,
+        dstMac: BOARD2_PORT8_MAC,
+        vlanId,
+        tcList: selectedTCs,
+        packetSize: 100,
+        packetsPerSecond,
+        duration
+      })
+    } catch {
+      setTrafficRunning(false)
     }
 
-    return { totalShapers, portsWithCBS, totalBandwidth, tcUsage }
+    setTimeout(stopTest, (duration + 2) * 1000)
   }
 
-  // Get maximum bandwidth for scaling bars (link speed in kbps)
-  const maxBandwidth = 1000000 // 1 Gbps in kbps
+  const stopTest = async () => {
+    setTrafficRunning(false)
+    try { await axios.post(`${TRAFFIC_API}/api/traffic/stop`, { interface: trafficInterface }) } catch {}
+    try { await axios.post('/api/capture/stop', {}); setCapturing(false) } catch {}
+  }
+
+  const toggleTC = (tc) => setSelectedTCs(prev => prev.includes(tc) ? prev.filter(t => t !== tc) : [...prev, tc].sort())
+
+  // Stats
+  const txPackets = capturedPackets.filter(p => p.direction === 'TX')
+  const rxPackets = capturedPackets.filter(p => p.direction === 'RX')
+  const txByTc = {}
+  const rxByTc = {}
+  txPackets.forEach(p => { if (p.hasVlan) txByTc[p.pcp] = (txByTc[p.pcp] || 0) + 1 })
+  rxPackets.forEach(p => { if (p.hasVlan) rxByTc[p.pcp] = (rxByTc[p.pcp] || 0) + 1 })
+
+  const cellStyle = { padding: '6px 10px', borderBottom: `1px solid ${colors.border}`, fontSize: '0.75rem' }
+  const headerStyle = { ...cellStyle, fontWeight: '600', background: colors.bgAlt }
+
+  // Build TC bandwidth matrix from cbsData
+  const shaperByTc = {}
+  cbsData.shapers?.forEach(s => { shaperByTc[s.tc] = s.idleSlope })
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">CBS Dashboard</h1>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', cursor: 'pointer' }}>
-            <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
-            Auto (10s)
-          </label>
-          <button className="btn btn-secondary" onClick={() => fetchAllCBS(false)} disabled={loading}>
-            {loading ? 'Loading...' : 'Refresh All'}
-          </button>
+          {autoSetupStatus && (
+            <span style={{ fontSize: '0.7rem', padding: '4px 8px', borderRadius: '4px', background: autoSetupStatus === 'success' ? '#dcfce7' : autoSetupStatus === 'error' ? '#fef2f2' : colors.bgAlt }}>
+              {autoSetupMessage}
+            </span>
+          )}
+          <button className="btn btn-secondary" onClick={fetchCBSStatus} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
+          <button className="btn btn-primary" onClick={autoSetupCBS} disabled={!cbsBoard}>Auto Setup</button>
+          <button className="btn btn-secondary" onClick={resetCBS} disabled={!cbsBoard}>Reset</button>
         </div>
       </div>
 
-      {error && <div className="alert alert-error" style={{ marginBottom: '16px' }}>{error}</div>}
-
-      {devices.length === 0 ? (
-        <div className="card" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
-          No devices configured. Go to Settings to add devices.
-        </div>
-      ) : (
-        <>
-          {/* Device Summary Cards */}
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(devices.length, 2)}, 1fr)`, gap: '16px', marginBottom: '20px' }}>
-            {devices.map(device => {
-              const deviceData = cbsData[device.id]
-              const stats = getDeviceStats(device.id)
-              const isSelected = selectedDevice?.id === device.id
-
-              return (
-                <div
-                  key={device.id}
-                  onClick={() => selectDevice(device)}
-                  style={{
-                    padding: '20px',
-                    background: isSelected ? '#f8fafc' : '#fff',
-                    border: isSelected ? '2px solid #3b82f6' : '1px solid #e2e8f0',
-                    borderRadius: '12px',
-                    cursor: 'pointer',
-                    transition: 'all 0.15s'
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
-                    <div>
-                      <div style={{ fontWeight: '600', fontSize: '1.1rem' }}>{device.name}</div>
-                      <div style={{ fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
-                        {device.transport === 'serial' ? device.device : device.host}
-                      </div>
-                    </div>
-                    <div style={{
-                      padding: '4px 12px',
-                      borderRadius: '6px',
-                      fontSize: '0.75rem',
-                      fontWeight: '600',
-                      background: !deviceData?.online ? '#fef2f2' : stats.portsWithCBS > 0 ? '#ecfdf5' : '#f8fafc',
-                      color: !deviceData?.online ? '#b91c1c' : stats.portsWithCBS > 0 ? '#059669' : '#64748b'
-                    }}>
-                      {!deviceData?.online ? 'OFFLINE' : stats.portsWithCBS > 0 ? `${stats.portsWithCBS} PORTS` : 'NO CBS'}
-                    </div>
-                  </div>
-
-                  {/* Stats */}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '16px' }}>
-                    <div style={{ textAlign: 'center', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
-                      <div style={{ fontSize: '1.5rem', fontWeight: '700', color: '#1e293b' }}>{stats.portsWithCBS}</div>
-                      <div style={{ fontSize: '0.7rem', color: '#64748b' }}>Ports with CBS</div>
-                    </div>
-                    <div style={{ textAlign: 'center', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
-                      <div style={{ fontSize: '1.5rem', fontWeight: '700', color: '#1e293b' }}>{stats.totalShapers}</div>
-                      <div style={{ fontSize: '0.7rem', color: '#64748b' }}>Total Shapers</div>
-                    </div>
-                    <div style={{ textAlign: 'center', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
-                      <div style={{ fontSize: '1.2rem', fontWeight: '700', color: '#1e293b' }}>
-                        {stats.totalBandwidth > 0 ? `${(stats.totalBandwidth / 1000).toFixed(0)}` : '-'}
-                      </div>
-                      <div style={{ fontSize: '0.7rem', color: '#64748b' }}>Total Mbps</div>
-                    </div>
-                  </div>
-
-                  {/* TC Usage Bar */}
-                  {Object.keys(stats.tcUsage).length > 0 && (
-                    <div>
-                      <div style={{ fontSize: '0.75rem', fontWeight: '600', marginBottom: '8px', color: '#475569' }}>
-                        Traffic Class Distribution
-                      </div>
-                      <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                        {Object.entries(stats.tcUsage).sort((a, b) => a[0] - b[0]).map(([tc, bw]) => (
-                          <div
-                            key={tc}
-                            style={{
-                              padding: '6px 12px',
-                              background: tcColors[tc] || '#94a3b8',
-                              color: '#fff',
-                              borderRadius: '6px',
-                              fontSize: '0.75rem',
-                              fontWeight: '600'
-                            }}
-                          >
-                            TC{tc}: {(bw / 1000).toFixed(0)} Mbps
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )
-            })}
+      {/* CBS Config + Test Controls */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+        {/* CBS Configuration - 8 TC Matrix */}
+        <div className="card">
+          <div className="card-header">
+            <h2 className="card-title">CBS Configuration</h2>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.65rem', color: colors.textMuted }}>
+                {cbsBoard?.name || '-'} Port {CBS_PORT}
+              </span>
+              <span style={{ fontSize: '0.65rem', color: cbsData.shapers?.length > 0 ? colors.success : colors.textLight, fontWeight: '600' }}>
+                {cbsData.shapers?.length > 0 ? `● ${cbsData.shapers.length} TC` : '○ OFF'}
+              </span>
+            </div>
           </div>
 
-          {/* Port Details for Selected Device */}
-          {selectedDevice && (
-            <div className="card">
-              <div className="card-header">
-                <h2 className="card-title">Port CBS Configuration - {selectedDevice.name}</h2>
-              </div>
+          {/* Credit-Based Shaper Matrix */}
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
+              <thead>
+                <tr>
+                  {[0,1,2,3,4,5,6,7].map(tc => (
+                    <th key={tc} style={{ ...headerStyle, width: '12.5%', textAlign: 'center', background: tcColors[tc], color: '#fff' }}>
+                      TC{tc}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  {[0,1,2,3,4,5,6,7].map(tc => {
+                    const slope = shaperByTc[tc]
+                    const hasSlope = slope && slope > 0
+                    return (
+                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', background: hasSlope ? '#dcfce7' : '#fef2f2' }}>
+                        {hasSlope ? `${(slope / 1000).toFixed(0)}M` : '-'}
+                      </td>
+                    )
+                  })}
+                </tr>
+                <tr>
+                  {[0,1,2,3,4,5,6,7].map(tc => {
+                    const slope = shaperByTc[tc]
+                    const hasSlope = slope && slope > 0
+                    return (
+                      <td key={tc} style={{ ...cellStyle, textAlign: 'center', fontSize: '0.6rem', color: colors.textMuted }}>
+                        {hasSlope ? `${slope} kbps` : '-'}
+                      </td>
+                    )
+                  })}
+                </tr>
+              </tbody>
+            </table>
+          </div>
 
-              {/* Port Grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
-                {allPorts.map(portNum => {
-                  const portData = cbsData[selectedDevice.id]?.ports?.[portNum]
-                  const hasCBS = portData?.shapers?.length > 0
-                  const totalBw = portData?.shapers?.reduce((sum, s) => sum + (s.idleSlope || 0), 0) || 0
+          {/* Total Bandwidth */}
+          <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '0.7rem', color: colors.textMuted }}>
+            <span>Total: {cbsData.shapers?.reduce((s, x) => s + (x.idleSlope || 0), 0) / 1000 || 0} Mbps</span>
+            <span>Shapers: {cbsData.shapers?.length || 0}</span>
+          </div>
 
-                  return (
-                    <div
-                      key={portNum}
-                      style={{
-                        padding: '16px',
-                        background: hasCBS ? '#f0fdf4' : '#f8fafc',
-                        border: hasCBS ? '1px solid #bbf7d0' : '1px solid #e2e8f0',
-                        borderRadius: '10px'
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                        <div style={{ fontWeight: '700', fontSize: '0.9rem' }}>Port {portNum}</div>
-                        {portData?.online === false ? (
-                          <span style={{ fontSize: '0.7rem', color: '#b91c1c' }}>ERR</span>
-                        ) : hasCBS ? (
-                          <span style={{ fontSize: '0.7rem', color: '#059669', fontWeight: '600' }}>
-                            {(totalBw / 1000).toFixed(0)} Mbps
-                          </span>
-                        ) : (
-                          <span style={{ fontSize: '0.7rem', color: '#94a3b8' }}>-</span>
-                        )}
-                      </div>
-
-                      {/* Bandwidth Bar */}
-                      <div style={{ height: '8px', background: '#e2e8f0', borderRadius: '4px', marginBottom: '8px', overflow: 'hidden' }}>
-                        {hasCBS && (
-                          <div style={{ display: 'flex', height: '100%' }}>
-                            {portData.shapers.map((shaper, i) => {
-                              const width = ((shaper.idleSlope || 0) / maxBandwidth) * 100
-                              return (
-                                <div
-                                  key={i}
-                                  style={{
-                                    width: `${Math.max(width, 1)}%`,
-                                    background: tcColors[shaper.tc] || '#94a3b8',
-                                    height: '100%'
-                                  }}
-                                  title={`TC${shaper.tc}: ${(shaper.idleSlope / 1000).toFixed(1)} Mbps`}
-                                />
-                              )
-                            })}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Shaper List */}
-                      {hasCBS ? (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                          {portData.shapers.map((shaper, i) => (
-                            <span
-                              key={i}
-                              style={{
-                                padding: '3px 8px',
-                                background: tcColors[shaper.tc] || '#94a3b8',
-                                color: '#fff',
-                                borderRadius: '4px',
-                                fontSize: '0.65rem',
-                                fontWeight: '600'
-                              }}
-                            >
-                              TC{shaper.tc}
-                            </span>
-                          ))}
-                        </div>
-                      ) : (
-                        <div style={{ fontSize: '0.75rem', color: '#94a3b8', textAlign: 'center' }}>
-                          No CBS
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
+          {/* Shaper Details */}
+          {cbsData.shapers?.length > 0 && (
+            <div style={{ marginTop: '8px', padding: '8px', background: colors.bgAlt, borderRadius: '4px', fontSize: '0.7rem' }}>
+              <div style={{ fontWeight: '600', marginBottom: '4px' }}>Active Shapers:</div>
+              {cbsData.shapers.map((s, idx) => (
+                <div key={idx} style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
+                  <span style={{ padding: '1px 6px', borderRadius: '3px', background: tcColors[s.tc], color: '#fff', fontWeight: '600' }}>TC{s.tc}</span>
+                  <span>Idle Slope: {s.idleSlope} kbps</span>
+                  <span style={{ color: colors.textMuted }}>({(s.idleSlope / 1000).toFixed(1)} Mbps)</span>
+                </div>
+              ))}
             </div>
           )}
+        </div>
 
-          {/* TC Legend */}
-          <div className="card" style={{ marginTop: '16px' }}>
-            <div className="card-header">
-              <h2 className="card-title">Traffic Class Reference</h2>
+        {/* Test Controls */}
+        <div className="card">
+          <div className="card-header">
+            <h2 className="card-title">Traffic Test</h2>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '10px', fontSize: '0.7rem' }}>
+            <div style={{ flex: 1, padding: '6px', background: trafficInterface ? '#ecfdf5' : '#fef2f2', borderRadius: '4px' }}>
+              TX: {trafficInterface || 'N/A'}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
-              {[0, 1, 2, 3, 4, 5, 6, 7].map(tc => (
-                <div
-                  key={tc}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '10px',
-                    padding: '10px',
-                    background: '#f8fafc',
-                    borderRadius: '6px'
-                  }}
-                >
-                  <div
-                    style={{
-                      width: '24px',
-                      height: '24px',
-                      borderRadius: '6px',
-                      background: tcColors[tc],
-                      flexShrink: 0
-                    }}
-                  />
-                  <div>
-                    <div style={{ fontWeight: '600', fontSize: '0.85rem' }}>TC {tc}</div>
-                    <div style={{ fontSize: '0.7rem', color: '#64748b' }}>
-                      {['Best Effort (BG)', 'Best Effort', 'Excellent Effort', 'Critical Apps',
-                        'Video <100ms', 'Voice <10ms', 'Internetwork Ctrl', 'Network Ctrl'][tc]}
-                    </div>
-                  </div>
-                </div>
+            <div style={{ flex: 1, padding: '6px', background: tapConnected ? '#ecfdf5' : '#fef2f2', borderRadius: '4px' }}>
+              RX: {TAP_INTERFACE}
+            </div>
+          </div>
+
+          <div style={{ marginBottom: '10px' }}>
+            <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>Traffic Classes:</div>
+            <div style={{ display: 'flex', gap: '4px' }}>
+              {[0,1,2,3,4,5,6,7].map(tc => (
+                <button key={tc} onClick={() => !trafficRunning && toggleTC(tc)} disabled={trafficRunning}
+                  style={{ padding: '4px 8px', borderRadius: '4px', border: 'none', background: selectedTCs.includes(tc) ? tcColors[tc] : colors.bgAlt, color: selectedTCs.includes(tc) ? '#fff' : colors.textMuted, fontSize: '0.7rem', fontWeight: '600', cursor: trafficRunning ? 'not-allowed' : 'pointer' }}>
+                  TC{tc}
+                </button>
               ))}
             </div>
           </div>
 
-          {/* Comparison Table */}
-          {devices.length > 1 && (
-            <div className="card" style={{ marginTop: '16px' }}>
-              <div className="card-header">
-                <h2 className="card-title">Device Comparison</h2>
-              </div>
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
-                  <thead>
-                    <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
-                      <th style={{ padding: '10px', textAlign: 'left' }}>Port</th>
-                      {devices.map(device => (
-                        <th key={device.id} style={{ padding: '10px', textAlign: 'center' }}>{device.name}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {allPorts.map(portNum => (
-                      <tr key={portNum} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '8px 10px', fontWeight: '600' }}>Port {portNum}</td>
-                        {devices.map(device => {
-                          const portData = cbsData[device.id]?.ports?.[portNum]
-                          const shapers = portData?.shapers || []
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '10px', fontSize: '0.7rem' }}>
+            <div>
+              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>VLAN</div>
+              <input type="number" value={vlanId} onChange={e => setVlanId(parseInt(e.target.value) || 0)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
+            </div>
+            <div>
+              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>PPS</div>
+              <input type="number" value={packetsPerSecond} onChange={e => setPacketsPerSecond(parseInt(e.target.value) || 1)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
+            </div>
+            <div>
+              <div style={{ color: colors.textMuted, marginBottom: '2px' }}>Duration</div>
+              <input type="number" value={duration} onChange={e => setDuration(parseInt(e.target.value) || 10)} disabled={trafficRunning} style={{ width: '100%', padding: '4px', borderRadius: '4px', border: `1px solid ${colors.border}` }} />
+            </div>
+          </div>
 
-                          return (
-                            <td key={device.id} style={{ padding: '8px 10px', textAlign: 'center' }}>
-                              {shapers.length > 0 ? (
-                                <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
-                                  {shapers.map((s, i) => (
-                                    <span
-                                      key={i}
-                                      style={{
-                                        padding: '2px 6px',
-                                        background: tcColors[s.tc] || '#94a3b8',
-                                        color: '#fff',
-                                        borderRadius: '4px',
-                                        fontSize: '0.65rem'
-                                      }}
-                                    >
-                                      TC{s.tc}: {(s.idleSlope / 1000).toFixed(0)}M
-                                    </span>
-                                  ))}
-                                </div>
-                              ) : (
-                                <span style={{ color: '#cbd5e1' }}>-</span>
-                              )}
-                            </td>
-                          )
-                        })}
-                      </tr>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {!trafficRunning ? (
+              <button className="btn btn-primary" onClick={startTest} disabled={!trafficInterface || !tapConnected} style={{ flex: 1 }}>Start Test</button>
+            ) : (
+              <button className="btn" onClick={stopTest} style={{ flex: 1, background: '#fef2f2', color: colors.error }}>Stop</button>
+            )}
+            <button className="btn btn-secondary" onClick={() => setCapturedPackets([])}>Clear</button>
+          </div>
+
+          {/* Stats - Per TC */}
+          <div style={{ marginTop: '10px' }}>
+            <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px' }}>TX / RX per TC:</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: '4px', fontSize: '0.65rem' }}>
+              {[0,1,2,3,4,5,6,7].map(tc => {
+                const tx = txByTc[tc] || 0
+                const rx = rxByTc[tc] || 0
+                const pass = tx > 0 ? ((rx / tx) * 100).toFixed(0) : '-'
+                return (
+                  <div key={tc} style={{ padding: '4px', background: colors.bgAlt, borderRadius: '4px', textAlign: 'center', borderTop: `3px solid ${tcColors[tc]}` }}>
+                    <div style={{ fontWeight: '700', color: tcColors[tc] }}>TC{tc}</div>
+                    <div style={{ color: '#3b82f6' }}>{tx}</div>
+                    <div style={{ color: '#22c55e' }}>{rx}</div>
+                    <div style={{ color: tx > 0 && rx === 0 ? colors.error : (pass === '100' ? colors.success : colors.warning), fontWeight: '600' }}>
+                      {tx > 0 ? `${pass}%` : '-'}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '0.65rem', color: colors.textMuted }}>
+              <span>Total TX: <b style={{ color: '#3b82f6' }}>{txPackets.length}</b></span>
+              <span>Total RX: <b style={{ color: '#22c55e' }}>{rxPackets.length}</b></span>
+              <span>Pass: <b style={{ color: txPackets.length > 0 ? (rxPackets.length / txPackets.length > 0.9 ? colors.success : colors.warning) : colors.textMuted }}>
+                {txPackets.length > 0 ? `${((rxPackets.length / txPackets.length) * 100).toFixed(0)}%` : '-'}
+              </b></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Packet Timeline */}
+      {capturedPackets.length > 0 && (
+        <div className="card" style={{ marginBottom: '16px' }}>
+          <div className="card-header">
+            <h2 className="card-title">Packet Timeline</h2>
+            <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>TX: {txPackets.length} | RX: {rxPackets.length}</span>
+          </div>
+
+          {/* Timeline Grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            {/* TX Timeline */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#3b82f6', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>TX</span>
+                송신
+              </div>
+              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                <div style={{ display: 'flex' }}>
+                  <div style={{ width: '30px' }}>
+                    {[7,6,5,4,3,2,1,0].map(tc => (
+                      <div key={tc} style={{ height: '14px', fontSize: '0.5rem', color: tcColors[tc], fontWeight: '600', textAlign: 'right', paddingRight: '4px' }}>TC{tc}</div>
                     ))}
-                  </tbody>
-                </table>
+                  </div>
+                  <div style={{ flex: 1, position: 'relative', height: '112px', background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '4px', overflow: 'hidden' }}>
+                    {(() => {
+                      const pkts = txPackets.filter(p => p.hasVlan).slice(-400)
+                      if (pkts.length === 0) return <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight, fontSize: '0.7rem' }}>No TX</div>
+                      const minT = pkts[0]?.time || 0
+                      const maxT = pkts[pkts.length - 1]?.time || 1
+                      const range = Math.max(maxT - minT, 1)
+                      return pkts.map((p, i) => (
+                        <div key={i} style={{ position: 'absolute', left: `${((p.time - minT) / range) * 100}%`, top: `${(7 - p.pcp) * 14}px`, width: '2px', height: '12px', background: tcColors[p.pcp], opacity: 0.8 }} />
+                      ))
+                    })()}
+                  </div>
+                </div>
+                {/* Time axis */}
+                {txPackets.length > 0 && (() => {
+                  const pkts = txPackets.filter(p => p.hasVlan)
+                  if (pkts.length === 0) return null
+                  const dur = ((pkts[pkts.length - 1]?.time || 0) - (pkts[0]?.time || 0)) / 1000
+                  return (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginLeft: '30px', marginTop: '4px', fontSize: '0.55rem', color: colors.textMuted }}>
+                      <span>0s</span><span>{(dur/2).toFixed(1)}s</span><span>{dur.toFixed(1)}s</span>
+                    </div>
+                  )
+                })()}
               </div>
             </div>
-          )}
-        </>
+
+            {/* RX Timeline */}
+            <div>
+              <div style={{ fontSize: '0.65rem', color: colors.textMuted, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ background: '#22c55e', color: '#fff', padding: '1px 6px', borderRadius: '3px', fontWeight: '600' }}>RX</span>
+                수신
+              </div>
+              <div style={{ background: colors.bgAlt, borderRadius: '4px', padding: '8px' }}>
+                <div style={{ display: 'flex' }}>
+                  <div style={{ width: '30px' }}>
+                    {[7,6,5,4,3,2,1,0].map(tc => (
+                      <div key={tc} style={{ height: '14px', fontSize: '0.5rem', color: tcColors[tc], fontWeight: '600', textAlign: 'right', paddingRight: '4px' }}>TC{tc}</div>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, position: 'relative', height: '112px', background: '#fff', border: `1px solid ${colors.border}`, borderRadius: '4px', overflow: 'hidden' }}>
+                    {(() => {
+                      const pkts = rxPackets.filter(p => p.hasVlan).slice(-400)
+                      if (pkts.length === 0) return <div style={{ padding: '20px', textAlign: 'center', color: colors.textLight, fontSize: '0.7rem' }}>No RX</div>
+                      const minT = pkts[0]?.time || 0
+                      const maxT = pkts[pkts.length - 1]?.time || 1
+                      const range = Math.max(maxT - minT, 1)
+                      return pkts.map((p, i) => (
+                        <div key={i} style={{ position: 'absolute', left: `${((p.time - minT) / range) * 100}%`, top: `${(7 - p.pcp) * 14}px`, width: '2px', height: '12px', background: tcColors[p.pcp], opacity: 0.8 }} />
+                      ))
+                    })()}
+                  </div>
+                </div>
+                {/* Time axis */}
+                {rxPackets.length > 0 && (() => {
+                  const pkts = rxPackets.filter(p => p.hasVlan)
+                  if (pkts.length === 0) return null
+                  const dur = ((pkts[pkts.length - 1]?.time || 0) - (pkts[0]?.time || 0)) / 1000
+                  return (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginLeft: '30px', marginTop: '4px', fontSize: '0.55rem', color: colors.textMuted }}>
+                      <span>0s</span><span>{(dur/2).toFixed(1)}s</span><span>{dur.toFixed(1)}s</span>
+                    </div>
+                  )
+                })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Packet Capture Log (Wireshark style) */}
+      {capturedPackets.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <h2 className="card-title">Packet Capture</h2>
+            <span style={{ fontSize: '0.7rem', color: colors.textMuted }}>{capturedPackets.length} packets</span>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
+              <thead>
+                <tr style={{ background: colors.bgAlt }}>
+                  <th style={{ ...cellStyle, width: '50px' }}>No.</th>
+                  <th style={{ ...cellStyle, width: '80px' }}>Time</th>
+                  <th style={{ ...cellStyle, width: '50px' }}>Dir</th>
+                  <th style={{ ...cellStyle, width: '50px' }}>TC</th>
+                  <th style={{ ...cellStyle, width: '60px' }}>VID</th>
+                  <th style={{ ...cellStyle, width: '60px' }}>Len</th>
+                  <th style={cellStyle}>Source</th>
+                  <th style={cellStyle}>Destination</th>
+                </tr>
+              </thead>
+              <tbody>
+                {capturedPackets.slice(-50).reverse().map((pkt, idx) => {
+                  const no = capturedPackets.length - idx
+                  const time = startTimeRef.current ? ((pkt.time - startTimeRef.current) / 1000).toFixed(3) : '0.000'
+                  return (
+                    <tr key={idx} style={{ background: pkt.direction === 'TX' ? '#eff6ff' : '#f0fdf4' }}>
+                      <td style={cellStyle}>{no}</td>
+                      <td style={cellStyle}>{time}s</td>
+                      <td style={cellStyle}>
+                        <span style={{ padding: '1px 4px', borderRadius: '3px', background: pkt.direction === 'TX' ? '#3b82f6' : '#22c55e', color: '#fff', fontWeight: '600' }}>
+                          {pkt.direction}
+                        </span>
+                      </td>
+                      <td style={cellStyle}>
+                        {pkt.hasVlan ? (
+                          <span style={{ padding: '1px 4px', borderRadius: '3px', background: tcColors[pkt.pcp], color: '#fff', fontWeight: '600' }}>
+                            TC{pkt.pcp}
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={cellStyle}>{pkt.hasVlan ? pkt.vid : '-'}</td>
+                      <td style={cellStyle}>{pkt.length}</td>
+                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.src || '-'}</td>
+                      <td style={{ ...cellStyle, color: colors.textMuted }}>{pkt.dst || '-'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
     </div>
   )

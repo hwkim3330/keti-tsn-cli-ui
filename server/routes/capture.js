@@ -299,15 +299,24 @@ router.post('/start', (req, res) => {
             let etherType = ethInfo.info?.type;
             let payloadOffset = ethInfo.offset;
 
-            // Check for VLAN tag (802.1Q) - EtherType 0x8100
-            if (etherType === 0x8100 && rawPacket.length >= 18) {
+            // Check for VLAN tag - the library parses it but has buggy PCP extraction
+            // So we manually read PCP from raw packet if VLAN is detected
+            if (ethInfo.info?.vlan && rawPacket.length >= 18) {
               // TCI is at offset 14-15: PCP(3) + DEI(1) + VID(12)
               const tci = rawPacket.readUInt16BE(14);
               const pcp = (tci >> 13) & 0x07;
               const dei = (tci >> 12) & 0x01;
               const vid = tci & 0x0FFF;
               vlanInfo = { pcp, dei, vid };
-              // Real EtherType is at offset 16
+              // etherType and payloadOffset already adjusted by the library
+            }
+            // Also check raw EtherType 0x8100 in case library missed it
+            else if (rawPacket.length >= 14 && rawPacket.readUInt16BE(12) === 0x8100 && rawPacket.length >= 18) {
+              const tci = rawPacket.readUInt16BE(14);
+              const pcp = (tci >> 13) & 0x07;
+              const dei = (tci >> 12) & 0x01;
+              const vid = tci & 0x0FFF;
+              vlanInfo = { pcp, dei, vid };
               etherType = rawPacket.readUInt16BE(16);
               payloadOffset = 18;
             }
