@@ -10,6 +10,11 @@ const PACKET_SIZE_BYTES = 64
 const PACKET_SIZE_BITS = PACKET_SIZE_BYTES * 8  // 512 bits
 const LINK_SPEED_KBPS = 1000000  // 1Gbps = 1,000,000 kbps
 
+// TC당 트래픽 속도(kbps)를 PPS로 변환
+const kbpsToPps = (kbps) => Math.round((kbps * 1000) / PACKET_SIZE_BITS)
+// PPS를 kbps로 변환
+const ppsToKbps = (pps) => (pps * PACKET_SIZE_BITS) / 1000
+
 const colors = {
   text: '#1f2937',
   textMuted: '#6b7280',
@@ -235,7 +240,7 @@ function CBSDashboard() {
   const [selectedTCs, setSelectedTCs] = useState([1, 2, 3])  // 트래픽 전송할 TC
   const [monitorTCs, setMonitorTCs] = useState([1, 2, 3])    // Credit 모니터링할 TC
   const [vlanId, setVlanId] = useState(100)
-  const [packetsPerSecond, setPacketsPerSecond] = useState(5000)  // 총 PPS
+  const [trafficRatePerTc, setTrafficRatePerTc] = useState(1000)  // TC당 트래픽 속도 (kbps) = 1Mbps
   const [duration, setDuration] = useState(5)
   const [cbsPort, setCbsPort] = useState(8)
 
@@ -246,6 +251,14 @@ function CBSDashboard() {
   const wsRef = useRef(null)
   const creditRef = useRef({})
   const simulationRef = useRef(null)
+  const monitorTCsRef = useRef(monitorTCs)
+  const idleSlopeRef = useRef(idleSlope)
+  const trafficRateRef = useRef(trafficRatePerTc)
+
+  // refs 업데이트
+  useEffect(() => { monitorTCsRef.current = monitorTCs }, [monitorTCs])
+  useEffect(() => { idleSlopeRef.current = idleSlope }, [idleSlope])
+  useEffect(() => { trafficRateRef.current = trafficRatePerTc }, [trafficRatePerTc])
 
   const board1 = devices.find(d => d.name?.includes('#1') || d.device?.includes('ACM0'))
   const board2 = devices.find(d => d.name?.includes('#2') || d.device?.includes('ACM1'))
@@ -334,6 +347,10 @@ function CBSDashboard() {
   useEffect(() => { setTrafficInterface(TRAFFIC_INTERFACE) }, [])
   useEffect(() => { return () => { if (simulationRef.current) clearInterval(simulationRef.current) } }, [])
 
+  // startTime을 ref로 관리하여 WebSocket 재연결 방지
+  const startTimeRef = useRef(null)
+  useEffect(() => { startTimeRef.current = startTime }, [startTime])
+
   // WebSocket for capture data
   useEffect(() => {
     const connect = () => {
@@ -345,8 +362,9 @@ function CBSDashboard() {
           const msg = JSON.parse(e.data)
           if (msg.type === 'c-capture-stats') {
             setCaptureStats(msg.data)
-            if (startTime) {
-              const elapsed = Date.now() - startTime
+            // startTimeRef를 사용하여 최신 startTime 참조
+            if (startTimeRef.current) {
+              const elapsed = Date.now() - startTimeRef.current
               updateCredit(msg.data, elapsed)
             }
           } else if (msg.type === 'c-capture-stopped' && msg.stats?.analysis) {
@@ -358,20 +376,26 @@ function CBSDashboard() {
     }
     connect()
     return () => wsRef.current?.close()
-  }, [startTime])
+  }, [])  // 의존성 제거 - WebSocket은 한번만 연결
 
-  // Credit 계산 함수 (실제 패킷 기반)
+  // Credit 계산 함수 (실제 패킷 기반) - refs 사용하여 최신 값 참조
   const updateCredit = (stats, elapsed) => {
+    const currentMonitorTCs = monitorTCsRef.current
+    const currentIdleSlope = idleSlopeRef.current
     const newCredit = { ...creditRef.current }
 
-    monitorTCs.forEach(tc => {
-      const slope = idleSlope[tc] || LINK_SPEED_KBPS
+    currentMonitorTCs.forEach(tc => {
+      const slope = currentIdleSlope[tc] || LINK_SPEED_KBPS
       const currentCount = stats.tc?.[tc]?.count || 0
-      const prevEntry = creditHistory[creditHistory.length - 1]
-      const prevCount = prevEntry?.packets?.[tc] || 0
-      const newPackets = currentCount - prevCount
       const prevCredit = creditRef.current[tc] ?? 0
-      const dt = prevEntry ? elapsed - prevEntry.time : 100
+
+      // 이전 패킷 수 가져오기
+      const prevPackets = creditRef.current[`packets_${tc}`] || 0
+      const newPackets = Math.max(0, currentCount - prevPackets)
+
+      // 시간 간격 계산
+      const prevTime = creditRef.current.lastTime || 0
+      const dt = Math.max(elapsed - prevTime, 1)
 
       // Credit 계산: idle 회복 - 전송 소비
       const idleRecoveryBits = (slope * dt) / 1000  // kbps * ms / 1000 = bits
@@ -381,13 +405,20 @@ function CBSDashboard() {
       const hiCredit = PACKET_SIZE_BITS * 2
       const loCredit = -PACKET_SIZE_BITS * 10
       credit = Math.max(loCredit, Math.min(hiCredit, credit))
+
       newCredit[tc] = credit
+      newCredit[`packets_${tc}`] = currentCount  // 패킷 수 저장
     })
 
+    newCredit.lastTime = elapsed
     creditRef.current = newCredit
+
     setCreditHistory(prev => {
-      const entry = { time: elapsed, credit: { ...newCredit }, packets: {} }
-      monitorTCs.forEach(tc => { entry.packets[tc] = stats.tc?.[tc]?.count || 0 })
+      const entry = { time: elapsed, credit: {}, packets: {} }
+      currentMonitorTCs.forEach(tc => {
+        entry.credit[tc] = newCredit[tc]
+        entry.packets[tc] = stats.tc?.[tc]?.count || 0
+      })
       return [...prev.slice(-200), entry]
     })
   }
@@ -399,8 +430,7 @@ function CBSDashboard() {
     creditRef.current = {}
     monitorTCs.forEach(tc => { creditRef.current[tc] = 0 })
 
-    const tcCount = selectedTCs.length || 1
-    const ppsPerTc = packetsPerSecond / tcCount
+    const ppsPerTc = kbpsToPps(trafficRatePerTc)  // TC당 PPS
     const intervalMs = 20
 
     const initCredit = {}
@@ -451,18 +481,21 @@ function CBSDashboard() {
     setCreditHistory([])
     creditRef.current = {}
     monitorTCs.forEach(tc => { creditRef.current[tc] = 0 })
-    setStartTime(Date.now())
 
     const initCredit = {}
     monitorTCs.forEach(tc => { initCredit[tc] = 0 })
     setCreditHistory([{ time: 0, credit: initCredit, packets: {} }])
 
+    // 총 PPS 계산: TC당 PPS * TC 개수
+    const totalPps = trafficInfo.totalPps
+
     try {
       await axios.post('/api/capture/start-c', { interface: TAP_INTERFACE, duration: duration + 2, vlanId })
       await new Promise(r => setTimeout(r, 300))
       setTrafficRunning(true)
+      setStartTime(Date.now())  // 트래픽 시작 직전에 시간 설정
       await axios.post(`${TRAFFIC_API}/api/traffic/start-precision`, {
-        interface: trafficInterface, dstMac: BOARD2_PORT8_MAC, vlanId, tcList: selectedTCs, packetsPerSecond, duration
+        interface: trafficInterface, dstMac: BOARD2_PORT8_MAC, vlanId, tcList: selectedTCs, packetsPerSecond: totalPps, duration
       })
       setTimeout(stopTest, (duration + 3) * 1000)
     } catch (err) {
@@ -480,23 +513,23 @@ function CBSDashboard() {
 
   // TC별 예상 트래픽 계산
   const trafficInfo = useMemo(() => {
-    const tcCount = selectedTCs.length || 1
-    const ppsPerTc = packetsPerSecond / tcCount
-    const bitsPerTc = ppsPerTc * PACKET_SIZE_BITS  // bits/s
-    const kbpsPerTc = bitsPerTc / 1000  // kbps
+    const ppsPerTc = kbpsToPps(trafficRatePerTc)  // TC당 PPS
+    const totalPps = ppsPerTc * selectedTCs.length  // 총 PPS
 
     const result = {}
     for (let tc = 0; tc < 8; tc++) {
       const slope = idleSlope[tc] || LINK_SPEED_KBPS
       const isLimited = slope < LINK_SPEED_KBPS
       const isTraffic = selectedTCs.includes(tc)
-      const trafficKbps = isTraffic ? kbpsPerTc : 0
+      const trafficKbps = isTraffic ? trafficRatePerTc : 0
       const willShape = isLimited && trafficKbps > slope
 
       result[tc] = { slope, isLimited, trafficKbps, willShape, ppsPerTc: isTraffic ? ppsPerTc : 0 }
     }
+    result.totalPps = totalPps
+    result.ppsPerTc = ppsPerTc
     return result
-  }, [idleSlope, packetsPerSecond, selectedTCs])
+  }, [idleSlope, trafficRatePerTc, selectedTCs])
 
   const formatBw = (kbps) => {
     if (kbps >= 1000000) return `${(kbps / 1000000).toFixed(1)}Gbps`
@@ -656,9 +689,12 @@ function CBSDashboard() {
                 style={{ width: '100%', padding: '10px', borderRadius: '6px', border: `1px solid ${colors.border}`, fontFamily: 'monospace', fontSize: '1rem' }} />
             </div>
             <div>
-              <div style={{ fontSize: '0.85rem', fontWeight: '600', marginBottom: '6px' }}>PPS (초당 패킷 수, 전체)</div>
-              <input type="number" value={packetsPerSecond} onChange={e => setPacketsPerSecond(parseInt(e.target.value) || 0)} disabled={trafficRunning}
+              <div style={{ fontSize: '0.85rem', fontWeight: '600', marginBottom: '6px' }}>TC당 트래픽 속도 (kbps)</div>
+              <input type="number" value={trafficRatePerTc} onChange={e => setTrafficRatePerTc(parseInt(e.target.value) || 0)} disabled={trafficRunning}
                 style={{ width: '100%', padding: '10px', borderRadius: '6px', border: `1px solid ${colors.border}`, fontFamily: 'monospace', fontSize: '1rem' }} />
+              <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginTop: '4px' }}>
+                = {formatBw(trafficRatePerTc)} / TC
+              </div>
             </div>
             <div>
               <div style={{ fontSize: '0.85rem', fontWeight: '600', marginBottom: '6px' }}>Duration (초)</div>
@@ -670,13 +706,15 @@ function CBSDashboard() {
           {/* 트래픽 계산 결과 */}
           {selectedTCs.length > 0 && (
             <div style={{ padding: '14px', background: colors.bgAlt, borderRadius: '8px', marginBottom: '16px' }}>
-              <div style={{ fontWeight: '700', marginBottom: '8px' }}>트래픽 계산 결과</div>
+              <div style={{ fontWeight: '700', marginBottom: '8px' }}>트래픽 설정 요약</div>
               <div style={{ fontFamily: 'monospace', fontSize: '0.9rem', lineHeight: '1.8' }}>
-                <div>총 PPS: <strong>{packetsPerSecond}</strong> pps</div>
-                <div>TC 개수: <strong>{selectedTCs.length}</strong>개</div>
-                <div>TC당 PPS: <strong>{Math.round(packetsPerSecond / selectedTCs.length)}</strong> pps</div>
-                <div>TC당 트래픽: <strong>{formatBw(trafficInfo[selectedTCs[0]]?.trafficKbps || 0)}</strong></div>
-                <div style={{ marginTop: '8px' }}>패킷 크기: {PACKET_SIZE_BYTES} bytes = {PACKET_SIZE_BITS} bits</div>
+                <div>TC당 트래픽: <strong>{formatBw(trafficRatePerTc)}</strong></div>
+                <div>선택된 TC: <strong>{selectedTCs.length}</strong>개 (TC{selectedTCs.join(', TC')})</div>
+                <div>총 트래픽: <strong>{formatBw(trafficRatePerTc * selectedTCs.length)}</strong></div>
+                <div style={{ marginTop: '8px', color: colors.textMuted }}>
+                  TC당 {trafficInfo.ppsPerTc} pps × {selectedTCs.length} TC = 총 {trafficInfo.totalPps} pps
+                </div>
+                <div style={{ color: colors.textMuted }}>패킷 크기: {PACKET_SIZE_BYTES} bytes</div>
               </div>
             </div>
           )}
@@ -709,8 +747,9 @@ function CBSDashboard() {
                   <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600' }}>TC</th>
                   <th style={{ padding: '12px', textAlign: 'right', fontWeight: '600' }}>패킷 수</th>
                   <th style={{ padding: '12px', textAlign: 'right', fontWeight: '600' }}>실제 속도</th>
+                  <th style={{ padding: '12px', textAlign: 'right', fontWeight: '600' }}>전송 속도</th>
                   <th style={{ padding: '12px', textAlign: 'right', fontWeight: '600' }}>Idle Slope</th>
-                  <th style={{ padding: '12px', textAlign: 'center', fontWeight: '600' }}>Shaping 여부</th>
+                  <th style={{ padding: '12px', textAlign: 'center', fontWeight: '600' }}>결과</th>
                 </tr>
               </thead>
               <tbody>
@@ -718,7 +757,10 @@ function CBSDashboard() {
                   const stats = captureStats.tc?.[tc] || captureStats.analysis?.[tc]
                   const info = trafficInfo[tc]
                   const actualKbps = stats?.kbps || 0
+                  // Shaping 판정: 실제 속도가 전송 속도의 80% 미만이면 shaped
                   const wasShaped = actualKbps > 0 && actualKbps < info.trafficKbps * 0.8
+                  // 또는 idle slope 이하로 제한되었으면 shaped
+                  const limitedBySlope = info.willShape && actualKbps > 0 && actualKbps <= info.slope * 1.1
 
                   return (
                     <tr key={tc} style={{ borderBottom: `1px solid ${colors.border}` }}>
@@ -727,12 +769,15 @@ function CBSDashboard() {
                         <span style={{ fontWeight: '700' }}>TC{tc}</span>
                       </td>
                       <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace', fontWeight: '600' }}>{stats?.count || '-'}</td>
-                      <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace' }}>{actualKbps ? formatBw(actualKbps) : '-'}</td>
-                      <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace', color: colors.textMuted }}>{formatBw(info.slope)}</td>
+                      <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace', fontWeight: '600' }}>{actualKbps ? formatBw(actualKbps) : '-'}</td>
+                      <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace', color: colors.textMuted }}>{formatBw(info.trafficKbps)}</td>
+                      <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace', color: info.willShape ? colors.error : colors.textMuted }}>{formatBw(info.slope)}</td>
                       <td style={{ padding: '12px', textAlign: 'center' }}>
                         {stats?.count ? (
-                          <span style={{ padding: '6px 12px', borderRadius: '6px', fontSize: '0.8rem', fontWeight: '700', background: wasShaped ? '#fef2f2' : '#dcfce7', color: wasShaped ? colors.error : colors.success }}>
-                            {wasShaped ? 'SHAPED' : 'OK'}
+                          <span style={{ padding: '6px 12px', borderRadius: '6px', fontSize: '0.8rem', fontWeight: '700',
+                            background: wasShaped || limitedBySlope ? '#fef2f2' : '#dcfce7',
+                            color: wasShaped || limitedBySlope ? colors.error : colors.success }}>
+                            {wasShaped || limitedBySlope ? 'SHAPED' : 'OK'}
                           </span>
                         ) : '-'}
                       </td>
